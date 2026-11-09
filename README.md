@@ -138,9 +138,18 @@ diffusion:
   batch_size: 32
   num_workers: 0
   lr: 0.0003
+  inference_steps: 20
 ```
 
-最佳验证权重保存在 `outputs/dp/<run>/<stamp>/checkpoints/best.ckpt`，同次运行的 `metrics.csv` 记录训练和验证损失。用 `starter.policies.diffusion_model.load_policy(path)` 加载后，可调用 `predict_action_chunk(rgb, state)`，传入 RGB 图像和 16 维末端状态，得到 `[horizon, 16]` 的动作。训练目标参考 [Diffusion Policy 的原始实现](https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/policy/diffusion_unet_hybrid_image_policy.py)，调度器使用 Diffusers。
+每帧头部 RGB 只解码一次，缩放后以 `uint8` 放在内存中（默认约 27 KiB/帧）。动作窗口延伸到轨迹最后一帧，末尾不足一块时重复最后一个示范动作。状态和动作的归一化范围只从训练轨迹计算。
+
+训练使用 DDPM 噪声预测、AdamW、学习率预热与余弦衰减，并以 EMA 权重验证。训练方法参考 [Diffusion Policy 的原始实现](https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/workspace/train_diffusion_unet_hybrid_workspace.py)，扩散调度器使用 Diffusers。
+
+模型约有 347 万个参数（默认 16 步）。残差视觉编码器同时提取局部空间坐标和图像特征；一维 U-Net 在多个时间尺度上去噪，逐层注入观测和扩散步条件。旧版小网络的权重需要重新训练。
+
+`metrics.csv` 记录训练和验证去噪损失，以及 `val_action_mae`：对固定留出窗口用与部署相同的采样步数生成动作，在训练集归一化尺度上与真实动作比较，忽略填充步。按该误差保存最好的 EMA 权重到 `outputs/dp/<run>/<stamp>/checkpoints/best.ckpt`。这个误差用于离线选权重，堆叠成功率仍由仿真评测给出。
+
+用 `starter.policies.diffusion_model.load_policy(path)` 加载新训练的 checkpoint，再调用 `predict_action_chunk(rgb, state)`，输入头部 RGB 和 16 维末端状态，得到 `[horizon, 16]` 动作。复现实验时保留配置、种子、`metrics.csv` 和 checkpoint；checkpoint 也记录了实际使用的训练与验证轨迹。
 
 评测时，策略服务在你的环境里监听端口，Isaac 客户端在镜像里运行。
 

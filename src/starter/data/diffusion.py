@@ -21,25 +21,28 @@ def preprocess_image(rgb, image_size):
 class ActionWindows:
     def __init__(self, paths, horizon, image_size, decode_image):
         self.horizon = horizon
-        self.image_size = image_size
-        self.decode_image = decode_image
-        self.camera_key = f"vision/{HEAD_CAMERA}/colors"
         self.episodes = []
+        self.images = []
+        camera_key = f"vision/{HEAD_CAMERA}/colors"
         for path in paths:
             with h5py.File(path, "r") as handle:
                 state = np.asarray(pack_ee_group(handle["state"]), dtype=np.float32)
                 action = np.asarray(pack_ee_group(handle["action"]), dtype=np.float32)
-                frames = len(handle[self.camera_key])
-            if state.shape != (frames, ACTION_DIM) or action.shape != state.shape:
-                raise ValueError(f"{path}: mismatched image, state or action shapes.")
-            if not (np.isfinite(state).all() and np.isfinite(action).all()):
-                raise ValueError(f"{path}: non-finite state or action values.")
-            if frames >= horizon:
-                self.episodes.append((path, state, action))
+                camera = handle[camera_key]
+                frames = len(camera)
+                if frames == 0 or state.shape != (frames, ACTION_DIM) or action.shape != state.shape:
+                    raise ValueError(f"{path}: empty or mismatched image, state or action shapes.")
+                if not (np.isfinite(state).all() and np.isfinite(action).all()):
+                    raise ValueError(f"{path}: non-finite state or action values.")
+                images = np.empty((frames, 3, image_size, image_size), dtype=np.uint8)
+                for t, encoded in enumerate(camera):
+                    images[t] = preprocess_image(decode_image(encoded), image_size)
+            self.images.append(images)
+            self.episodes.append((path, state, action))
 
-        self.ends = list(accumulate(len(action) - horizon + 1 for _, _, action in self.episodes))
+        self.ends = list(accumulate(len(action) for _, _, action in self.episodes))
         if not self.ends:
-            raise ValueError(f"No full action windows of length {horizon} in this split.")
+            raise ValueError("No episodes in this split.")
 
     def __len__(self):
         return self.ends[-1]
@@ -47,11 +50,10 @@ class ActionWindows:
     def __getitem__(self, index):
         episode = bisect_right(self.ends, index)
         t = index - (self.ends[episode - 1] if episode else 0)
-        path, state, action = self.episodes[episode]
-        with h5py.File(path, "r") as handle:
-            rgb = self.decode_image(handle[self.camera_key][t])
-        image = preprocess_image(rgb, self.image_size)
-        return image, state[t], action[t : t + self.horizon]
+        _, state, action = self.episodes[episode]
+        valid = min(self.horizon, len(action) - t)
+        steps = np.arange(t, t + self.horizon).clip(max=len(action) - 1)
+        return self.images[episode][t], state[t], action[steps], valid
 
     def bounds(self):
         stats = {}

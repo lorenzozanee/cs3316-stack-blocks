@@ -2,40 +2,131 @@
 
 import torch
 from diffusers import DDPMScheduler
+from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 from torch import nn
+from torch.nn import functional as F
 
 from starter.data.diffusion import preprocess_image
 from starter.interfaces import ACTION_DIM
 
 
+class _ImageResidual(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
+            nn.GroupNorm(8, out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_channels),
+        )
+        self.skip = (
+            nn.Identity() if in_channels == out_channels and stride == 1
+            else nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False)
+        )
+
+    def forward(self, x):
+        return F.silu(self.layers(x) + self.skip(x))
+
+
+class _VisionEncoder(nn.Module):
+    feature_dim = 128 * 4 + 32 * 2
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 32, 5, stride=2, padding=2, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            _ImageResidual(32, 48, stride=2),
+            _ImageResidual(48, 64, stride=2),
+            _ImageResidual(64, 96),
+            _ImageResidual(96, 128),
+        )
+        self.keypoints = nn.Conv2d(128, 32, 1)
+
+    def forward(self, image):
+        features = self.backbone(image)
+        h, w = features.shape[-2:]
+        heatmaps = self.keypoints(features).flatten(2).softmax(dim=-1).unflatten(-1, (h, w))
+        x = (torch.arange(w, device=features.device, dtype=features.dtype) + 0.5) * (2 / w) - 1
+        y = (torch.arange(h, device=features.device, dtype=features.dtype) + 0.5) * (2 / h) - 1
+        points = torch.stack((heatmaps.sum(dim=-2) @ x, heatmaps.sum(dim=-1) @ y), dim=-1)
+        pooled = F.adaptive_avg_pool2d(features, 2).flatten(1)
+        return torch.cat((pooled, points.flatten(1)), dim=-1)
+
+
+class _ConditionalResidual(nn.Module):
+    def __init__(self, in_channels, out_channels, context_dim):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, 3, padding=1)
+        self.norm = nn.GroupNorm(8, out_channels)
+        self.film = nn.Linear(context_dim, 2 * out_channels)
+        self.output = nn.Sequential(
+            nn.SiLU(),
+            nn.Conv1d(out_channels, out_channels, 3, padding=1),
+            nn.GroupNorm(8, out_channels),
+        )
+        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, 1)
+
+    def forward(self, x, context):
+        scale, bias = self.film(context).unsqueeze(-1).chunk(2, dim=1)
+        h = self.norm(self.conv(x))
+        return self.skip(x) + self.output(h * (1 + scale) + bias)
+
+
+class _ActionUNet(nn.Module):
+    def __init__(self, horizon, context_dim):
+        super().__init__()
+        self.position = nn.Parameter(torch.zeros(1, 96, horizon))
+        self.input = nn.Conv1d(ACTION_DIM, 96, 1)
+        self.down_blocks = nn.ModuleList(
+            _ConditionalResidual(width, width, context_dim) for width in (96, 192)
+        )
+        self.downsample = nn.ModuleList(
+            nn.Conv1d(a, b, 3, stride=2, padding=1) for a, b in ((96, 192), (192, 256))
+        )
+        self.middle = nn.ModuleList(_ConditionalResidual(256, 256, context_dim) for _ in range(2))
+        self.up_blocks = nn.ModuleList(
+            _ConditionalResidual(a + b, b, context_dim) for a, b in ((256, 192), (192, 96))
+        )
+        self.output = nn.Sequential(nn.GroupNorm(8, 96), nn.SiLU(), nn.Conv1d(96, ACTION_DIM, 1))
+
+    def forward(self, noisy_actions, context):
+        x = self.input(noisy_actions.transpose(1, 2)) + self.position
+        skips = []
+        for block, downsample in zip(self.down_blocks, self.downsample):
+            x = block(x, context)
+            skips.append(x)
+            x = downsample(x)
+        for block in self.middle:
+            x = block(x, context)
+        for block, skip in zip(self.up_blocks, reversed(skips)):
+            x = F.interpolate(x, size=skip.shape[-1], mode="nearest")
+            x = block(torch.cat((x, skip), dim=1), context)
+        return self.output(x).transpose(1, 2)
+
+
 class DiffusionPolicy(nn.Module):
-    def __init__(self, horizon, image_size, scheduler_config, bounds):
+    def __init__(self, horizon, image_size, inference_steps, scheduler_config, bounds):
         super().__init__()
         self.horizon = horizon
         self.image_size = image_size
+        self.inference_steps = inference_steps
         self.scheduler = DDPMScheduler(**scheduler_config)
         for key, value in bounds.items():
             self.register_buffer(key, torch.as_tensor(value, dtype=torch.float32))
 
-        self.vision = nn.Sequential(
-            nn.Conv2d(3, 32, 5, stride=2, padding=2), nn.SiLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.SiLU(),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.SiLU(),
-            nn.AdaptiveAvgPool2d((4, 4)), nn.Flatten(),
-            nn.Linear(64 * 4 * 4, 128), nn.SiLU(),
+        self.vision = _VisionEncoder()
+        self.proprio = nn.Sequential(nn.Linear(ACTION_DIM, 64), nn.SiLU())
+        self.condition = nn.Sequential(
+            nn.Linear(self.vision.feature_dim + 64, 256), nn.LayerNorm(256), nn.SiLU(),
         )
-        self.condition = nn.Linear(128 + ACTION_DIM, 128)
-        self.timestep = nn.Embedding(self.scheduler.config.num_train_timesteps, 128)
-        self.position = nn.Parameter(torch.zeros(1, 128, horizon))
-        self.input = nn.Conv1d(ACTION_DIM, 128, 1)
-        self.blocks = nn.ModuleList(
-            nn.Sequential(
-                nn.GroupNorm(8, 128), nn.SiLU(),
-                nn.Conv1d(128, 128, 3, dilation=dilation, padding=dilation),
-            )
-            for dilation in (1, 2, 4, 1)
+        self.timestep = nn.Sequential(
+            Timesteps(128, flip_sin_to_cos=True, downscale_freq_shift=0),
+            TimestepEmbedding(128, 256, out_dim=128),
         )
-        self.output = nn.Conv1d(128, ACTION_DIM, 1)
+        self.denoiser = _ActionUNet(horizon, context_dim=256 + 128)
 
     def normalize(self, x, key):
         low, high = getattr(self, f"{key}_min"), getattr(self, f"{key}_max")
@@ -43,16 +134,32 @@ class DiffusionPolicy(nn.Module):
         scale = torch.where(half_range < 1e-6, 1.0, half_range)
         return (x - (high + low) / 2) / scale
 
+    def denormalize_actions(self, sample):
+        return self.action_min + (sample + 1) * (self.action_max - self.action_min) / 2
+
     def encode_observation(self, image, state):
         features = self.vision(image.float() / 255)
-        return self.condition(torch.cat((features, self.normalize(state, "state")), dim=-1))
+        proprio = self.proprio(self.normalize(state, "state"))
+        return self.condition(torch.cat((features, proprio), dim=-1))
 
     def forward(self, noisy_actions, timesteps, condition):
-        context = (condition + self.timestep(timesteps)).unsqueeze(-1)
-        x = self.input(noisy_actions.transpose(1, 2)) + self.position
-        for block in self.blocks:
-            x = x + block(x + context)
-        return self.output(x).transpose(1, 2)
+        context = torch.cat((condition, self.timestep(timesteps)), dim=-1)
+        return self.denoiser(noisy_actions, context)
+
+    @torch.inference_mode()
+    def sample_actions(self, images, states, *, num_inference_steps=None, generator=None):
+        steps = self.inference_steps if num_inference_steps is None else num_inference_steps
+        if not 2 <= steps <= self.scheduler.config.num_train_timesteps:
+            raise ValueError("Sampling requires between 2 and num_train_timesteps denoising steps.")
+        condition = self.encode_observation(images, states)
+        device = states.device
+        sample = torch.randn((len(states), self.horizon, ACTION_DIM), device=device, generator=generator)
+        self.scheduler.set_timesteps(steps)
+        for step in self.scheduler.timesteps.tolist():
+            k = torch.full((len(states),), step, device=device, dtype=torch.long)
+            noise = self(sample, k, condition)
+            sample = self.scheduler.step(noise, step, sample, generator=generator).prev_sample
+        return self.denormalize_actions(sample)
 
     @torch.inference_mode()
     def predict_action_chunk(self, rgb, state, *, num_inference_steps=None):
@@ -60,15 +167,7 @@ class DiffusionPolicy(nn.Module):
         device = self.state_min.device
         image = torch.as_tensor(preprocess_image(rgb, self.image_size), device=device)
         state = torch.as_tensor(state, device=device, dtype=torch.float32).reshape(1, ACTION_DIM)
-        condition = self.encode_observation(image.unsqueeze(0), state)
-        sample = torch.randn((1, self.horizon, ACTION_DIM), device=device)
-        steps = num_inference_steps or self.scheduler.config.num_train_timesteps
-        self.scheduler.set_timesteps(steps)
-        for step in self.scheduler.timesteps.tolist():
-            k = torch.full((1,), step, device=device, dtype=torch.long)
-            noise = self(sample, k, condition)
-            sample = self.scheduler.step(noise, step, sample).prev_sample
-        return (self.action_min + (sample[0] + 1) * (self.action_max - self.action_min) / 2)
+        return self.sample_actions(image.unsqueeze(0), state, num_inference_steps=num_inference_steps)[0]
 
 
 def load_policy(path, device="cpu"):
