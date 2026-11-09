@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${ROOT}/src:${ROOT}/third_party:${PYTHONPATH:-}"
 cd "${ROOT}"
 
-python3 -m starter.pipelines.diffusion offline --config configs/env.yaml
+python3 -m starter.pipelines.diffusion offline --config "${1:-configs/env.yaml}"

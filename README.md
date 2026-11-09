@@ -1,6 +1,6 @@
 # 项目起点：方舟 X5 双臂堆积木
 
-命令在 `startcode/` 下执行。这里保留了仿真环境、示范数据读取，以及 [Diffusion](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/DP/README.md) 和 [ACT](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/ACT/README.md) 两条链路的启动方式。模型结构、训练过程、评测服务和策略超参需要自己实现。完成一种实现即可。
+命令在 `startcode/` 下执行。这里提供了仿真环境、示范数据读取，以及 [Diffusion](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/DP/README.md) 和 [ACT](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/ACT/README.md) 两条链路的启动方式。Diffusion 已提供离线训练基线；在线训练和评测服务仍需实现。完成一种路线即可。
 
 不启动仿真时，可以先检查环境和数据接口：
 
@@ -128,6 +128,20 @@ bash scripts/train_dp.sh
 bash scripts/train_act.sh
 ```
 
+运行 Diffusion 离线基线前，在策略环境安装 `python3 -m pip install -r requirements-dp.txt`，并按前文准备示范和 XPolicyLab。至少需要两条示范，训练集和验证集按轨迹划分。默认预测 16 步动作，训练 20 个 epoch；有 CUDA 时使用 `policy_gpu`，否则使用 CPU。可复制 `configs/env.yaml`，在副本中添加以下配置，再用 `bash scripts/train_dp.sh <配置文件>` 启动：
+
+```yaml
+diffusion:
+  epochs: 1
+  horizon: 16
+  image_size: 96
+  batch_size: 32
+  num_workers: 0
+  lr: 0.0003
+```
+
+最佳验证权重保存在 `outputs/dp/<run>/<stamp>/checkpoints/best.ckpt`，同次运行的 `metrics.csv` 记录训练和验证损失。用 `starter.policies.diffusion_model.load_policy(path)` 加载后，可调用 `predict_action_chunk(rgb, state)`，传入 RGB 图像和 16 维末端状态，得到 `[horizon, 16]` 的动作。训练目标参考 [Diffusion Policy 的原始实现](https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/policy/diffusion_unet_hybrid_image_policy.py)，调度器使用 Diffusers。
+
 评测时，策略服务在你的环境里监听端口，Isaac 客户端在镜像里运行。
 
 ```bash
@@ -186,10 +200,10 @@ HDF5 在 `data/RoboDojo/stack_blocks/arx_x5/data/episode_*.hdf5`。`starter.data
 
 ## 需要实现的部分
 
-两条链路都是先离线行为克隆，再在同一个 `stack_blocks` 任务里在线训练。超参写在你自己的配置里。起始代码没有学习率、扩散步数、clip、PPO 轮数或残差方差。
+两条链路都是先离线行为克隆，再在同一个 `stack_blocks` 任务里在线训练。在线训练超参写在你自己的配置里。
 
 1. `src/starter/policies/diffusion.py`
-  `train_offline` 读取 `stack_blocks` 示范。`train_online` 从这份权重继续，并用 `RemoteEnv` 与已经启动的仿真通信。`bash scripts/train_dp.sh` 和 `bash scripts/train_dppo.sh` 分别进入这两个函数。
+  `train_offline` 已可读取 `stack_blocks` 示范并保存权重。需要实现的 `train_online` 从这份权重继续，并用 `RemoteEnv` 与已经启动的仿真通信。`bash scripts/train_dp.sh` 和 `bash scripts/train_dppo.sh` 分别进入这两个函数。
 2. `src/starter/policies/act.py`
   同样分离线和在线。入口是 `bash scripts/train_act.sh` 和 `bash scripts/train_act_residual.sh`。
 3. `policies/diffusion/setup_eval_policy_server.sh` 和 `policies/act/setup_eval_policy_server.sh`

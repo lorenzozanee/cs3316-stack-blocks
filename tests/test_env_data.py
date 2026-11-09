@@ -1,4 +1,4 @@
-"""Environment and data contracts. Policy training is not implemented."""
+"""Environment and data contracts."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from starter.envs.stack_blocks import ParallelAdapter, StackBlocksAdapter
 from starter.interfaces import ACTION_DIM, pack_ee_action, unpack_ee_action
 from starter.policies.act import train_offline as act_offline
 from starter.policies.act import train_online as act_online
-from starter.policies.diffusion import train_offline as diffusion_offline
 from starter.policies.diffusion import train_online as diffusion_online
 from starter.rewards.intrinsic import combine_reward
 
@@ -201,7 +200,7 @@ class DataAndConfigTest(unittest.TestCase):
 
 class PolicySlotTest(unittest.TestCase):
     def test_policy_training_is_unimplemented(self):
-        for function in (diffusion_offline, diffusion_online, act_offline, act_online):
+        for function in (diffusion_online, act_offline, act_online):
             with self.assertRaises(NotImplementedError):
                 function({})
 
