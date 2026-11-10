@@ -1,4 +1,7 @@
-"""Conditional flow matching with a randomly initialized ViT and action DiT."""
+"""Conditional flow matching with a randomly initialized ViT and action DiT.
+
+Sources: see SOURCES.md.
+"""
 
 import math
 from collections import deque
@@ -186,17 +189,31 @@ class FlowMatchingPolicy(nn.Module):
     @torch.inference_mode()
     def sample_actions(self, images, states, *, num_inference_steps=None, generator=None):
         """Integrate the velocity field with midpoint RK2; call in eval mode."""
+        return self.sample_from_condition(
+            self.encode_observation(images, states),
+            num_inference_steps=num_inference_steps, generator=generator,
+        )
+
+    @torch.inference_mode()
+    def sample_from_condition(self, condition, *, initial_noise=None, num_inference_steps=None, generator=None):
+        """Reuse encoded observations; fixed noise makes a frozen base repeatable."""
         steps = self.inference_steps if num_inference_steps is None else num_inference_steps
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
             raise ValueError("num_inference_steps must be a positive integer.")
-        condition = self.encode_observation(images, states)
-        sample = torch.randn((len(states), self.horizon, ACTION_DIM), device=states.device, generator=generator)
+        memory, state = condition
+        shape = (len(state), self.horizon, ACTION_DIM)
+        if initial_noise is None:
+            sample = torch.randn(shape, device=state.device, generator=generator)
+        else:
+            sample = initial_noise.to(device=state.device, dtype=torch.float32).clone()
+            if sample.shape != shape or not torch.isfinite(sample).all():
+                raise ValueError(f"Expected finite initial_noise with shape {shape}.")
         dt = 1 / steps
         for index in range(steps):
-            time = torch.full((len(states),), index * dt, device=states.device)
-            velocity = self(sample, time, condition)
+            time = torch.full((len(state),), index * dt, device=state.device)
+            velocity = self(sample, time, (memory, state))
             midpoint = sample + velocity * (dt / 2)
-            sample = sample + self(midpoint, time + dt / 2, condition) * dt
+            sample = sample + self(midpoint, time + dt / 2, (memory, state)) * dt
         return self.denormalize_actions(sample)
 
     def reset(self):
@@ -241,4 +258,12 @@ def load_policy(path, device="cpu"):
               for key in ("state", "action") for side in ("min", "max")}
     model = FlowMatchingPolicy(**checkpoint["policy"], bounds=bounds)
     model.load_state_dict(weights)
+    model.policy_config = checkpoint["policy"]
+    if checkpoint.get("algorithm") == "residual_ppo":
+        from starter.policies.residual_model import ResidualPolicy
+
+        residual = ResidualPolicy(model, **checkpoint["residual_config"])
+        residual.head.load_state_dict(checkpoint["residual"])
+        residual.base_noise.copy_(checkpoint["base_noise"])
+        return residual.to(device).eval()
     return model.to(device).eval()

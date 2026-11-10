@@ -199,10 +199,14 @@ class DataAndConfigTest(unittest.TestCase):
 
 
 class PolicySlotTest(unittest.TestCase):
-    def test_policy_training_is_unimplemented(self):
-        for function in (diffusion_online, act_offline, act_online):
+    def test_act_training_is_unimplemented(self):
+        for function in (act_offline, act_online):
             with self.assertRaises(NotImplementedError):
                 function({})
+
+    def test_diffusion_online_requires_residual_ppo_config(self):
+        with self.assertRaisesRegex(KeyError, "residual_ppo"):
+            diffusion_online({})
 
 
 class RemoteResetTimeoutTest(unittest.TestCase):

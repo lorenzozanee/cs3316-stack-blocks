@@ -12,3 +12,6 @@ third_party/data
 .vscode/
 train_diffusion_offline.ipynb
 train_fm_offline.ipynb
+train_fm_offline_modelscope.ipynb
+train_fm_offline_amd.ipynb
+train_fm_offline_any.ipynb

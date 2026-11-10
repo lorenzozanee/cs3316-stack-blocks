@@ -1,6 +1,6 @@
 # 项目起点：方舟 X5 双臂堆积木
 
-命令在 `startcode/` 下执行。这里提供了仿真环境、示范数据读取，以及 [Diffusion](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/DP/README.md) 和 [ACT](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/ACT/README.md) 两条链路的启动方式。Diffusion 已提供离线训练基线；在线训练和评测服务仍需实现。完成一种路线即可。
+命令在 `startcode/` 下执行。这里提供了仿真环境、示范数据读取，以及 [Diffusion](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/DP/README.md) 和 [ACT](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/ACT/README.md) 两条链路的启动方式。Flow Matching 已提供离线训练和冻结基座的残差 PPO 在线训练；评测服务仍需实现。完成一种路线即可。
 
 不启动仿真时，可以先检查环境和数据接口：
 
@@ -118,7 +118,7 @@ conda activate dp    # 或 act
 
 在线训练时，策略进程留在当前环境，Isaac 由镜像启动。
 
-- `bash scripts/train_dppo.sh` 读取 `configs/env.yaml`，用 `scripts/run_online_env.sh` 执行 `docker run`，容器内运行 `scripts/isaac_env_server.py`。然后在当前环境调用 `starter.pipelines.diffusion` 的 online 阶段。
+- `bash scripts/train_dppo.sh` 读取 `configs/env.yaml`，用 `scripts/run_online_env.sh` 执行 `docker run`，容器内运行 `scripts/isaac_env_server.py`。然后在当前环境调用 `starter.pipelines.diffusion` 的 online 阶段，训练冻结 Flow Matching 基座的残差 PPO。
 - `bash scripts/train_act_residual.sh` 同样启动镜像，再调用 `starter.pipelines.act` 的 online 阶段。
 
 离线阶段不启动镜像：
@@ -152,7 +152,64 @@ diffusion:
 
 checkpoint 保存在 `outputs/dp/<run>/<stamp>/checkpoints/`：首轮、每 10 轮和末轮写出阶段 EMA 权重 `epoch_XXXX.ckpt`，`last.ckpt` 额外保存优化器、调度器、原始权重和随机数状态。离线阶段没有环境回报，报告中的回报曲线需由在线训练或仿真评测提供。
 
-用 `starter.policies.diffusion_model.load_policy(path)` 加载新训练的 checkpoint，再调用 `predict_action_chunk(rgb, state)`，输入头部 RGB 和 16 维末端状态，得到 `[horizon, 16]` 动作；每个 episode 开头调用 `reset()`。复现实验时保留配置、种子、`metrics.csv`、曲线和 checkpoint；checkpoint 也记录了实际使用的示范轨迹。
+用 `starter.policies.diffusion_model.load_policy(path)` 加载离线 checkpoint，再调用 `predict_action_chunk(rgb, state)`，输入头部 RGB 和 16 维末端状态，得到 `[horizon, 16]` 动作；每个 episode 开头调用 `reset()`。复现实验时保留配置、种子、`metrics.csv`、曲线和 checkpoint；checkpoint 也记录了实际使用的示范轨迹。
+
+### Flow Matching 残差 PPO 在线训练
+
+入口文件名沿用历史 `train_dppo.sh`，实际训练的是冻结 Flow Matching 基座的残差 PPO，不是 DPPO。
+
+先准备离线 checkpoint。在 `configs/env.yaml` 中加入必填项：
+
+```yaml
+residual_ppo:
+  offline_checkpoint: outputs/dp/<run>/<stamp>/checkpoints/last.ckpt
+```
+
+运行：
+
+```bash
+bash scripts/train_dppo.sh
+```
+
+脚本固定读取 `configs/env.yaml`，要求 `policy_gpu` 和 `env_gpu` 不同，并通过 `scripts/run_online_env.sh` 以 `once=0` 启动常驻仿真服务；结束时停掉 `stack-blocks-dppo-env` 容器和后台服务。
+
+在线超参默认在 Python 中：`total_timesteps=100000`、`rollout_steps=128`、`ppo_epochs=10`、`minibatch_size=256`、`lr=0.0003`、`gamma=0.99`、`gae_lambda=0.95`、`clip_coef=0.2`、`value_coef=0.5`、`entropy_coef=0.0`、`target_kl=0.02`、`max_grad_norm=0.5`、`hidden_dim=256`、`initial_std=0.2`、`position_scale=0.02`、`quaternion_scale=0.05`、`gripper_scale=0.1`、`checkpoint_every=10`、`stats_window=100`。GPU、端口、任务、场景数等环境设置仍从配置文件读取。
+
+冻结的 Flow Matching 基座在每个重规划点用固定潜变量生成动作块，执行离线 checkpoint 中记录的 `action_steps` 步后重新规划。每一步的残差控制器读取当前头部 RGB 和 16 维本体，输出该步残差；残差经 tanh 和尺度限制，四元数归一化，夹爪裁到 `[0, 1]`。PPO 只对残差潜变量的高斯对数概率计算，基座不更新。环境得分保持 0/15/100，成功时 `terminated`；550 步截断时用价值函数 bootstrap。
+
+产物写到 `outputs/dp/<run>/<stamp>/`：`config.json`、`metrics.csv`、`episodes.csv`、`checkpoints/update_XXXXXX.ckpt` 和 `checkpoints/last.ckpt`。`starter.policies.diffusion_model.load_policy(path)` 同时加载离线和在线 checkpoint；在线 checkpoint 返回残差控制器，其 `predict_action_chunk(rgb, state)` 只返回一个 16 维动作，因此每一步都要提供新观测。
+
+在线训练每次更新在终端显示本轮已完成回合的平均回报、最近 `stats_window` 个已完成回合的平均回报和成功率，以及 actor/critic 损失。尚无完整回合时，回报和成功率留空，不记成零；滚动统计跨 PPO 更新保留。`episodes.csv` 逐回合保存累计环境交互步数、种子、长度、未经折扣的回报、最高/最终外部得分、成功与终止/截断标志；`metrics.csv` 保存逐次更新的回报、滚动统计和 PPO 指标。回报是每步外部得分之和，可能超过 100；成功率单独统计，15 分不算成功。
+
+首轮更新、每隔 `checkpoint_every` 次更新和训练结束时自动刷新 `plots/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `return_curve.png` | 完整回合原始回报与最近至多 `stats_window` 个回合的平均回报 |
+| `success_rate.png` | 同一回合窗口内的训练成功率 |
+| `episode_length.png` | 完整回合步数与滚动均值 |
+| `loss_curve.png` | PPO policy/value loss，分别使用两个子图 |
+
+横轴统一为所有并行场景累计的环境交互步数，回合曲线使用各回合实际完成的位置。还没有完整回合时显示无数据提示，不把 rollout 片段当作完整回合。Ctrl+C 后也会从已经写入的 CSV 刷新曲线。可单独重画已有日志：
+
+```bash
+PYTHONPATH=src python3 -m starter.policies.online_metrics "outputs/dp/<run>/<stamp>" --window 100
+```
+
+### 对照 PDF 的期中仿真交付要求
+
+选题 PDF 第 3 页要求保留配置、种子、学习曲线和检查点；第 4 页要求报告中的阶段性回报/损失结果，并注明开源来源。代码来源、直接依赖和本地修改说明见 [`src/starter/policies/SOURCES.md`](src/starter/policies/SOURCES.md)。
+
+| PDF 要求 | 当前覆盖情况 |
+| --- | --- |
+| 训练过程回报、损失等阶段性结果（第 4 页） | 在线 CSV、终端统计及上述四张曲线；离线损失曲线在离线训练目录中 |
+| 配置、种子、检查点、可加载权重（第 3–4 页） | 每次训练保存；离线/在线权重均可通过 `load_policy()` 加载 |
+| 技术报告中的算法、训练奖励、关键参数、改进与失败分析（第 3–4 页） | README、来源说明和运行日志提供依据，报告及对照/消融仍需根据实际实验撰写 |
+| 离线与在线模型分别统一评测（第 2、4 页） | 尚未完成：`policies/diffusion/setup_eval_policy_server.sh` 仍为占位入口 |
+| `_result.json` 和 `episode_*.mp4`（第 4、6 页） | 需实现评测服务并运行 RoboDojo 官方评测后产生，训练日志和训练成功率不能替代 |
+| 声称改进时至少 3 个随机种子、完整曲线与评测指标对照（第 4 页） | 当前每次运行记录一个训练种子；需分别运行实验并评测，单次训练不满足此项 |
+
+因此，`train_online()` 提供训练过程证据，尚不能单独产出全部期中提交材料。PDF 第 2 页的 `stack_blocks_random`、1/0 奖励表与当前起点代码的 `stack_blocks`、0/15/100 外部得分存在差异；本实现遵循当前仓库的任务约定，不修改外部奖励，提交时需确认课程实际使用的任务与评测口径。
 
 评测时，策略服务在你的环境里监听端口，Isaac 客户端在镜像里运行。
 
@@ -212,10 +269,10 @@ HDF5 在 `data/RoboDojo/stack_blocks/arx_x5/data/episode_*.hdf5`。`starter.data
 
 ## 需要实现的部分
 
-两条链路都是先离线行为克隆，再在同一个 `stack_blocks` 任务里在线训练。在线训练超参写在你自己的配置里。
+两条链路都是先离线行为克隆，再在同一个 `stack_blocks` 任务里在线训练。环境设置写在你自己的配置里，在线超参默认在 Python 中。
 
 1. `src/starter/policies/diffusion.py`
-  `train_offline` 已可读取 `stack_blocks` 示范并保存权重。需要实现的 `train_online` 从这份权重继续，并用 `RemoteEnv` 与已经启动的仿真通信。`bash scripts/train_dp.sh` 和 `bash scripts/train_dppo.sh` 分别进入这两个函数。
+  `train_offline` 从示范训练 Flow Matching 基座；`train_online` 已实现冻结该基座的残差 PPO，用 `RemoteEnv` 与已经启动的仿真通信。`bash scripts/train_dp.sh` 和 `bash scripts/train_dppo.sh` 分别进入这两个函数。
 2. `src/starter/policies/act.py`
   同样分离线和在线。入口是 `bash scripts/train_act.sh` 和 `bash scripts/train_act_residual.sh`。
 3. `policies/diffusion/setup_eval_policy_server.sh` 和 `policies/act/setup_eval_policy_server.sh`
@@ -227,11 +284,11 @@ HDF5 在 `data/RoboDojo/stack_blocks/arx_x5/data/episode_*.hdf5`。`starter.data
 
 两条都是先在 `stack_blocks` 的示范上做行为克隆，再在同一个任务里用环境得分做在线强化学习。观测是头部相机和 16 维末端状态。一次预测可以是未来一小段动作，执行其中的若干步再重新规划。网络用卷积、Transformer 还是别的结构，历史帧取几帧，损失和学习率取多少，都由你定。
 
-### [Diffusion Policy](https://github.com/real-stanford/diffusion_policy)，然后做 [DPPO](https://github.com/irom-princeton/dppo)
+### Flow Matching，然后做冻结基座的残差 PPO
 
-离线阶段把动作序列的生成看成条件去噪。给一个观测和某个噪声水平，网络预测这一水平上的噪声；对示范动作加噪后再预测，就是行为克隆。推理时从高斯噪声出发，按调度逐步去掉噪声，得到动作。
+离线阶段把行为克隆写成条件 Flow Matching：给一个观测和噪声水平，网络预测从噪声指向示范动作的速度场；推理时从固定潜变量出发积分，得到动作块。在线阶段冻结基座，只训练一个小的残差控制器。
 
-在线阶段把这条去噪链当成策略。可以只让最后几个去噪步保留高斯随机性，更早的步用后验均值，不再抽样。PPO 只用这些随机步的对数概率，并沿去噪顺序打折，使越靠近最终动作的步权重越大。回报来自环境得分，可以再加只在训练时使用的内在奖励。若评测加载的是 EMA 权重，参数更新后也要写回 EMA。步数、折扣、标准差下限和 clip 自己选。
+基座在每个重规划点用固定潜变量生成动作块，执行离线 checkpoint 中记录的 `action_steps` 步后重新规划。每一步残差控制器读取当前头部 RGB 和本体状态，输出一个受限残差并加到基座动作上。PPO 只对残差潜变量的高斯对数概率计算，不对基座的动作链或积分过程计算。残差应明显小于动作本身，四元数归一化，夹爪裁到 `[0, 1]`。回报直接使用环境得分 0/15/100，截断时用价值函数 bootstrap。PPO 实现可参考 CleanRL、Stable-Baselines3 等公开库。
 
 ### [ACT](https://github.com/tonyzhaozh/act)，然后做残差 PPO
 
