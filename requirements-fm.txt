@@ -1,0 +1,8 @@
+torch
+torchvision
+matplotlib
+h5py
+numpy
+opencv-python-headless
+PyYAML
+huggingface_hub

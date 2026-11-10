@@ -11,3 +11,4 @@ third_party/data
 *.pkl
 .vscode/
 train_diffusion_offline.ipynb
+train_fm_offline.ipynb

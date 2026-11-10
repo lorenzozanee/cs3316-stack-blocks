@@ -1,5 +1,7 @@
 torch
 diffusers
+torchvision
+matplotlib
 h5py
 numpy
 opencv-python-headless

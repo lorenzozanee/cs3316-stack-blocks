@@ -1,132 +1,139 @@
-"""Image-conditioned noise prediction and action sampling."""
+"""Conditional flow matching with a randomly initialized ViT and action DiT."""
+
+import math
+from collections import deque
 
 import torch
-from diffusers import DDPMScheduler
-from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 from torch import nn
-from torch.nn import functional as F
+from torchvision.models.vision_transformer import VisionTransformer
 
 from starter.data.diffusion import preprocess_image
 from starter.interfaces import ACTION_DIM
 
 
-class _ImageResidual(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+def _time_embedding(t, width):
+    frequencies = torch.exp(
+        -math.log(10000) * torch.arange(width // 2, device=t.device) / (width // 2)
+    )
+    angles = t.float()[:, None] * 1000 * frequencies[None]
+    return torch.cat((angles.cos(), angles.sin()), dim=-1)
+
+
+def _modulate(x, shift, scale):
+    return x * (1 + scale[:, None]) + shift[:, None]
+
+
+class _DiTBlock(nn.Module):
+    def __init__(self, width, heads, dropout):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
-            nn.GroupNorm(8, out_channels),
-            nn.SiLU(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(8, out_channels),
+        self.norms = nn.ModuleList(
+            nn.LayerNorm(width, elementwise_affine=False, eps=1e-6) for _ in range(3)
         )
-        self.skip = (
-            nn.Identity() if in_channels == out_channels and stride == 1
-            else nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False)
+        self.self_attention = nn.MultiheadAttention(width, heads, dropout=dropout, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(width, heads, dropout=dropout, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(width, width * 4), nn.GELU(approximate="tanh"),
+            nn.Dropout(dropout), nn.Linear(width * 4, width), nn.Dropout(dropout),
         )
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, width * 9))
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
 
-    def forward(self, x):
-        return F.silu(self.layers(x) + self.skip(x))
+    def forward(self, x, memory, condition):
+        shift1, scale1, gate1, shift2, scale2, gate2, shift3, scale3, gate3 = (
+            self.modulation(condition).chunk(9, dim=-1)
+        )
+        query = _modulate(self.norms[0](x), shift1, scale1)
+        x = x + gate1[:, None] * self.self_attention(query, query, query, need_weights=False)[0]
+        query = _modulate(self.norms[1](x), shift2, scale2)
+        x = x + gate2[:, None] * self.cross_attention(query, memory, memory, need_weights=False)[0]
+        return x + gate3[:, None] * self.mlp(_modulate(self.norms[2](x), shift3, scale3))
 
 
-class _VisionEncoder(nn.Module):
-    feature_dim = 128 * 4 + 32 * 2
-
-    def __init__(self):
+class FlowMatchingPolicy(nn.Module):
+    def __init__(
+        self, horizon, image_size, inference_steps, bounds, n_obs_steps=2, action_steps=4,
+        vision_dim=384, vision_depth=12, vision_heads=6, model_dim=512, depth=12,
+        num_heads=8, dropout=0.1,
+    ):
         super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 32, 5, stride=2, padding=2, bias=False),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            _ImageResidual(32, 48, stride=2),
-            _ImageResidual(48, 64, stride=2),
-            _ImageResidual(64, 96),
-            _ImageResidual(96, 128),
-        )
-        self.keypoints = nn.Conv2d(128, 32, 1)
-
-    def forward(self, image):
-        features = self.backbone(image)
-        h, w = features.shape[-2:]
-        heatmaps = self.keypoints(features).flatten(2).softmax(dim=-1).unflatten(-1, (h, w))
-        x = (torch.arange(w, device=features.device, dtype=features.dtype) + 0.5) * (2 / w) - 1
-        y = (torch.arange(h, device=features.device, dtype=features.dtype) + 0.5) * (2 / h) - 1
-        points = torch.stack((heatmaps.sum(dim=-2) @ x, heatmaps.sum(dim=-1) @ y), dim=-1)
-        pooled = F.adaptive_avg_pool2d(features, 2).flatten(1)
-        return torch.cat((pooled, points.flatten(1)), dim=-1)
-
-
-class _ConditionalResidual(nn.Module):
-    def __init__(self, in_channels, out_channels, context_dim):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, 3, padding=1)
-        self.norm = nn.GroupNorm(8, out_channels)
-        self.film = nn.Linear(context_dim, 2 * out_channels)
-        self.output = nn.Sequential(
-            nn.SiLU(),
-            nn.Conv1d(out_channels, out_channels, 3, padding=1),
-            nn.GroupNorm(8, out_channels),
-        )
-        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, 1)
-
-    def forward(self, x, context):
-        scale, bias = self.film(context).unsqueeze(-1).chunk(2, dim=1)
-        h = self.norm(self.conv(x))
-        return self.skip(x) + self.output(h * (1 + scale) + bias)
-
-
-class _ActionUNet(nn.Module):
-    def __init__(self, horizon, context_dim):
-        super().__init__()
-        self.position = nn.Parameter(torch.zeros(1, 96, horizon))
-        self.input = nn.Conv1d(ACTION_DIM, 96, 1)
-        self.down_blocks = nn.ModuleList(
-            _ConditionalResidual(width, width, context_dim) for width in (96, 192)
-        )
-        self.downsample = nn.ModuleList(
-            nn.Conv1d(a, b, 3, stride=2, padding=1) for a, b in ((96, 192), (192, 256))
-        )
-        self.middle = nn.ModuleList(_ConditionalResidual(256, 256, context_dim) for _ in range(2))
-        self.up_blocks = nn.ModuleList(
-            _ConditionalResidual(a + b, b, context_dim) for a, b in ((256, 192), (192, 96))
-        )
-        self.output = nn.Sequential(nn.GroupNorm(8, 96), nn.SiLU(), nn.Conv1d(96, ACTION_DIM, 1))
-
-    def forward(self, noisy_actions, context):
-        x = self.input(noisy_actions.transpose(1, 2)) + self.position
-        skips = []
-        for block, downsample in zip(self.down_blocks, self.downsample):
-            x = block(x, context)
-            skips.append(x)
-            x = downsample(x)
-        for block in self.middle:
-            x = block(x, context)
-        for block, skip in zip(self.up_blocks, reversed(skips)):
-            x = F.interpolate(x, size=skip.shape[-1], mode="nearest")
-            x = block(torch.cat((x, skip), dim=1), context)
-        return self.output(x).transpose(1, 2)
-
-
-class DiffusionPolicy(nn.Module):
-    def __init__(self, horizon, image_size, inference_steps, scheduler_config, bounds):
-        super().__init__()
+        sizes = (horizon, image_size, inference_steps, n_obs_steps, action_steps,
+                 vision_dim, vision_depth, vision_heads, model_dim, depth, num_heads)
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in sizes):
+            raise ValueError("Model sizes and inference_steps must be positive integers.")
+        if image_size % 16 or action_steps > horizon:
+            raise ValueError("image_size must be divisible by 16; action_steps must not exceed horizon.")
+        if vision_dim % vision_heads or model_dim % num_heads or model_dim % 2:
+            raise ValueError("Attention widths must be divisible by heads; model_dim must also be even.")
+        if not 0 <= dropout < 1:
+            raise ValueError("dropout must be in [0, 1).")
         self.horizon = horizon
         self.image_size = image_size
         self.inference_steps = inference_steps
-        self.scheduler = DDPMScheduler(**scheduler_config)
-        for key, value in bounds.items():
-            self.register_buffer(key, torch.as_tensor(value, dtype=torch.float32))
+        self.n_obs_steps = n_obs_steps
+        self.action_steps = action_steps
+        self.model_dim = model_dim
+        for key in ("state", "action"):
+            low, high = (torch.as_tensor(bounds[f"{key}_{side}"], dtype=torch.float32).clone()
+                         for side in ("min", "max"))
+            if low.shape != (ACTION_DIM,) or high.shape != low.shape:
+                raise ValueError("Normalization bounds must contain 16 values per vector.")
+            if not (torch.isfinite(low).all() and torch.isfinite(high).all() and (high >= low).all()):
+                raise ValueError("Normalization bounds must be finite and ordered.")
+            self.register_buffer(f"{key}_min", low)
+            self.register_buffer(f"{key}_max", high)
+        self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-        self.vision = _VisionEncoder()
-        self.proprio = nn.Sequential(nn.Linear(ACTION_DIM, 64), nn.SiLU())
-        self.condition = nn.Sequential(
-            nn.Linear(self.vision.feature_dim + 64, 256), nn.LayerNorm(256), nn.SiLU(),
+        self.vision = VisionTransformer(
+            image_size=image_size, patch_size=16, num_layers=vision_depth, num_heads=vision_heads,
+            hidden_dim=vision_dim, mlp_dim=vision_dim * 4, dropout=dropout,
+            attention_dropout=dropout,
         )
-        self.timestep = nn.Sequential(
-            Timesteps(128, flip_sin_to_cos=True, downscale_freq_shift=0),
-            TimestepEmbedding(128, 256, out_dim=128),
+        self.vision.heads = nn.Identity()
+        self.vision_projection = nn.Linear(vision_dim, model_dim)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(ACTION_DIM, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim),
         )
-        self.denoiser = _ActionUNet(horizon, context_dim=256 + 128)
+        patches = (image_size // 16) ** 2
+        self.spatial_position = nn.Parameter(torch.empty(1, 1, patches, model_dim))
+        self.observation_position = nn.Parameter(torch.empty(1, n_obs_steps, 1, model_dim))
+        self.action_position = nn.Parameter(torch.empty(1, horizon, model_dim))
+        for position in (self.spatial_position, self.observation_position, self.action_position):
+            nn.init.normal_(position, std=0.02)
+        self.memory_norm = nn.LayerNorm(model_dim)
+        self.input = nn.Linear(ACTION_DIM, model_dim)
+        self.time_encoder = nn.Sequential(
+            nn.Linear(model_dim, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim),
+        )
+        self.blocks = nn.ModuleList(_DiTBlock(model_dim, num_heads, dropout) for _ in range(depth))
+        self.output_norm = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
+        self.output_modulation = nn.Sequential(nn.SiLU(), nn.Linear(model_dim, model_dim * 2))
+        self.output = nn.Linear(model_dim, ACTION_DIM)
+        nn.init.zeros_(self.output_modulation[-1].weight)
+        nn.init.zeros_(self.output_modulation[-1].bias)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        self.reset()
+
+    @staticmethod
+    def canonicalize(values, *, strict=True):
+        """Use unit quaternions in the w>=0 hemisphere and bounded grippers."""
+        values = torch.as_tensor(values, dtype=torch.float32).clone()
+        if values.shape[-1] != ACTION_DIM or not torch.isfinite(values).all():
+            raise ValueError("Expected finite 16-D end-effector vectors.")
+        for start in (3, 11):
+            quat = values[..., start:start + 4]
+            norm = quat.norm(dim=-1, keepdim=True)
+            if strict and (norm < 1e-6).any():
+                raise ValueError("End-effector quaternions must have nonzero norm.")
+            identity = torch.zeros_like(quat)
+            identity[..., 0] = 1
+            quat = torch.where(norm < 1e-6, identity, quat / norm.clamp_min(1e-6))
+            values[..., start:start + 4] = torch.where(quat[..., :1] < 0, -quat, quat)
+        values[..., 7] = values[..., 7].clamp(0, 1)
+        values[..., 15] = values[..., 15].clamp(0, 1)
+        return values
 
     def normalize(self, x, key):
         low, high = getattr(self, f"{key}_min"), getattr(self, f"{key}_max")
@@ -135,48 +142,103 @@ class DiffusionPolicy(nn.Module):
         return (x - (high + low) / 2) / scale
 
     def denormalize_actions(self, sample):
-        return self.action_min + (sample + 1) * (self.action_max - self.action_min) / 2
+        half_range = (self.action_max - self.action_min) / 2
+        actions = sample.clamp(-1, 1) * half_range + (self.action_max + self.action_min) / 2
+        return self.canonicalize(actions, strict=False)
 
-    def encode_observation(self, image, state):
-        features = self.vision(image.float() / 255)
-        proprio = self.proprio(self.normalize(state, "state"))
-        return self.condition(torch.cat((features, proprio), dim=-1))
+    def encode_observation(self, images, states):
+        expected = (self.n_obs_steps, 3, self.image_size, self.image_size)
+        if images.ndim != 5 or tuple(images.shape[1:]) != expected:
+            raise ValueError(f"Expected images [B, {', '.join(map(str, expected))}].")
+        if tuple(states.shape) != (len(images), self.n_obs_steps, ACTION_DIM):
+            raise ValueError("Expected states [B, n_obs_steps, 16].")
+        batch = len(images)
+        image = images.flatten(0, 1).float() / 255
+        image = (image - self.image_mean) / self.image_std
+        tokens = self.vision.conv_proj(image).flatten(2).transpose(1, 2)
+        cls = self.vision.class_token.expand(len(tokens), -1, -1)
+        tokens = self.vision.encoder(torch.cat((cls, tokens), dim=1))[:, 1:]
+        tokens = self.vision_projection(tokens).reshape(batch, self.n_obs_steps, -1, self.model_dim)
+        tokens = tokens + self.spatial_position
+        state = self.state_encoder(self.normalize(states, "state"))
+        memory = torch.cat((tokens, state[:, :, None]), dim=2) + self.observation_position
+        return self.memory_norm(memory.flatten(1, 2)), state[:, -1]
 
     def forward(self, noisy_actions, timesteps, condition):
-        context = torch.cat((condition, self.timestep(timesteps)), dim=-1)
-        return self.denoiser(noisy_actions, context)
+        memory, state = condition
+        context = self.time_encoder(_time_embedding(timesteps, self.model_dim)) + state
+        x = self.input(noisy_actions) + self.action_position
+        for block in self.blocks:
+            x = block(x, memory, context)
+        shift, scale = self.output_modulation(context).chunk(2, dim=-1)
+        return self.output(_modulate(self.output_norm(x), shift, scale))
+
+    def loss(self, images, states, actions, valid_steps, *, generator=None):
+        actions = self.normalize(actions, "action")
+        noise = torch.randn(actions.shape, device=actions.device, generator=generator)
+        time = torch.rand(len(actions), device=actions.device, generator=generator)
+        interpolated = torch.lerp(noise, actions, time[:, None, None])
+        velocity = self(interpolated, time, self.encode_observation(images, states))
+        mask = torch.arange(self.horizon, device=actions.device)[None] < valid_steps[:, None]
+        error = (velocity.float() - (actions - noise)).square().mean(dim=-1)
+        return (error * mask).sum() / mask.sum()
 
     @torch.inference_mode()
     def sample_actions(self, images, states, *, num_inference_steps=None, generator=None):
+        """Integrate the velocity field with midpoint RK2; call in eval mode."""
         steps = self.inference_steps if num_inference_steps is None else num_inference_steps
-        if not 2 <= steps <= self.scheduler.config.num_train_timesteps:
-            raise ValueError("Sampling requires between 2 and num_train_timesteps denoising steps.")
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+            raise ValueError("num_inference_steps must be a positive integer.")
         condition = self.encode_observation(images, states)
-        device = states.device
-        sample = torch.randn((len(states), self.horizon, ACTION_DIM), device=device, generator=generator)
-        self.scheduler.set_timesteps(steps)
-        for step in self.scheduler.timesteps.tolist():
-            k = torch.full((len(states),), step, device=device, dtype=torch.long)
-            noise = self(sample, k, condition)
-            sample = self.scheduler.step(noise, step, sample, generator=generator).prev_sample
+        sample = torch.randn((len(states), self.horizon, ACTION_DIM), device=states.device, generator=generator)
+        dt = 1 / steps
+        for index in range(steps):
+            time = torch.full((len(states),), index * dt, device=states.device)
+            velocity = self(sample, time, condition)
+            midpoint = sample + velocity * (dt / 2)
+            sample = sample + self(midpoint, time + dt / 2, condition) * dt
         return self.denormalize_actions(sample)
 
+    def reset(self):
+        """Clear observation history at every episode boundary."""
+        self._images = deque(maxlen=self.n_obs_steps)
+        self._states = deque(maxlen=self.n_obs_steps)
+
     @torch.inference_mode()
-    def predict_action_chunk(self, rgb, state, *, num_inference_steps=None):
-        """Return a denormalized [horizon, 16] action chunk for one observation."""
-        device = self.state_min.device
-        image = torch.as_tensor(preprocess_image(rgb, self.image_size), device=device)
-        state = torch.as_tensor(state, device=device, dtype=torch.float32).reshape(1, ACTION_DIM)
-        return self.sample_actions(image.unsqueeze(0), state, num_inference_steps=num_inference_steps)[0]
+    def update_observation(self, rgb, state):
+        """Feed every environment step, including intermediate steps of an action chunk."""
+        image = torch.from_numpy(preprocess_image(rgb, self.image_size))
+        state = self.canonicalize(torch.as_tensor(state).reshape(ACTION_DIM)).cpu()
+        if not self._images:
+            for _ in range(self.n_obs_steps):
+                self._images.append(image)
+                self._states.append(state)
+        else:
+            self._images.append(image)
+            self._states.append(state)
+
+    @torch.inference_mode()
+    def predict_action_chunk(self, rgb=None, state=None, *, num_inference_steps=None):
+        """Return [horizon, 16] from history, optionally adding the current observation."""
+        if self.training:
+            raise RuntimeError("Call eval() before predicting actions.")
+        if (rgb is None) != (state is None):
+            raise ValueError("Provide both rgb and state, or use the existing observation history.")
+        if rgb is not None:
+            self.update_observation(rgb, state)
+        if not self._images:
+            raise ValueError("Feed an observation before requesting actions.")
+        device = self.action_min.device
+        images = torch.stack(tuple(self._images))[None].to(device)
+        states = torch.stack(tuple(self._states))[None].to(device)
+        return self.sample_actions(images, states, num_inference_steps=num_inference_steps)[0]
 
 
 def load_policy(path, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     weights = checkpoint["model"]
-    bounds = {
-        f"{key}_{bound}": weights[f"{key}_{bound}"]
-        for key in ("state", "action") for bound in ("min", "max")
-    }
-    model = DiffusionPolicy(**checkpoint["policy"], bounds=bounds)
+    bounds = {f"{key}_{side}": weights[f"{key}_{side}"]
+              for key in ("state", "action") for side in ("min", "max")}
+    model = FlowMatchingPolicy(**checkpoint["policy"], bounds=bounds)
     model.load_state_dict(weights)
     return model.to(device).eval()

@@ -128,28 +128,31 @@ bash scripts/train_dp.sh
 bash scripts/train_act.sh
 ```
 
-运行 Diffusion 离线基线前，在策略环境安装 `python3 -m pip install -r requirements-dp.txt`，并按前文准备示范和 XPolicyLab。至少需要两条示范，训练集和验证集按轨迹划分。默认预测 16 步动作，训练 20 个 epoch；有 CUDA 时使用 `policy_gpu`，否则使用 CPU。可复制 `configs/env.yaml`，在副本中添加以下配置，再用 `bash scripts/train_dp.sh <配置文件>` 启动：
+运行 Flow Matching 离线训练前，在策略环境安装 `python3 -m pip install -r requirements-fm.txt`，并按前文准备示范和 XPolicyLab。使用全部示范，不做轨迹留出。默认预测 16 步动作、取最近两帧观测，训练 100 个 epoch；有 CUDA 时使用 `policy_gpu`，否则使用 CPU。可复制 `configs/env.yaml`，在副本中添加以下配置，再用 `bash scripts/train_dp.sh <配置文件>` 启动：
 
 ```yaml
 diffusion:
-  epochs: 1
+  epochs: 100
   horizon: 16
-  image_size: 96
-  batch_size: 32
-  num_workers: 0
-  lr: 0.0003
+  action_steps: 4
+  n_obs_steps: 2
+  image_size: 224
+  batch_size: 16
+  num_workers: 4
+  lr: 0.0001
+  vision_lr: 0.0001
   inference_steps: 20
 ```
 
-每帧头部 RGB 只解码一次，缩放后以 `uint8` 放在内存中（默认约 27 KiB/帧）。动作窗口延伸到轨迹最后一帧，末尾不足一块时重复最后一个示范动作。状态和动作的归一化范围只从训练轨迹计算。
+头部 RGB 按需从 HDF5 解码，不把全部 224×224 图像放入内存。动作窗口延伸到轨迹最后一帧，末尾不足一块时重复最后一个示范动作；状态和动作的归一化范围从全部示范计算。训练使用轻量平移、颜色增强和 dropout 抑制过拟合。
 
-训练使用 DDPM 噪声预测、AdamW、学习率预热与余弦衰减，并以 EMA 权重验证。训练方法参考 [Diffusion Policy 的原始实现](https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/workspace/train_diffusion_unet_hybrid_workspace.py)，扩散调度器使用 Diffusers。
+模型从零初始化，不使用预训练权重：约 1.02 亿参数中，约 2166 万参数的 ViT 编码头部图像，其余约 8042 万参数的 DiT 预测动作速度场。训练使用 Flow Matching 回归、AdamW、5% 预热与余弦退火、混合精度、梯度裁剪和带预热的 EMA。视觉与动作参数默认学习率相同；`dropout`、`vision_lr` 等可覆盖。
 
-模型约有 347 万个参数（默认 16 步）。残差视觉编码器同时提取局部空间坐标和图像特征；一维 U-Net 在多个时间尺度上去噪，逐层注入观测和扩散步条件。旧版小网络的权重需要重新训练。
+`metrics.csv` 每轮记录 `train_loss`、`train_probe_action_mae`、`lr`、`grad_norm`、`samples` 和 `elapsed_s`。`train_probe_action_mae` 是从全部示范中抽取的固定训练窗口上的动作误差，不是独立验证集指标，也不能替代成功率。`steps.csv` 记录每次更新的损失、梯度范数和学习率。训练结束自动在 `outputs/dp/<run>/<stamp>/plots/` 生成损失曲线、动作误差曲线和学习率曲线，`config.json` 保存本次配置。
 
-`metrics.csv` 记录训练和验证去噪损失，以及 `val_action_mae`：对固定留出窗口用与部署相同的采样步数生成动作，在训练集归一化尺度上与真实动作比较，忽略填充步。按该误差保存最好的 EMA 权重到 `outputs/dp/<run>/<stamp>/checkpoints/best.ckpt`。这个误差用于离线选权重，堆叠成功率仍由仿真评测给出。
+checkpoint 保存在 `outputs/dp/<run>/<stamp>/checkpoints/`：首轮、每 10 轮和末轮写出阶段 EMA 权重 `epoch_XXXX.ckpt`，`last.ckpt` 额外保存优化器、调度器、原始权重和随机数状态。离线阶段没有环境回报，报告中的回报曲线需由在线训练或仿真评测提供。
 
-用 `starter.policies.diffusion_model.load_policy(path)` 加载新训练的 checkpoint，再调用 `predict_action_chunk(rgb, state)`，输入头部 RGB 和 16 维末端状态，得到 `[horizon, 16]` 动作。复现实验时保留配置、种子、`metrics.csv` 和 checkpoint；checkpoint 也记录了实际使用的训练与验证轨迹。
+用 `starter.policies.diffusion_model.load_policy(path)` 加载新训练的 checkpoint，再调用 `predict_action_chunk(rgb, state)`，输入头部 RGB 和 16 维末端状态，得到 `[horizon, 16]` 动作；每个 episode 开头调用 `reset()`。复现实验时保留配置、种子、`metrics.csv`、曲线和 checkpoint；checkpoint 也记录了实际使用的示范轨迹。
 
 评测时，策略服务在你的环境里监听端口，Isaac 客户端在镜像里运行。
 
