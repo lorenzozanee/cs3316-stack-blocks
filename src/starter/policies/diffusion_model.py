@@ -146,23 +146,27 @@ class FlowMatchingPolicy(nn.Module):
         actions = sample.clamp(-1, 1) * half_range + (self.action_max + self.action_min) / 2
         return self.canonicalize(actions, strict=False)
 
-    def encode_observation(self, images, states):
+    def encode_visual(self, images):
         expected = (self.n_obs_steps, 3, self.image_size, self.image_size)
         if images.ndim != 5 or tuple(images.shape[1:]) != expected:
             raise ValueError(f"Expected images [B, {', '.join(map(str, expected))}].")
-        if tuple(states.shape) != (len(images), self.n_obs_steps, ACTION_DIM):
-            raise ValueError("Expected states [B, n_obs_steps, 16].")
-        batch = len(images)
         image = images.flatten(0, 1).float() / 255
         image = (image - self.image_mean) / self.image_std
         tokens = self.vision.conv_proj(image).flatten(2).transpose(1, 2)
         cls = self.vision.class_token.expand(len(tokens), -1, -1)
         tokens = self.vision.encoder(torch.cat((cls, tokens), dim=1))[:, 1:]
-        tokens = self.vision_projection(tokens).reshape(batch, self.n_obs_steps, -1, self.model_dim)
-        tokens = tokens + self.spatial_position
+        return tokens.reshape(len(images), self.n_obs_steps, -1, self.vision.hidden_dim)
+
+    def condition_from_visual(self, visual, states):
+        if tuple(states.shape) != (len(visual), self.n_obs_steps, ACTION_DIM):
+            raise ValueError("Expected states [B, n_obs_steps, 16].")
+        tokens = self.vision_projection(visual) + self.spatial_position
         state = self.state_encoder(self.normalize(states, "state"))
         memory = torch.cat((tokens, state[:, :, None]), dim=2) + self.observation_position
         return self.memory_norm(memory.flatten(1, 2)), state[:, -1]
+
+    def encode_observation(self, images, states):
+        return self.condition_from_visual(self.encode_visual(images), states)
 
     def forward(self, noisy_actions, timesteps, condition):
         memory, state = condition
@@ -183,13 +187,13 @@ class FlowMatchingPolicy(nn.Module):
         error = (velocity.float() - (actions - noise)).square().mean(dim=-1)
         return (error * mask).sum() / mask.sum()
 
-    @torch.inference_mode()
-    def sample_actions(self, images, states, *, num_inference_steps=None, generator=None):
-        """Integrate the velocity field with midpoint RK2; call in eval mode."""
+    @torch.no_grad()
+    def sample_normalized_actions(self, condition, *, num_inference_steps=None, generator=None):
+        """Sample before clipping and pose projection, preserving the flow action for RL."""
         steps = self.inference_steps if num_inference_steps is None else num_inference_steps
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
             raise ValueError("num_inference_steps must be a positive integer.")
-        condition = self.encode_observation(images, states)
+        states = condition[1]
         sample = torch.randn((len(states), self.horizon, ACTION_DIM), device=states.device, generator=generator)
         dt = 1 / steps
         for index in range(steps):
@@ -197,6 +201,14 @@ class FlowMatchingPolicy(nn.Module):
             velocity = self(sample, time, condition)
             midpoint = sample + velocity * (dt / 2)
             sample = sample + self(midpoint, time + dt / 2, condition) * dt
+        return sample
+
+    @torch.inference_mode()
+    def sample_actions(self, images, states, *, num_inference_steps=None, generator=None):
+        condition = self.encode_observation(images, states)
+        sample = self.sample_normalized_actions(
+            condition, num_inference_steps=num_inference_steps, generator=generator,
+        )
         return self.denormalize_actions(sample)
 
     def reset(self):

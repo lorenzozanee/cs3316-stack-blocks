@@ -374,17 +374,11 @@ def train_offline(config: dict) -> Path:
     return last_checkpoint
 
 
-def train_online(config: dict) -> None:
-    """Fine-tune the offline diffusion policy in ``stack_blocks``.
+def train_online(config: dict) -> Path:
+    """Fine-tune the pretrained flow policy with FPO++ and a frozen visual encoder."""
+    from starter.policies.fpo import train_fpo
 
-    ``scripts/train_dppo.sh`` has already started Isaac in the simulator image.
-    Connect with ``starter.envs.remote.RemoteEnv`` using ``env_host`` and
-    ``env_port``. Keep the environment score. Do not feed privileged block
-    poses to the policy. The policy process and Isaac are on different GPUs.
-    """
-
-    del config
-    raise NotImplementedError("实现扩散策略的在线微调。从离线 checkpoint 继续，不要随机初始化。")
+    return train_fpo(config)
 
 
 def _positive_int(options, key, default, minimum=1):

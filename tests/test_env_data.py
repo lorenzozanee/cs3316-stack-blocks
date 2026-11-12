@@ -7,6 +7,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import ModuleType
+from unittest.mock import Mock, patch
 
 from starter.config import load_config, parse_simple_yaml
 from starter.data.demos import hold_demos
@@ -168,7 +170,7 @@ class DataAndConfigTest(unittest.TestCase):
         self.assertEqual(len(action), ACTION_DIM)
         self.assertEqual(len(observation), ACTION_DIM + 1)
 
-    def test_shipped_configs_omit_policy_hyperparameters(self):
+    def test_environment_configs_omit_policy_hyperparameters(self):
         env = load_config(ROOT / "configs/env.yaml")
         evaluation = load_config(ROOT / "configs/eval.yaml")
         self.assertEqual(env["rollout_task"], "stack_blocks")
@@ -179,8 +181,12 @@ class DataAndConfigTest(unittest.TestCase):
         self.assertEqual(evaluation["action_type"], "ee")
         blob = "\n".join(
             path.read_text(encoding="utf-8")
-            for path in (ROOT / "configs").glob("*.yaml")
+            for path in (ROOT / "configs/env.yaml", ROOT / "configs/eval.yaml")
         )
+        training = load_config(ROOT / "configs/fpo.yaml")
+        self.assertEqual(training["num_envs"], 1)
+        self.assertIn("learning_rate", training["fpo"])
+        self.assertIn("gamma", training["fpo"])
         for key in ("learning_rate", "clip:", "denoising", "residual_std", "ppo_epochs", "gamma:"):
             self.assertNotIn(key, blob)
         image_env = (ROOT / "configs/sim_image.env").read_text(encoding="utf-8")
@@ -199,10 +205,19 @@ class DataAndConfigTest(unittest.TestCase):
 
 
 class PolicySlotTest(unittest.TestCase):
-    def test_policy_training_is_unimplemented(self):
-        for function in (diffusion_online, act_offline, act_online):
+    def test_act_training_is_unimplemented(self):
+        for function in (act_offline, act_online):
             with self.assertRaises(NotImplementedError):
                 function({})
+
+    def test_diffusion_online_delegates_to_fpo(self):
+        module = ModuleType("starter.policies.fpo")
+        train = Mock(return_value=Path("last.ckpt"))
+        module.train_fpo = train
+        config = {"fpo": {"checkpoint": "offline.ckpt"}}
+        with patch.dict("sys.modules", {"starter.policies.fpo": module}):
+            self.assertEqual(diffusion_online(config), Path("last.ckpt"))
+        train.assert_called_once_with(config)
 
 
 class RemoteResetTimeoutTest(unittest.TestCase):

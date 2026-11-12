@@ -1,0 +1,25 @@
+# FPO++ 在线微调。顶层键覆盖 configs/env.yaml 的同名键，fpo 块只给在线训练。
+# 算法: Flow Policy Gradients for Robot Control, https://arxiv.org/abs/2602.02481
+# 实现参考: https://github.com/amazon-far/fpo-control
+# 视觉编码器冻结，不加 LoRA；动作网络和 value 网络更新（约 80.4m 参数，
+# 含 DiT 与状态投影），首轮只训 value。
+num_envs: 1
+
+fpo:
+  device: cuda
+  updates: 100
+  rollout_chunks: 64
+  minibatch_size: 16
+  microbatch_size: 1
+  cfm_samples: 8
+  update_epochs: 4
+  learning_rate: 0.00001
+  value_learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.01
+  value_clip: 0.2
+  max_grad_norm: 1.0
+  target_kl: 0.02
+  checkpoint_every: 10
+  output_dir: outputs/fpo
