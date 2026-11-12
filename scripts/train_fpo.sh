@@ -9,16 +9,17 @@ cd "${ROOT}"
 
 usage() {
   cat <<'EOF'
-用法: bash scripts/train_fpo.sh CHECKPOINT [TRAINING_CONFIG]
+用法: bash scripts/train_fpo.sh [CHECKPOINT] [TRAINING_CONFIG]
 
-  CHECKPOINT       在线训练起始的离线 checkpoint。
+  CHECKPOINT       可选，覆盖 fpo.yaml 的 fpo.checkpoint。
   TRAINING_CONFIG  在线训练配置，默认 configs/fpo.yaml。
 
 环境变量:
+  TRAINING_CONFIG=...    不传位置参数时指定训练配置。
   ENV_CONFIG=...         环境配置，默认 configs/env.yaml。
   EXTERNAL_ENV=1         仿真已在运行，不启动也不清理任何仿真资源。
   PREFLIGHT=1            只运行 pipeline 预检，不启动仿真。
-  RESUME_CHECKPOINT=...  从该 checkpoint 继续在线训练。
+  RESUME_CHECKPOINT=...  覆盖 fpo.yaml 的 fpo.resume。
   CONTAINER_LEARNER=1    用容器里的 CUDA torch 跑 pipeline，不用宿主 torch；
                          内部模式复用本次仿真容器，预检模式起短时容器，
                          外部模式需给 LEARNER_CONTAINER。
@@ -26,19 +27,19 @@ usage() {
 EOF
 }
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
+if [[ $# -gt 2 ]]; then
   usage >&2
   exit 2
 fi
-case "$1" in
+case "${1:-}" in
   -h|--help)
     usage
     exit 0
     ;;
 esac
 
-CHECKPOINT="$1"
-TRAINING_CONFIG="${2:-configs/fpo.yaml}"
+CHECKPOINT="${1:-}"
+TRAINING_CONFIG="${2:-${TRAINING_CONFIG:-configs/fpo.yaml}}"
 ENV_CONFIG="${ENV_CONFIG:-configs/env.yaml}"
 EXTERNAL_ENV="${EXTERNAL_ENV:-0}"
 PREFLIGHT="${PREFLIGHT:-0}"
@@ -94,16 +95,10 @@ require_file() {
   fi
 }
 
-CHECKPOINT="$(absolute "${CHECKPOINT}")"
-require_file "${CHECKPOINT}" "checkpoint "
 TRAINING_CONFIG="$(absolute "${TRAINING_CONFIG}")"
 require_file "${TRAINING_CONFIG}" "训练配置 "
 ENV_CONFIG="$(absolute "${ENV_CONFIG}")"
 require_file "${ENV_CONFIG}" "环境配置 "
-if [[ -n "${RESUME_CHECKPOINT}" ]]; then
-  RESUME_CHECKPOINT="$(absolute "${RESUME_CHECKPOINT}")"
-  require_file "${RESUME_CHECKPOINT}" "resume checkpoint "
-fi
 
 # Training config top-level keys override env config keys. Only the fields the
 # launcher needs are read here; fpo.* stays owned by the trainer.
@@ -123,6 +118,10 @@ if not isinstance(fpo, dict):
 output_dir = fpo.get("output_dir")
 if not isinstance(output_dir, str) or not output_dir.strip():
     raise SystemExit(f"{train_path}: fpo.output_dir 必须是非空字符串。")
+checkpoint = fpo.get("checkpoint") or ""
+resume = fpo.get("resume") or ""
+if not isinstance(checkpoint, str) or not isinstance(resume, str):
+    raise SystemExit(f"{train_path}: fpo.checkpoint 和 fpo.resume 必须是字符串。")
 
 
 def value(key):
@@ -155,6 +154,8 @@ fields = {
     "ENV_CFG_NAME": text("env_cfg"),
     "NUM_ENVS": integer("num_envs", 1),
     "FPO_OUTPUT_DIR": output_dir,
+    "CONFIG_CHECKPOINT": checkpoint,
+    "CONFIG_RESUME": resume,
 }
 for name, item in fields.items():
     print(f"{name}={shlex.quote(str(item))}")
@@ -163,6 +164,23 @@ PY
   exit 1
 fi
 eval "${META}"
+
+if [[ -z "${CHECKPOINT}" ]]; then
+  CHECKPOINT="${CONFIG_CHECKPOINT}"
+fi
+if [[ -z "${CHECKPOINT}" ]]; then
+  echo "没有 checkpoint：设置 ${TRAINING_CONFIG} 的 fpo.checkpoint，或把它作为第一个参数。" >&2
+  exit 1
+fi
+CHECKPOINT="$(absolute "${CHECKPOINT}")"
+require_file "${CHECKPOINT}" "checkpoint "
+if [[ -z "${RESUME_CHECKPOINT}" ]]; then
+  RESUME_CHECKPOINT="${CONFIG_RESUME}"
+fi
+if [[ -n "${RESUME_CHECKPOINT}" ]]; then
+  RESUME_CHECKPOINT="$(absolute "${RESUME_CHECKPOINT}")"
+  require_file "${RESUME_CHECKPOINT}" "resume checkpoint "
+fi
 
 FPO_OUTPUT_DIR="$(absolute "${FPO_OUTPUT_DIR}")"
 if [[ "${CONTAINER_LEARNER}" == "1" && -z "${LEARNER_CONTAINER}" ]]; then

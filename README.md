@@ -95,7 +95,7 @@ docker image inspect stack-blocks-policy:dp-act >/dev/null && echo "policy ok"
 
 策略镜像是参考环境，不是必须项。里面是 Ubuntu 22.04、Miniconda，以及两个空的 Python 3.10 环境 `dp` 和 `act`。没有 Isaac，没有训练好的权重，也还没有 PyTorch 或模型库。训练脚本不会启动它。可以不使用这个镜像，在宿主机用 conda 或 venv 自己装依赖，再激活后运行下面的脚本。
 
-如果用它作参考，挂上本目录后进入容器，在 `dp` 或 `act` 里安装你的实现所需的包。只想对照上游 DP / ACT 的依赖时，可以在容器里对克隆下来的 XPolicyLab 执行 `policy/DP/install.sh` 和 `policy/ACT/install.sh`。离线训练可以在这个容器里跑。在线训练要能再启动仿真容器：把宿主机的容器套接字挂进策略容器，或者更直接地在宿主机环境里执行 `train_fpo.sh <checkpoint>` / `train_act_residual.sh`，让这两个脚本去启动仿真镜像。
+如果用它作参考，挂上本目录后进入容器，在 `dp` 或 `act` 里安装你的实现所需的包。只想对照上游 DP / ACT 的依赖时，可以在容器里对克隆下来的 XPolicyLab 执行 `policy/DP/install.sh` 和 `policy/ACT/install.sh`。离线训练可以在这个容器里跑。在线训练要能再启动仿真容器：把宿主机的容器套接字挂进策略容器，或者更直接地在宿主机环境里执行 `train_fpo.sh` / `train_act_residual.sh`，让这两个脚本去启动仿真镜像。
 
 ```bash
 docker run --rm -it \
@@ -118,7 +118,7 @@ conda activate dp    # 或 act
 
 在线训练时，策略进程留在当前环境，Isaac 由镜像启动。
 
-- `bash scripts/train_fpo.sh <离线checkpoint>` 合并 `configs/env.yaml` 和 `configs/fpo.yaml`，用 `scripts/run_online_env.sh` 启动单环境 Isaac，再调用 `starter.pipelines.diffusion` 的 online 阶段。策略与渲染共用 `policy_gpu`，不需要第二张显卡。
+- `bash scripts/train_fpo.sh` 合并 `configs/env.yaml` 和 `configs/fpo.yaml`（checkpoint 取 `fpo.checkpoint`），用 `scripts/run_online_env.sh` 启动 Isaac（默认 4 环境），再调用 `starter.pipelines.diffusion` 的 online 阶段。策略与渲染共用 `policy_gpu`，不需要第二张显卡。
 - `bash scripts/train_act_residual.sh` 同样启动镜像，再调用 `starter.pipelines.act` 的 online 阶段。
 
 离线阶段不启动镜像：
@@ -160,30 +160,34 @@ checkpoint 保存在 `outputs/dp/<run>/<stamp>/checkpoints/`：首轮、每 10 �
 
 在线阶段只需要兼容的离线 checkpoint 和仿真资产，不读取离线示范。固定冻结视觉 ViT、不加 LoRA，更新动作网络与小型 value MLP。默认第一轮只训练 value；其后对在线动作的 CFM 误差构造代理比率，无需精确动作似然或对采样积分链反向传播。采样与更新都关闭 dropout，复用相同噪声、时间与旧误差。
 
+checkpoint 和续训路径写在 `configs/fpo.yaml` 的 `fpo.checkpoint`、`fpo.resume`。命令行第一个参数可以临时覆盖 checkpoint。
+
 ```bash
-CHECKPOINT='outputs/dp/<run>/<stamp>/checkpoints/last.ckpt'
-CONTAINER_LEARNER=1 PREFLIGHT=1 bash scripts/train_fpo.sh "$CHECKPOINT"
-CONTAINER_LEARNER=1 bash scripts/train_fpo.sh "$CHECKPOINT"
+CONTAINER_LEARNER=1 PREFLIGHT=1 bash scripts/train_fpo.sh
+CONTAINER_LEARNER=1 bash scripts/train_fpo.sh
+# 临时换一个离线权重
+CONTAINER_LEARNER=1 bash scripts/train_fpo.sh 'outputs/dp/<run>/<stamp>/checkpoints/last.ckpt'
 ```
 
 `CONTAINER_LEARNER=1` 复用现有仿真镜像的 CUDA PyTorch：预检启动短时 Python 容器，正式训练在本次 Isaac 容器中另起学习进程，不需要为宿主安装 CUDA PyTorch。容器模式要求配置、checkpoint 和输出都在项目目录内。宿主已有可用的 CUDA PyTorch 时，可以去掉这个环境变量。
 
-预检用合成输入执行一次更新并写 `preflight.json`，不连接仿真、不保存训练权重；它验证训练更新的梯度和显存，不覆盖 Isaac 渲染开销或证明任务成功率。实际训练合并 `configs/env.yaml` 与 `configs/fpo.yaml`；后者默认单环境、microbatch 1、8 组 CFM 噪声/时间样本，并把视觉特征和 rollout 存在 CPU。CFM 样本逐组反传，梯度累积后才更新；CUDA 使用 BF16 或 FP16。
+预检用合成输入执行一次更新并写 `preflight.json`，不连接仿真、不保存训练权重；它验证训练更新的梯度和显存，不覆盖 Isaac 渲染开销或证明任务成功率。实际训练合并 `configs/env.yaml` 与 `configs/fpo.yaml`；后者默认 4 个并行环境、microbatch 1、8 组 CFM 噪声/时间样本，并把视觉特征和 rollout 存在 CPU。单卡 12GB 实测 4 环境整卡峰值约 10.1GB，其中训练更新约 1.5GB；余量不足时降 `num_envs`。CFM 样本逐组反传，梯度累积后才更新；CUDA 使用 BF16 或 FP16。
 
 增加 `num_envs` 会增加仿真的场景、渲染显存和 CPU 开销；策略逐场景推理，更新始终按 microbatch 分块。`rollout_chunks` 是所有环境合计的动作块数量，不是每个环境的采样长度。增加环境数时，可按需要增加它以维持每个环境的采样长度。
 
 ```bash
 # 复制并调整在线训练参数。
 cp configs/fpo.yaml configs/fpo.local.yaml
-CONTAINER_LEARNER=1 bash scripts/train_fpo.sh "$CHECKPOINT" configs/fpo.local.yaml
+TRAINING_CONFIG=configs/fpo.local.yaml CONTAINER_LEARNER=1 bash scripts/train_fpo.sh
 # 宿主有 CUDA PyTorch 时，可连接已经单独启动的 RemoteEnv。
-EXTERNAL_ENV=1 bash scripts/train_fpo.sh "$CHECKPOINT"
+EXTERNAL_ENV=1 bash scripts/train_fpo.sh
 # 或在指定的现成容器内运行；两种外部模式都不清理外部仿真。
 EXTERNAL_ENV=1 CONTAINER_LEARNER=1 LEARNER_CONTAINER='<容器名>' \
-  bash scripts/train_fpo.sh "$CHECKPOINT"
+  bash scripts/train_fpo.sh
 # 从完整训练状态继续；fpo.updates 是总目标轮数。
-CONTAINER_LEARNER=1 RESUME_CHECKPOINT='outputs/fpo/<run>/<stamp>/checkpoints/last.ckpt' \
-  bash scripts/train_fpo.sh "$CHECKPOINT"
+CONTAINER_LEARNER=1 \
+  RESUME_CHECKPOINT='outputs/fpo/<run>/<stamp>/checkpoints/last.ckpt' \
+  bash scripts/train_fpo.sh
 ```
 
 每次默认预测 16 步并执行前 4 步，实际执行长度以 checkpoint 为准。中间每步更新各环境独立的历史，提前结束时停止该环境剩余动作；全部环境结束后统一 reset。动作块奖励按环境步折扣累加，bootstrap 使用 `gamma^实际步数`，GAE trace 使用 `(gamma * gae_lambda)^实际步数`。成功终止不 bootstrap，时间截断用最后观测 bootstrap，但不把 advantage 接到新回合。外部 0/15/100 得分保持原样，积木位姿不进入模型。
@@ -251,7 +255,7 @@ HDF5 在 `data/RoboDojo/stack_blocks/arx_x5/data/episode_*.hdf5`。`starter.data
 两条链路都是先离线行为克隆，再在同一个 `stack_blocks` 任务里在线训练。在线训练超参写在你自己的配置里。
 
 1. `src/starter/policies/diffusion.py`
-  `train_offline` 读取 `stack_blocks` 示范并保存权重；`train_online` 从 checkpoint 继续，通过 `RemoteEnv` 执行 FPO++ 微调。`bash scripts/train_dp.sh` 和 `bash scripts/train_fpo.sh <checkpoint>` 分别进入这两个函数。
+  `train_offline` 读取 `stack_blocks` 示范并保存权重；`train_online` 从 checkpoint 继续，通过 `RemoteEnv` 执行 FPO++ 微调。`bash scripts/train_dp.sh` 和 `bash scripts/train_fpo.sh` 分别进入这两个函数。
 2. `src/starter/policies/act.py`
   同样分离线和在线。入口是 `bash scripts/train_act.sh` 和 `bash scripts/train_act_residual.sh`。
 3. `policies/diffusion/setup_eval_policy_server.sh` 和 `policies/act/setup_eval_policy_server.sh`

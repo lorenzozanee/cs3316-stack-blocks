@@ -3,9 +3,15 @@
 # 实现参考: https://github.com/amazon-far/fpo-control
 # 视觉编码器冻结，不加 LoRA；动作网络和 value 网络更新（约 80.4m 参数，
 # 含 DiT 与状态投影），首轮只训 value。
-num_envs: 1
+# 单卡 12GB 实测 4 环境峰值约 10.1GB；余量不足时降为 2 或 1。
+num_envs: 4
+# seed 沿用 configs/env.yaml；多组种子实验改那里，run 目录名也会跟着变。
 
 fpo:
+  # 离线 checkpoint；命令行第一个参数可覆盖。改成你的离线 run。
+  checkpoint: outputs/2026.11.10-17.53.37/checkpoints/last.ckpt
+  # 续训时取消注释并指向 FPO 的 last.ckpt。
+  # resume: outputs/fpo/RoboDojo-stack_blocks-arx_x5-ee-0/<stamp>/checkpoints/last.ckpt
   device: cuda
   updates: 100
   rollout_chunks: 64

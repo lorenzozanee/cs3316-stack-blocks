@@ -184,7 +184,7 @@ class DataAndConfigTest(unittest.TestCase):
             for path in (ROOT / "configs/env.yaml", ROOT / "configs/eval.yaml")
         )
         training = load_config(ROOT / "configs/fpo.yaml")
-        self.assertEqual(training["num_envs"], 1)
+        self.assertEqual(training["num_envs"], 4)
         self.assertIn("learning_rate", training["fpo"])
         self.assertIn("gamma", training["fpo"])
         for key in ("learning_rate", "clip:", "denoising", "residual_std", "ppo_epochs", "gamma:"):
