@@ -474,7 +474,7 @@ class FPOTrainer:
             "algorithm": "fpo++", "model": self.policy.state_dict(), "policy": self.policy_config,
             "value": self.value.state_dict(), "iteration": self.iteration,
             "env_steps": self.env_steps, "completed_episodes": self.completed_episodes,
-            "next_seed": self.next_seed, "fpo": asdict(self.settings),
+            "seed": self.config.get("seed"), "next_seed": self.next_seed, "fpo": asdict(self.settings),
         }
         if full:
             payload.update({
@@ -594,6 +594,7 @@ class FPOTrainer:
                     checkpoint = self.save()
                     if iteration % settings.checkpoint_every == 0 or iteration == settings.updates:
                         self.save(full=False)
+                    _plot_online_metrics(self.run_dir)
                     print(
                         f"iteration={iteration}/{settings.updates} env_steps={self.env_steps} "
                         f"episodes={self.completed_episodes} actor_loss={metrics['actor_loss']:.5f} "
@@ -605,6 +606,83 @@ class FPOTrainer:
             raise ValueError("fpo.updates must exceed the iteration in the resumed checkpoint.")
         print(f"checkpoint={checkpoint}", flush=True)
         return checkpoint
+
+
+def _plot_online_metrics(run_dir):
+    """Write the return, success, loss, and KL curves for the report."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    def read(path, names):
+        columns = {name: [] for name in names}
+        if path.is_file():
+            with path.open(newline="") as file:
+                for row in csv.DictReader(file):
+                    for name in names:
+                        value = row.get(name, "")
+                        columns[name].append(float(value) if value not in ("", None) else math.nan)
+        return {name: np.asarray(values, dtype=np.float64) for name, values in columns.items()}
+
+    metrics = read(run_dir / "metrics.csv", (
+        "iteration", "success_rate", "mean_score", "mean_return",
+        "actor_loss", "value_loss", "approx_kl", "clip_fraction",
+    ))
+    iteration = metrics["iteration"]
+    if not iteration.size:
+        return None
+    episodes = read(run_dir / "episodes.csv", ("iteration", "success"))
+    cumulative = np.full(iteration.shape, np.nan)
+    if episodes["iteration"].size:
+        for index, update in enumerate(iteration):
+            seen = episodes["iteration"] <= update
+            if seen.any():
+                cumulative[index] = episodes["success"][seen].mean()
+
+    def save(path, panels):
+        fig, axes = plt.subplots(
+            len(panels), 1, figsize=(7, 3 * len(panels)), dpi=150, sharex=True, squeeze=False,
+        )
+        for ax, (title, ylabel, values, color) in zip(axes[:, 0], panels):
+            visible = np.isfinite(values)
+            if visible.any():
+                ax.plot(iteration[visible], values[visible], color=color, linewidth=1, alpha=0.25, label="Per update")
+                window = min(5, int(visible.sum()))
+                smooth = np.convolve(values[visible], np.ones(window) / window, mode="valid")
+                label = f"{window}-point mean" if window > 1 else "Per update"
+                ax.plot(iteration[visible][window - 1:], smooth, color=color, linewidth=2, label=label)
+                ax.legend(frameon=False, fontsize=8)
+            ax.set_title(title, loc="left", fontsize=10)
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="y", color="#e6e6e3", linewidth=0.8)
+            ax.set_axisbelow(True)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+        axes[-1, 0].set_xlabel("Update")
+        fig.tight_layout()
+        fig.savefig(path)
+        plt.close(fig)
+
+    plots = run_dir / "plots"
+    plots.mkdir(exist_ok=True)
+    save(plots / "return_curve.png", [
+        ("Episode return", "Return", metrics["mean_return"], "#2a78d6"),
+        ("Episode score", "Score", metrics["mean_score"], "#eb6834"),
+    ])
+    save(plots / "success_rate.png", [
+        ("Success rate per update", "Success (%)", metrics["success_rate"] * 100, "#2a78d6"),
+        ("Cumulative success rate", "Success (%)", cumulative * 100, "#eb6834"),
+    ])
+    save(plots / "loss_curve.png", [
+        ("Actor loss (clipped CFM surrogate)", "Loss", metrics["actor_loss"], "#2a78d6"),
+        ("Value loss", "Loss", metrics["value_loss"], "#eb6834"),
+    ])
+    save(plots / "kl_clip.png", [
+        ("Approximate KL", "KL", metrics["approx_kl"], "#2a78d6"),
+        ("Clip fraction", "Clipped (%)", metrics["clip_fraction"] * 100, "#eb6834"),
+    ])
+    return plots
 
 
 def train_fpo(config):

@@ -192,7 +192,7 @@ CONTAINER_LEARNER=1 \
 
 每次默认预测 16 步并执行前 4 步，实际执行长度以 checkpoint 为准。中间每步更新各环境独立的历史，提前结束时停止该环境剩余动作；全部环境结束后统一 reset。动作块奖励按环境步折扣累加，bootstrap 使用 `gamma^实际步数`，GAE trace 使用 `(gamma * gae_lambda)^实际步数`。成功终止不 bootstrap，时间截断用最后观测 bootstrap，但不把 advantage 接到新回合。外部 0/15/100 得分保持原样，积木位姿不进入模型。
 
-结果写入 `outputs/fpo/<run>/<stamp>/`：`metrics.csv` 记录损失、代理 KL、clip 比例、梯度范数与显存；`episodes.csv` 记录每回合得分、成功标记和种子。没有结束回合的更新不会生成成功率。`checkpoints/last.ckpt` 保存模型、value、优化器和随机状态，定期另存仅供推理的权重 checkpoint；两类权重都能用 `load_policy` 加载。断点续训恢复训练状态后从新回合开始，不恢复 Isaac 中途场景。
+结果写入 `outputs/fpo/<run>/<stamp>/`：`metrics.csv` 记录损失、代理 KL、clip 比例、梯度范数与显存；`episodes.csv` 记录每回合得分、成功标记和种子。训练中每次更新后在 `plots/` 生成回报、得分、成功率、损失和 KL 曲线，可直接用于报告；没有结束回合的更新不会生成成功率。`checkpoints/last.ckpt` 保存模型、value、优化器、随机状态和种子，定期另存仅供推理的权重 checkpoint；两类权重都能用 `load_policy` 加载。断点续训恢复训练状态后从新回合开始，不恢复 Isaac 中途场景。
 
 评测时，策略服务在你的环境里监听端口，Isaac 客户端在镜像里运行。
 

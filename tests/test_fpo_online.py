@@ -365,11 +365,16 @@ class OnlineTrainingTest(unittest.TestCase):
             self._assert_gae_covers_both_outcomes(gae_inputs)
 
             saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-            for key in ("model", "policy", "value", "actor_optimizer", "value_optimizer"):
+            for key in ("model", "policy", "value", "actor_optimizer", "value_optimizer", "seed"):
                 self.assertIn(key, saved)
+            self.assertEqual(saved["seed"], 0)
             self.assertTrue(saved["actor_optimizer"]["param_groups"])
             self.assertTrue(saved["value_optimizer"]["param_groups"])
             self.assertTrue(saved["value"])
+            for name in ("return_curve.png", "success_rate.png", "loss_curve.png", "kl_clip.png"):
+                plot = checkpoint.parent.parent / "plots" / name
+                self.assertTrue(plot.is_file(), name)
+                self.assertGreater(plot.stat().st_size, 0, name)
             staged = torch.load(
                 checkpoint.with_name("iteration_0001.ckpt"), map_location="cpu", weights_only=True,
             )
