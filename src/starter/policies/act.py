@@ -244,5 +244,6 @@ def train_online(config: dict) -> None:
     frozen action plus a residual. Keep the environment score, and do not feed
     privileged block poses to the policy.
     """
-    del config
-    raise NotImplementedError("实现冻结基座上的残差在线训练。")
+    from starter.policies.act_online import train_online as train_residual_ppo
+
+    train_residual_ppo(config)

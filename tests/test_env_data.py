@@ -201,13 +201,14 @@ class DataAndConfigTest(unittest.TestCase):
 
 class PolicySlotTest(unittest.TestCase):
     def test_remaining_policy_training_is_unimplemented(self):
-        for function in (diffusion_offline, diffusion_online, act_online):
+        for function in (diffusion_offline, diffusion_online):
             with self.assertRaises(NotImplementedError):
                 function({})
 
     def test_act_requires_explicit_configuration(self):
-        with self.assertRaises(KeyError):
-            act_offline({})
+        for function in (act_offline, act_online):
+            with self.subTest(function=function.__name__), self.assertRaises(KeyError):
+                function({})
 
     def test_act_rejects_missing_real_demonstrations(self):
         import tempfile

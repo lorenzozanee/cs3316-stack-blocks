@@ -1,6 +1,6 @@
 # ACT 评测接入
 
-仅评测适配；模型和离线训练使用 `src/starter/policies/act*.py`。支持 `RoboDojo / stack_blocks / arx_x5 / ee`，输入只使用 `cam_head` RGB 和 16 维末端状态。
+本目录负责评测适配；模型、离线训练和冻结基座的残差 PPO 在线训练使用 `src/starter/policies/act*.py`。支持 `RoboDojo / stack_blocks / arx_x5 / ee`，输入只使用 `cam_head` RGB 和 16 维末端状态。
 
 ## 环境
 
@@ -34,6 +34,8 @@ checkpoints/
 ```
 
 `configs/eval.yaml` 的 `ckpt` 指向具体 `.ckpt` 文件，默认 `policies/act/checkpoints/policy_last.ckpt`。最后权重在训练结束时写出；也可指定同目录下的中间检查点。权重通过保存的配置和统计量加载，不重新下载 ResNet 权重。开始新的训练运行后，需显式更新 `checkpoints` 链接或评测配置，避免误评其他模型。
+
+残差 PPO 在线产物位于 `outputs/act_residual/`。在线 `.ckpt` 包含冻结 ACT、残差 actor/critic 和归一化统计量；同目录保留标记 `policy_type: act_residual_ppo` 的 `config.json` 即可，不再需要额外 `dataset_stats.pkl`。将 `configs/eval.yaml` 的 `ckpt` 指向它，仍使用同一适配器。在线评测与训练一致，每步时间聚合基座动作，再加确定性残差均值；必须保持 `temporal_agg: true`。离线 checkpoint 继续支持整块动作执行和时间聚合两种评测方式。
 
 ## 检查和评测
 

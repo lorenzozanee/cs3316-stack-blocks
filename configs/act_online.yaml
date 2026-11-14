@@ -1,0 +1,24 @@
+# Residual PPO hyperparameters. Environment/task settings remain in env.yaml.
+# Supply the selected offline ACT checkpoint using --checkpoint.
+device: cuda
+temporal_agg: true
+finetune_updates: 100
+# Complete waves of num_envs; each scene keeps its own episode boundary.
+finetune_episodes: 8
+hidden_dim: 128
+# Corrections are clipped to this fraction of each offline action std.
+residual_scale: 0.05
+initial_std: 0.1
+lr: 3e-4
+gamma: 0.99
+gae_lambda: 0.95
+ppo_epochs: 10
+minibatch_size: 256
+clip_range: 0.2
+value_coef: 0.5
+entropy_coef: 0.0
+max_grad_norm: 0.5
+target_kl: 0.02
+save_freq: 25
+# Explicit opt-in is needed if policy and Isaac use the same physical GPU.
+allow_shared_gpu: false

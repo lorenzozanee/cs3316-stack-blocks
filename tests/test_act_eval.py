@@ -15,8 +15,10 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "third_party"))
+sys.path.insert(0, str(ROOT / "src"))
 
 from policies.act import model as adapter
+from starter.policies.act_inference import FrozenACTRunner
 
 
 class RecordingPolicy(torch.nn.Module):
@@ -62,13 +64,15 @@ class ACTEvalTest(unittest.TestCase):
                  "action_mean": np.zeros(16), "action_std": np.full(16, 2.0)}
         with (root / "dataset_stats.pkl").open("wb") as stream:
             pickle.dump(stats, stream)
+        self.stats = stats
         self.network = RecordingPolicy()
 
     def make_model(self, temporal=True):
         cfg = {"bench_name": "RoboDojo", "task_name": "stack_blocks", "env_cfg_type": "arx_x5",
                "action_type": "ee", "checkpoint_path": str(self.checkpoint),
                "device": "cpu", "temporal_agg": temporal}
-        with mock.patch.object(adapter, "load_offline_policy", return_value=self.network), \
+        runner = FrozenACTRunner(self.network, self.stats, "cpu", temporal_agg=temporal)
+        with mock.patch.object(adapter, "load_act_runner", return_value=(runner, None, None)), \
              mock.patch.object(adapter, "get_robot_action_dim_info", return_value={"arm_dim": [6, 6], "ee_dim": [1, 1]}):
             return adapter.Model(cfg)
 
@@ -99,10 +103,10 @@ class ACTEvalTest(unittest.TestCase):
         expected = 2 * (3 + 15 * np.exp(-0.01)) / (1 + np.exp(-0.01))
         self.assertAlmostEqual(float(second[0][0]["left_ee_pose"][0]), expected, places=5)
         self.assertEqual(len(second[0]), 1)
-        self.assertEqual(len(policy.histories[0]), 1)
-        self.assertEqual(len(policy.histories[2]), 2)
+        self.assertEqual(len(policy.runner.histories[0]), 1)
+        self.assertEqual(len(policy.runner.histories[2]), 2)
         policy.reset()
-        self.assertEqual(policy.histories, {})
+        self.assertEqual(policy.runner.histories, {})
         self.assertEqual(policy.observations, {})
 
     def test_temporal_history_is_bounded_and_aligns_current_step(self):
@@ -113,7 +117,7 @@ class ACTEvalTest(unittest.TestCase):
         weights = np.exp(-0.01 * np.arange(3))
         expected = 2 * np.dot([23, 32, 41], weights / weights.sum())
         self.assertAlmostEqual(float(action[0]["left_ee_pose"][0]), expected, places=5)
-        self.assertEqual(len(policy.histories[0]), 3)
+        self.assertEqual(len(policy.runner.histories[0]), 3)
 
     def test_nonfinite_predictions_fail_before_sending_actions(self):
         policy = self.make_model()

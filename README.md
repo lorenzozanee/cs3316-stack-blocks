@@ -1,6 +1,6 @@
 # 项目起点：方舟 X5 双臂堆积木
 
-命令在项目根目录下执行。这里保留了仿真环境、示范数据读取，以及 [Diffusion](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/DP/README.md) 和 [ACT](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/ACT/README.md) 两条链路的启动方式。ACT 离线预训练和评测接入已实现；Diffusion、在线训练和 Diffusion 评测服务仍需实现。
+命令在项目根目录下执行。这里保留了仿真环境、示范数据读取，以及 [Diffusion](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/DP/README.md) 和 [ACT](https://github.com/XPolicyLab/XPolicyLab/blob/main/policy/ACT/README.md) 两条链路的启动方式。ACT 离线预训练、冻结基座的残差 PPO 在线训练和评测接入已实现；Diffusion 训练和评测服务仍需实现。
 
 不启动仿真时，可以先检查环境和数据接口：
 
@@ -119,7 +119,7 @@ conda activate dp    # 或 act
 在线训练时，策略进程留在当前环境，Isaac 由镜像启动。
 
 - `bash scripts/train_dppo.sh` 读取 `configs/env.yaml`，用 `scripts/run_online_env.sh` 执行 `docker run`，容器内运行 `scripts/isaac_env_server.py`。然后在当前环境调用 `starter.pipelines.diffusion` 的 online 阶段。
-- `bash scripts/train_act_residual.sh` 同样启动镜像，再调用 `starter.pipelines.act` 的 online 阶段。
+- `bash scripts/train_act_residual.sh /path/to/offline.ckpt` 同样启动镜像，再调用 `starter.pipelines.act` 的 online 阶段；必须明确选择离线基座 checkpoint。
 
 离线阶段不启动镜像：
 
@@ -225,14 +225,14 @@ HDF5 在 `data/RoboDojo/stack_blocks/arx_x5/data/episode_*.hdf5`。`starter.data
 
 ## 需要实现的部分
 
-两条链路都是先离线行为克隆，再在同一个 `stack_blocks` 任务里在线训练。ACT 离线超参见 `configs/act.yaml`；Diffusion 和在线算法的超参仍需实现。
+两条链路都是先离线行为克隆，再在同一个 `stack_blocks` 任务里在线训练。ACT 离线超参见 `configs/act.yaml`，残差 PPO 超参见 `configs/act_online.yaml`；Diffusion 训练仍需实现。
 
 1. `src/starter/policies/diffusion.py`
   `train_offline` 读取 `stack_blocks` 示范。`train_online` 从这份权重继续，并用 `RemoteEnv` 与已经启动的仿真通信。`bash scripts/train_dp.sh` 和 `bash scripts/train_dppo.sh` 分别进入这两个函数。
 2. `src/starter/policies/act.py`
-  `train_offline` 已实现，入口为 `bash scripts/train_act.sh`；`train_online` 仍为占位，入口为 `bash scripts/train_act_residual.sh`。
+  `train_offline` 和 `train_online` 均已实现，入口分别为 `bash scripts/train_act.sh` 和 `bash scripts/train_act_residual.sh /path/to/offline.ckpt`。在线阶段使用冻结 ACT 上的残差 PPO，见下节。
 3. `policies/diffusion/setup_eval_policy_server.sh`
-  Diffusion 评测服务仍需实现。ACT 对应入口已配置，通过共享 WebSocket 服务加载本项目的 checkpoint；支持 RGB 预处理、状态与动作归一化、批量环境和时间聚合。参数顺序是：bench、task、checkpoint 文件、env_cfg、action_type、seed、policy_gpu、conda 环境名、端口、主机。离线检查点和在线检查点按上一节分开评。
+  Diffusion 评测服务仍需实现。ACT 对应入口已配置，通过共享 WebSocket 服务加载本项目的 checkpoint；支持 RGB 预处理、状态与动作归一化、批量环境和时间聚合。通过 `configs/eval.yaml` 配置任务、`ckpt`、GPU 和策略环境等参数。离线检查点和在线检查点按上一节分开评。
 
 
 
@@ -248,8 +248,41 @@ HDF5 在 `data/RoboDojo/stack_blocks/arx_x5/data/episode_*.hdf5`。`starter.data
 
 ### [ACT](https://github.com/tonyzhaozh/act)，然后做残差 PPO
 
+本地固定的 XPolicyLab 版本中，`policy/ACT/train.sh` 调用 `imitate_episodes.py` 的 `train_bc`，只提供离线行为克隆与评测，没有 ACT 在线 RL 或残差 PPO。离线损失中的 KL 属于 CVAE 正则项。下面的残差 PPO 是本项目实现，复用已训练的 ACT，而非 XPolicyLab 现成的在线算法。
+
 离线阶段训练一个确定性策略，由当前观测直接预测一段未来动作，用示范做行为克隆，然后冻结。原始 ACT 用条件变分结构把动作块和图像对齐，测试时潜变量取零；你也可以用别的确定性序列模型，只要能冻结、并能在同样的观测上重复给出基座动作。
 
 在线阶段不改基座。另学一个小的高斯残差，执行的动作是基座动作加残差。PPO 的对数概率只对残差计算。残差幅度应明显小于动作本身，否则一开始就会盖住已经克隆到的行为。基座权重在更新之后必须和冻结时相同。官方 ACT 常用三台相机；本作业只使用 `cam_head`。
+
+#### 运行残差 PPO
+
+```bash
+conda activate act
+bash scripts/train_act_residual.sh /absolute/path/to/offline.ckpt
+# 指定环境配置和 PPO 配置：
+bash scripts/train_act_residual.sh /absolute/path/to/offline.ckpt configs/env.yaml configs/act_online.yaml
+```
+
+如果已经启动了环境服务，可只运行学习器：
+
+```bash
+PYTHONPATH=src python -m starter.pipelines.act online \
+  --config configs/env.yaml --online-config configs/act_online.yaml \
+  --checkpoint /absolute/path/to/offline.ckpt
+```
+
+先用仿真成功率选择离线 checkpoint，不自动选择最新文件。`configs/env.yaml` 的 `policy_gpu`、`env_gpu` 都是物理卡号；单卡运行时设为同一卡，并在 `configs/act_online.yaml` 显式设置 `allow_shared_gpu: true`，按显存减小 `num_envs`，保持 `finetune_episodes` 是它的正整数倍。启动脚本会在创建容器前检查 checkpoint、配置和 GPU。全流程需要本地 Docker、Isaac 镜像与资产。
+
+实现约定：
+
+- 基座始终为 `eval`，梯度关闭；每次 PPO 更新后逐张量验证权重和 buffers 不变。训练与评测共用 RGB/状态归一化及上游 oldest-first 时间聚合，每步执行一个动作。
+- 残差 actor/critic 是两层 128 维 MLP，输入归一化本体状态、当前基座动作和冻结 ResNet 的 512 维视觉特征，不输入积木位姿。视觉特征从同一次 ACT 前向中提取。均值头初始为零。
+- 原始高斯残差用于 PPO 对数概率；执行时先裁到 `[-1,1]`，再乘 `residual_scale × action_std` 后加到基座动作。默认 `residual_scale=0.05`，初始高斯标准差 `0.1`，初期典型修正约为示范动作标准差的 0.5%。夹爪裁到 `[0,1]`，四元数归一化。
+- 外部 `0/15/100` 得分不修改。训练奖励使用相邻得分差，避免持续 15 分比尽早完成堆叠更有利；日志中的成功仍严格要求成功结束且得分为 100。
+- 环境只支持整批重置，因此按完整回合波次采样，已结束场景立即移出 active 列表。GAE 对成功终止不 bootstrap，对时间截断使用最终观测 bootstrap，不使用重置观测，也不生成填充场景的假样本。PPO 的裁剪目标、GAE 和优化使用项目现有 PyTorch 实现，未引入假定逐场景自动重置的 VecEnv。
+
+默认配置为每次更新 8 回合、100 次更新、PPO 10 轮、学习率 `3e-4`、clip `0.2`、`gamma=0.99`、`gae_lambda=0.95`、KL 提前停止阈值 `0.02`；具体参数集中在 `configs/act_online.yaml`。
+
+在线产物单独保存在 `outputs/act_residual/<任务与种子>/<时间戳>/`，包括配置、CSV/JSONL 指标、成功率/外部得分/PPO 损失曲线、周期 checkpoint 和 `policy_last.ckpt`。在线 checkpoint 包含冻结基座、残差、归一化统计量和优化器，不依赖原离线目录；评测时使用同目录 `config.json` 识别类型。沿用 `bash scripts/eval_policy.sh configs/eval.yaml`，将评测配置中的 `ckpt` 换成在线产物即可，评测执行残差均值，不采样噪声。离线与在线模型分别评测，不能用训练回报代替仿真成功率。
 
 不利用示范、也不设计内在奖励或课程的随机高斯策略，很难在 550 步内碰到 100 分。选题允许的直接在线学习，指的是 PPO、SAC 这一类，并配上合理的内在奖励、探索或课程，而且仍然不改外部得分。离线策略如果一次都堆不成功，在线阶段也看不到 100 分。15 分是中途信号，可以进入回报，不能改成成功。
