@@ -1,0 +1,34 @@
+# Offline ACT baseline, adapted to stack_blocks / arx_x5 / ee / cam_head.
+# Architecture/loss match XPolicyLab ACT. Use all demos and a shorter initial BC run.
+# Select periodic checkpoints by simulator scores before residual RL.
+bench_name: RoboDojo
+data_task: stack_blocks
+env_cfg: arx_x5
+action_type: ee
+camera_names:
+  - cam_head
+data_path: data/RoboDojo/stack_blocks/arx_x5
+num_episodes: 100
+seed: 0
+device: cuda
+policy_gpu: 0
+
+hidden_dim: 512
+dim_feedforward: 3200
+enc_layers: 4
+dec_layers: 7
+nheads: 8
+dropout: 0.1
+chunk_size: 50
+kl_weight: 10
+pretrained_backbone: true
+
+batch_size: 16
+num_workers: 4
+num_epochs: 6000
+# First-epoch learning rates; cosine annealing reaches lr_min in the last epoch.
+lr: 1e-5
+lr_backbone: 1e-5
+lr_min: 1e-6
+weight_decay: 1e-4
+save_freq: 500

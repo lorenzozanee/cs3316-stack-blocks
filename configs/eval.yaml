@@ -1,0 +1,16 @@
+# Narrow evaluation configuration for one student checkpoint.
+# The policy server and the Isaac client may share the same GPU.
+task: stack_blocks
+env_cfg: arx_x5
+action_type: ee
+seed: 1
+# native uses the per-task episode count from RoboDojo.
+eval_num: native
+# Parallel Isaac environments. The wrapper generates a per-run sim config.
+num_envs: 4
+policy_gpu: 0
+env_gpu: 0
+# Host conda environment for the policy server.
+policy_env: act
+policy_dir: policies/act
+ckpt: /home/cc/startcode_base/outputs/act/RoboDojo-stack_blocks-arx_x5-ee-0/2026.11.14-06.48.15/policy_epoch_4000_seed_0.ckpt

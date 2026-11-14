@@ -1,0 +1,15 @@
+policy_name: act
+protocol: ws
+host: 127.0.0.1
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+action_type: null
+gpu_id: null
+eval_batch: true
+device: cuda:0
+# Match XPolicyLab ACT evaluation: predict every step and aggregate overlapping chunks.
+temporal_agg: true

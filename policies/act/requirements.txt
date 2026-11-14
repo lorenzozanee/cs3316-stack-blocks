@@ -1,0 +1,5 @@
+-r ../../requirements-act.txt
+websockets>=14,<16
+msgpack>=1.0.8,<2
+msgpack-numpy>=0.4.8,<0.5
+pydantic>=2.5,<3
