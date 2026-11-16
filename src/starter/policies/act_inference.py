@@ -16,14 +16,15 @@ import cv2
 import numpy as np
 import torch
 
-from starter.interfaces import ACTION_DIM, HEAD_CAMERA
+from starter.interfaces import ACTION_DIM, BLOCK_LABELS, HEAD_CAMERA
 from starter.policies.act import load_offline_policy
 from starter.policies.act_model import ACTPolicy
 from starter.policies.residual_ppo import ResidualActorCritic
 
-FEATURE_DIM = 512 + 2 * 16
+VISUAL_FEATURE_DIM = 512 + 2 * ACTION_DIM
+FEATURE_DIM = VISUAL_FEATURE_DIM + 7 * len(BLOCK_LABELS)
 STAT_KEYS = ("qpos_mean", "qpos_std", "action_mean", "action_std")
-ONLINE_FORMAT = "act_residual_ppo_v1"
+ONLINE_FORMAT = "act_residual_ppo_v3"
 MIN_QUATERNION_NORM = 1e-8
 
 
@@ -48,6 +49,38 @@ def _normalization_stats(stats: Mapping) -> dict[str, np.ndarray]:
             raise ValueError(f"{key} must be positive.")
         result[key] = array
     return result
+
+
+def block_pose_features(blocks: Mapping) -> np.ndarray:
+    """Ordered object state for the residual, never the frozen ACT forward.
+
+    ResiP (arXiv:2407.16677) conditions residual PPO on object state and the
+    base action; implementation reference:
+    https://github.com/ankile/robust-rearrangement/blob/cf80d12d4acae9e4751a49407a96f85f07b342e3/src/gym/env_rl_wrapper.py
+    This adapter retains ACT visual features and adds all three block poses.
+    Poses use RoboDojo's scene-relative metres and wxyz rotation,
+    matching its Func_Parser.get_label_pose / LayoutManager.get_instance_pose.
+    """
+    poses = []
+    for label in BLOCK_LABELS:
+        try:
+            position = np.asarray(blocks[label]["pos"], dtype=np.float32)
+            rotation = np.asarray(blocks[label]["rot"], dtype=np.float32)
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"Residual observation requires pos and rot for {label}.") from error
+        if position.shape != (3,) or rotation.shape != (4,):
+            raise ValueError(f"Residual {label} pose must have position(3) and rotation(4).")
+        if not np.isfinite(position).all() or not np.isfinite(rotation).all():
+            raise ValueError(f"Residual {label} pose contains a non-finite value.")
+        norm = np.linalg.norm(rotation)
+        if norm < MIN_QUATERNION_NORM:
+            raise ValueError(f"Residual {label} quaternion is near zero.")
+        rotation = rotation / norm
+        # q and -q encode the same orientation; use a consistent hemisphere.
+        if rotation[0] < 0:
+            rotation = -rotation
+        poses.extend((position, rotation))
+    return np.concatenate(poses)
 
 
 class FrozenACTRunner:
@@ -184,7 +217,12 @@ class FrozenACTRunner:
             if not torch.isfinite(visual).all():
                 raise ValueError("ACT backbone produced a non-finite feature.")
             normalized = torch.from_numpy(np.stack(normalized_actions)).to(self.device)
-            features = torch.cat([qpos, normalized, visual.to(qpos.dtype)], dim=-1)
+            try:
+                object_state = np.stack([block_pose_features(obs["blocks"]) for obs in obs_list])
+            except KeyError as error:
+                raise ValueError("Residual observations require block poses.") from error
+            objects = torch.from_numpy(object_state).to(device=self.device, dtype=qpos.dtype)
+            features = torch.cat([qpos, normalized, visual.to(qpos.dtype), objects], dim=-1)
             if features.shape != (len(obs_list), FEATURE_DIM):
                 raise ValueError(f"Residual features must have shape ({len(obs_list)}, {FEATURE_DIM}).")
         return chunks, features
@@ -277,7 +315,7 @@ def load_act_runner(checkpoint, device, temporal_agg: bool = True):
     return ``None`` for the last two values.
     """
 
-    checkpoint = Path(checkpoint)
+    checkpoint = Path(checkpoint).expanduser().resolve()
     config = json.loads((checkpoint.parent / "config.json").read_text(encoding="utf-8"))
     policy_type = config.get("policy_type")
     if policy_type == "act_residual_ppo":

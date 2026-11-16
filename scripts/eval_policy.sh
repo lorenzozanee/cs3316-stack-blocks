@@ -144,6 +144,58 @@ RUN_DIR="${ROOT}/outputs/eval/${RUN_ID}"
 RESULTS_DIR="${ROOT}/outputs/eval/results"
 mkdir -p "${RUN_DIR}/sim" "${RESULTS_DIR}"
 
+# Optional layout subset. Stage copies of selected layout files and mount them
+# over the seed layout directory inside the client container. The assets tree is
+# bind-mounted under several container paths, so the staged directory must
+# shadow every alias; the evaluator reads layouts through RoboDojo's Assets
+# symlink, which resolves to ASSET_MOUNT_DEST rather than ASSETS_SOURCE.
+# The client renumbers the selected layouts 0..N-1; layout_map.json records the
+# original ids and the final verification rewrites _result.json layout_id to them.
+LAYOUT_STAGE=""
+eval "$(python3 - "${CONFIG}" "${ASSETS_SOURCE}" "${ASSET_MOUNT_DEST}" "${RUN_DIR}" <<'PY'
+import json
+import shlex
+import shutil
+import sys
+from pathlib import Path
+
+from starter.config import load_config
+
+config_path, assets_source, asset_mount_dest, run_dir = sys.argv[1:]
+cfg = load_config(config_path)
+layout_ids = cfg.get("layout_ids")
+if layout_ids is None:
+    raise SystemExit(0)
+if not isinstance(layout_ids, list) or not layout_ids:
+    raise SystemExit("layout_ids must be a non-empty list.")
+ids = [int(value) for value in layout_ids]
+if len(set(ids)) != len(ids):
+    raise SystemExit("layout_ids must not contain duplicates.")
+seed = int(cfg["seed"])
+task = cfg["task"]
+env_cfg_name = cfg["env_cfg"]
+relative = Path("Eval_Layout") / "RoboDojo" / env_cfg_name / str(seed)
+source_dir = Path(assets_source) / relative
+stage = Path(run_dir) / "layouts" / str(seed)
+stage.mkdir(parents=True, exist_ok=True)
+for new_id, old_id in enumerate(ids):
+    source = source_dir / f"{task}_{old_id}.json"
+    if not source.is_file():
+        raise SystemExit(f"Missing layout file: {source}")
+    shutil.copyfile(source, stage / f"{task}_{new_id}.json")
+mapping = {str(new_id): old_id for new_id, old_id in enumerate(ids)}
+Path(run_dir, "layout_map.json").write_text(json.dumps(mapping, indent=2) + "\n")
+dests = []
+for root in (asset_mount_dest, assets_source, "/workspace/RoboDojo/Assets"):
+    dest = str(Path(root) / relative)
+    if dest not in dests:
+        dests.append(dest)
+print(f"LAYOUT_STAGE={shlex.quote(str(stage))}")
+print("LAYOUT_MOUNTS=(" + " ".join(shlex.quote(dest) for dest in dests) + ")")
+print(f"EVAL_NUM={len(ids)}")
+PY
+)"
+
 SIM_SRC="${ROBODOJO_ROOT}/env_cfg/sim/${SIM_CFG_NAME}.yml"
 SIM_PATH="${RUN_DIR}/sim/${SIM_CFG_NAME}.yml"
 if [[ ! -f "${SIM_SRC}" ]]; then
@@ -161,6 +213,24 @@ if num_envs < 1:
     raise ValueError("num_envs must be positive")
 cfg = yaml.safe_load(Path(src).read_text())
 cfg["scene"]["num_envs"] = num_envs
+Path(dst).write_text(yaml.safe_dump(cfg, sort_keys=False))
+PY
+# RoboDojo caps EVAL_NUM at the task index budget. Stage the requested budget
+# alongside the sim config so an explicit eval_num also works above that default.
+TASK_INDEX_SRC="${ROBODOJO_ROOT}/task/RoboDojo/config/_task.yml"
+TASK_INDEX_PATH="${RUN_DIR}/task_index.yml"
+"${POLICY_PYTHON}" - "${TASK_INDEX_SRC}" "${TASK_INDEX_PATH}" "${TASK}" "${EVAL_NUM}" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+
+src, dst, task, requested = sys.argv[1:]
+cfg = yaml.safe_load(Path(src).read_text())
+if requested != "native":
+    count = int(requested)
+    if count < 1:
+        raise ValueError("eval_num must be positive")
+    cfg["tasks"][task]["eval_nums"] = count
 Path(dst).write_text(yaml.safe_dump(cfg, sort_keys=False))
 PY
 cp -- "${CONFIG}" "${RUN_DIR}/eval.yaml"
@@ -210,6 +280,13 @@ do
 done
 shopt -u nullglob
 
+layout_maps=()
+if [[ -n "${LAYOUT_STAGE}" ]]; then
+  for dest in "${LAYOUT_MOUNTS[@]}"; do
+    layout_maps+=(-v "${LAYOUT_STAGE}:${dest}:ro")
+  done
+fi
+
 docker_cmd=(
   docker run --rm --name "${CONTAINER_NAME}"
   --device "/dev/nvidia${ENV_GPU}"
@@ -234,8 +311,10 @@ docker_cmd=(
   -v "${ASSETS_SOURCE}:${ASSET_MOUNT_DEST}:ro"
   -v "${ASSETS_SOURCE}:${ASSETS_SOURCE}:ro"
   -v "${ASSETS_SOURCE}:/workspace/RoboDojo/Assets:ro"
+  "${layout_maps[@]}"
   -v "${ICD_PATH}:/etc/vulkan/icd.d/nvidia_icd.json:ro"
   -v "${SIM_PATH}:${SIM_SRC}:ro"
+  -v "${TASK_INDEX_PATH}:${TASK_INDEX_SRC}:ro"
   -v "${RESULTS_DIR}:${ROBODOJO_ROOT}/eval_result"
   "${IMAGE}"
   bash "${ROBODOJO_ROOT}/scripts/robodojo.sh" client
@@ -256,6 +335,9 @@ echo "[eval] results=${RESULTS_DIR}"
 echo "[eval] checkpoint=$(readlink -f "${CKPT_PATH}")"
 echo "[eval] policy server in conda env ${POLICY_ENV} on GPU ${POLICY_GPU}"
 echo "[eval] Isaac client in ${IMAGE} on GPU ${ENV_GPU}, port ${PORT}, num_envs=${NUM_ENVS}"
+if [[ -n "${LAYOUT_STAGE}" ]]; then
+  echo "[eval] layout subset=${LAYOUT_STAGE} mounted at ${LAYOUT_MOUNTS[*]}; mapping in ${RUN_DIR}/layout_map.json"
+fi
 
 if [[ "${DRY_RUN}" == 1 ]]; then
   if [[ ! -e "${CKPT_PATH}" ]]; then
@@ -308,3 +390,50 @@ fi
 
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 "${docker_cmd[@]}" 2>&1 | tee "${CLIENT_LOG}"
+
+# A successful client exit must also cover the requested episode count.
+"${POLICY_PYTHON}" - "${RESULTS_DIR}" "${RUN_ID}" "${TASK_INDEX_PATH}" "${TASK}" "${RUN_DIR}" "${IMAGE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+import yaml
+
+results_dir, run_id, task_index, task, run_dir, image = sys.argv[1:]
+index = yaml.safe_load(Path(task_index).read_text())
+expected = int(index["tasks"][task].get("eval_nums", index.get("common", {}).get("eval_nums", 50)))
+paths = list(Path(results_dir).glob(f"**/{run_id}/_result.json"))
+if len(paths) != 1:
+    raise SystemExit(f"Expected one result for {run_id}, found {len(paths)}")
+result_path = paths[0]
+result = json.loads(result_path.read_text())
+completed = int(result["eval_time"])
+if completed != expected:
+    raise SystemExit(f"Incomplete evaluation: requested {expected}, completed {completed}; {result_path}")
+# The client renumbers staged layouts 0..N-1; report the real seed-set ids in
+# _result.json and in the episode video names (episode_<real id>_cam_*).
+# Result files are written by the container as root, so rewrite through docker.
+layout_map_path = Path(run_dir) / "layout_map.json"
+if layout_map_path.is_file():
+    import subprocess
+    script = (
+        "import json,re,sys\n"
+        "from pathlib import Path\n"
+        "res,lm=map(Path,sys.argv[1:])\n"
+        "r=json.loads(res.read_text());mapping=json.loads(lm.read_text())\n"
+        "for d in r['details'].values(): d['layout_id']=mapping[str(d['layout_id'])]\n"
+        "res.write_text(json.dumps(r,indent=2)+'\\n')\n"
+        "for v in sorted(res.parent.glob('episode_*_cam_*.mp4'),reverse=True):\n"
+        "    m=re.match(r'episode_(\\d+)(_.*)',v.name)\n"
+        "    key=str(int(m.group(1))) if m else None\n"
+        "    if key in mapping:\n"
+        "        v.rename(v.with_name(f'episode_{mapping[key]:07d}{m.group(2)}'))\n"
+    )
+    subprocess.run(
+        ["docker", "run", "--rm", "-i",
+         "-v", f"{result_path.parent}:{result_path.parent}",
+         "-v", f"{layout_map_path}:{layout_map_path}:ro",
+         image, "python3", "-", str(result_path), str(layout_map_path)],
+        input=script, text=True, check=True,
+    )
+print(f"[eval] verified {completed}/{expected} episodes: {result_path}")
+PY

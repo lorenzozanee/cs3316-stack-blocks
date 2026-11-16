@@ -29,6 +29,7 @@ def install_parallel_control(task, observation_cfg: dict, task_name: str) -> Non
     )
     obs.initialize(task)
     task.online_obs = obs
+    _install_capture_lifecycle(task.capture_manager)
 
     def get_obs_batch(env_idx_list=None):
         if env_idx_list is None:
@@ -56,6 +57,60 @@ def install_parallel_control(task, observation_cfg: dict, task_name: str) -> Non
 
     task.get_obs_batch = get_obs_batch
     task.take_action_batch = take_action_batch
+
+
+def _install_capture_lifecycle(capture) -> None:
+    """Reuse capture resources until CameraManager replaces its camera handles.
+
+    The pinned TiledCaptureManager.reset appends new render products and
+    annotators on every episode. Its CameraView cleanup also references unused
+    attributes. Manage their lifetime here without modifying the simulator image.
+    """
+    previous_cameras = ()
+
+    def release_resources():
+        for view in capture.tiled_cameras:
+            for annotator in view._annotators.values():
+                annotator.detach([view._render_product_path])
+            view._annotators.clear()
+        for product in capture.tiled_render_products:
+            product.destroy()
+        capture.tiled_cameras.clear()
+        capture.tiled_render_products.clear()
+        capture.annotator.clear()
+        capture.annotator_type.clear()
+        capture.annotator_device.clear()
+        capture.camera_prim_paths.clear()
+        capture._output_buffers.clear()
+
+    def reset():
+        nonlocal previous_cameras
+        cameras = tuple(camera for row in capture.camera_manager.cameras for camera in row)
+        unchanged = len(cameras) == len(previous_cameras) and all(
+            current is previous for current, previous in zip(cameras, previous_cameras)
+        )
+        if unchanged and capture.tiled_cameras:
+            print(f"[env] capture reused: render_products={len(capture.tiled_render_products)}", flush=True)
+            return
+        release_resources()
+        capture.cameras = capture.camera_manager.cameras
+        capture.camera_names = capture.camera_manager.camera_names
+        capture.num_cams = len(capture.cameras[0])
+        capture.init_cameras()
+        previous_cameras = cameras
+        print(f"[env] capture initialized: render_products={len(capture.tiled_render_products)}", flush=True)
+
+    def destroy():
+        nonlocal previous_cameras
+        release_resources()
+        previous_cameras = ()
+        # Do not clear the aliased CameraManager lists: it owns those handles.
+        capture.cameras = []
+        capture.camera_names = []
+        capture.sim = None
+
+    capture.reset = reset
+    capture.destroy = destroy
 
 
 def bind_eval_layouts(task, task_name: str, config_name: str, seed: int = 0):
@@ -89,7 +144,38 @@ def bind_eval_layouts(task, task_name: str, config_name: str, seed: int = 0):
             task.scene_manager.layout_manager.set_saved_layout(
                 index, manager.get_seed_scene_info(layout)
             )
-        return original(seed=list(seeds), options=options)
+        result = original(seed=list(seeds), options=options)
+        task.online_obs.reset()
+        # CUDA reset parks pooled rigid bodies and the table offscreen. Restore
+        # the selected layout before the adapter initializes reward state.
+        task.scene_manager.apply_saved_poses(env_idx_list=list(range(task.num_envs)))
+        # Reuse EvalEnv.setup_scene's validity and 300-step stability check;
+        # evaluating a different settled scene is not an ACT/PPO comparison.
+        layout_manager = task.scene_manager.layout_manager
+        task.success = [bool(valid) for valid in layout_manager.layout_valid]
+        task.end_flag = [not valid for valid in task.success]
+        invalid = [i for i, valid in enumerate(task.success) if not valid]
+        if invalid:
+            raise RuntimeError(f"Invalid training layouts in scenes {invalid}, "
+                               f"layout ids {[seeds[i] for i in invalid]}.")
+        any_usable, unstable = layout_manager.check_layout_stability(task)
+        failed = sorted(set(unstable) | {i for i, valid in enumerate(task.success) if not valid})
+        # The upstream boolean means ANY scene survived. Eval drops failed
+        # scenes; this fixed-width training batch must fail explicitly rather
+        # than learn from an invalid scene. RemoteEnv propagates this error.
+        if not any_usable or failed:
+            raise RuntimeError(f"Unstable training layouts in scenes {failed}, "
+                               f"layout ids {[seeds[i] for i in failed]}.")
+        # Match EvalEnv.setup_scene: let materials and camera exposure settle
+        # before ACT sees its first frame or rewards capture their initial state.
+        for _ in range(10):
+            task.render()
+        for step in range(200):
+            task.sim_step()
+            if step % 5 == 0:
+                task.online_obs.render_for_capture()
+                task.online_obs.get_obs()
+        return result
 
     task.reset = reset
     return len(layouts)

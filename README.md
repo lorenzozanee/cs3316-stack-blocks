@@ -205,7 +205,7 @@ bash scripts/robodojo.sh eval \
 
 位姿顺序是 `[x, y, z, qw, qx, qy, qz]`。夹爪下标是 7 和 15，送进环境前裁到 `[0, 1]`。关节角是 14 维，不要把它当成 `ee` 的宽度。官方数据脚本对 `arx_x5` 报的动作维度是关节的 14，这里要使用 16。
 
-策略观测只有头部相机 `cam_head` 和这 16 维本体。`src/starter/envs/stack_blocks.py` 已经把腕部图像和积木位姿从策略观测里拿掉。积木位姿在 `get_privileged_state()`，只能用于训练时的内在奖励。`src/starter/rewards/intrinsic.py` 现在加的是 0。奖励可以改，但不要写回环境的 `reward_manager`，也不要改外部得分。
+冻结 ACT 的观测只有头部相机 `cam_head` 和这 16 维本体。`src/starter/envs/stack_blocks.py` 保持这个基础观测契约，并通过独立的 `get_privileged_state()` 提供积木位姿。当前 Residual PPO 额外读取这些位姿用于残差 actor/critic 和训练奖励，评测也提供相同位姿；它们不进入冻结 ACT。`src/starter/rewards/intrinsic.py` 的通用内在奖励仍为 0，ACT 的势能塑形在 `act_online.py` 中实现，不写回环境的 `reward_manager`，也不改外部得分。
 
 HDF5 在 `data/RoboDojo/stack_blocks/arx_x5/data/episode_*.hdf5`。`starter.data.demos.read_episode` 给出 16 维状态、16 维动作，以及 `vision/cam_head/colors` 里原样存放的图像缓冲。解码请使用克隆下来的 `XPolicyLab.utils.process_data.decode_image_bit`。这批数据里有旧的 JPEG 标记，用 PIL 直接解会把通道读反。文件里还有腕部相机，不要送进策略。图像如何缩放、是否堆历史帧，由你决定。
 
@@ -276,13 +276,37 @@ PYTHONPATH=src python -m starter.pipelines.act online \
 实现约定：
 
 - 基座始终为 `eval`，梯度关闭；每次 PPO 更新后逐张量验证权重和 buffers 不变。训练与评测共用 RGB/状态归一化及上游 oldest-first 时间聚合，每步执行一个动作。
-- 残差 actor/critic 是两层 128 维 MLP，输入归一化本体状态、当前基座动作和冻结 ResNet 的 512 维视觉特征，不输入积木位姿。视觉特征从同一次 ACT 前向中提取。均值头初始为零。
-- 原始高斯残差用于 PPO 对数概率；执行时先裁到 `[-1,1]`，再乘 `residual_scale × action_std` 后加到基座动作。默认 `residual_scale=0.05`，初始高斯标准差 `0.1`，初期典型修正约为示范动作标准差的 0.5%。夹爪裁到 `[0,1]`，四元数归一化。
-- 外部 `0/15/100` 得分不修改。训练奖励使用相邻得分差，避免持续 15 分比尽早完成堆叠更有利；日志中的成功仍严格要求成功结束且得分为 100。
+- 残差 actor/critic 各自使用独立的两层 128 维 MLP 和梯度裁剪，价值拟合不再修改 actor 特征层或挤占 actor 梯度预算；输入归一化本体状态、当前基座动作、冻结 ResNet 的 512 维视觉特征，以及按 `block_0/1/2` 排列的场景相对位置与 wxyz 四元数，共 565 维。物体位姿仅进入残差，ACT 仍只接收头部 RGB 和 16 维本体；均值头初始为零。状态与基座动作拼接参考 [ResiP 官方实现](https://github.com/ankile/robust-rearrangement/blob/cf80d12d4acae9e4751a49407a96f85f07b342e3/src/train/residual_ppo.py)，本项目额外保留冻结视觉特征。
+- 原始高斯残差用于 PPO 对数概率；执行时先裁到 `[-1,1]`，再乘 `residual_scale × action_std` 后加到基座动作。当前 `residual_scale=0.2`、固定高斯标准差 `0.2231`（`learn_std: false`，ResiP MLP init_logstd=-1.5）；actor/critic 学习率分别为 `lr` / `critic_lr`。夹爪裁到 `[0,1]`，四元数归一化。
+- 外部 `0/15/100` 得分不修改。训练奖励为相邻得分差加势能塑形 `gamma*phi(next)-phi(current)`，真实终止时后继势能强制为零，时间截断保留后继势能及价值 bootstrap；当前 `gamma=0.999`。势能为阶段化四项：3D 抓取点接近（tanh，随链进度门控）、两块有界抬升、有向上升链 pair 计分（对齐+高度窗）、落定对上的实测夹爪释放；落定用块线/角速度阈值作瞬时代理，实测夹爪开度经特权观测读取（与官方谓词同源），不进入残差特征。这是任务适配，ResiP 原实现使用稀疏奖励。日志中的成功仍严格要求成功结束且得分为 100。
 - 环境只支持整批重置，因此按完整回合波次采样，已结束场景立即移出 active 列表。GAE 对成功终止不 bootstrap，对时间截断使用最终观测 bootstrap，不使用重置观测，也不生成填充场景的假样本。PPO 的裁剪目标、GAE 和优化使用项目现有 PyTorch 实现，未引入假定逐场景自动重置的 VecEnv。
+- 在线重置按 `configs/act_online.yaml` 的 `rollout_layout_ids` 循环选择 seed 0 集合中的布局编号，当前课程为 14–23；单个布局也可配置为单元素列表。轮转游标随 checkpoint 保存，独立评测稳定达到 15 后再扩展至 0–54。训练 RNG 的 `seed` 不改变布局集合。选定布局后执行任务重置、清空观测历史，并调用 `scene_manager.apply_saved_poses` 恢复桌子与积木；随后检查布局有效性和稳定性，再沿用评测的渲染与相机预热流程，最后初始化机器人和奖励状态。训练 TCP 相机传输使用无损 PNG，避免 JPEG 改变冻结 ACT 的输入像素。CUDA 场景重置会把复用物体暂存到离屏位置，仅选择布局不会把物体放回桌面。
+- 在线服务在回合重置时复用相机的 render products、annotators 和输出缓冲区；相机句柄被替换时才先释放再重建，关闭时显式 detach/destroy，避免上游采集器每次 reset 追加渲染资源。日志中的 `capture initialized/reused` 与 render product 数量可用于核对资源是否持续增长。
 
-默认配置为每次更新 8 回合、100 次更新、PPO 10 轮、学习率 `3e-4`、clip `0.2`、`gamma=0.99`、`gae_lambda=0.95`、KL 提前停止阈值 `0.02`；具体参数集中在 `configs/act_online.yaml`。
+在线启动时，`run_online_env.sh` 从选定机器人的 `curobo_tmp.yml` 生成容器路径配置，保存在 `outputs/online_env/<容器名>/robot_configs/` 并逐文件只读挂载。模型、网格、纹理等资产继续复用已有 `Assets` 软链接与只读挂载，不复制资产，也不改写共享资产中的配置。模板或 URDF 缺失时会在启动仿真前报错。
 
-在线产物单独保存在 `outputs/act_residual/<任务与种子>/<时间戳>/`，包括配置、CSV/JSONL 指标、成功率/外部得分/PPO 损失曲线、周期 checkpoint 和 `policy_last.ckpt`。在线 checkpoint 包含冻结基座、残差、归一化统计量和优化器，不依赖原离线目录；评测时使用同目录 `config.json` 识别类型。沿用 `bash scripts/eval_policy.sh configs/eval.yaml`，将评测配置中的 `ckpt` 换成在线产物即可，评测执行残差均值，不采样噪声。离线与在线模型分别评测，不能用训练回报代替仿真成功率。
+每次更新的回合数、总更新次数、PPO 轮数、学习率、clip、GAE 和 KL 提前停止阈值统一由 `configs/act_online.yaml` 设置，每次运行的实际参数写入输出目录的 `config.json`。
+
+在线产物单独保存在 `outputs/act_residual/<任务与种子>/<时间戳>/`。`config.json` 保存完整训练参数与基座路径；`metadata.json` 记录依赖版本、设备、参数量、上游版本和指标口径。每次 PPO 更新向 `metrics.jsonl`、`metrics.csv` 写入并刷新：
+
+| 分析内容 | 记录的数据 |
+| --- | --- |
+| 采样与任务表现 | 累计环境步数/回合数、本轮有效步数/回合数、成功数/成功率、峰值得分达到 15 的回合比例（包含成功）、终止/超时数、平均最终/峰值得分、平均回合长度 |
+| 奖励与信用 | 平均回合 score-delta 奖励总和及折扣回报、非零/负奖励步数、PPO 标准化前的优势均值/标准差、GAE return 和采样时价值预测的均值/标准差 |
+| PPO 更新 | policy/value/total loss、原始高斯熵、approx KL 与阈值、PPO clip fraction、实际 optimizer 步数（`updates`）、完整完成的 PPO epochs、KL 提前停止标记、裁剪前梯度范数均值/最大值、更新后 critic 的 explained variance |
+| 残差与探索 | 更新后原始高斯标准差的均值/最小/最大值、采样残差的绝对均值/RMS、元素被 `[-1,1]` 裁剪的比例、裁剪缩放后相对示范 action std 的绝对均值、实际左右臂位置修正范数的平均值，以及单独记录的更新后确定性均值位置修正（米） |
+| 性能与资源 | 学习率、采样/PPO/整轮耗时、累计耗时、ETA、有效环境步/秒、PyTorch 已分配/已缓存/峰值显存和显卡总容量（GiB） |
+
+`episodes.jsonl`、`episodes.csv` 在每个采样波次结束时保存逐回合明细：update、完成序号、`layout_id`（布局编号）、`seed`（训练 RNG 配置种子）、长度、最终/峰值得分、成功/终止/超时标记、奖励总和/折扣回报、非零/负奖励步数、首次得分达到 15 的步数，以及平均位置修正量。回合结束只看官方 `run_reward` 成功标志或步数上限，公开得分本身不结束回合。未达到 15 时，首次达成步数记为 JSON `null` / CSV 空值；return 方差为零时 explained variance 也记为空，不能当成拟合程度为 0。没有 optimizer 步时梯度范数为空。
+
+每轮终端输出成功数与成功率、阶段达成率、得分、PPO 损失/KL、实际 optimizer 步数、提前停止标记、LR、采样/PPO/整轮耗时、累计耗时、ETA，以及 VRAM allocated/reserved/peak/total。ETA 按已完成更新的平均耗时估计，包含采样与环境重置，最初可能受 Isaac 初始化影响；显存仅统计策略进程的 PyTorch 分配器，不含 Isaac 等其他进程。显存峰值在每次采样前重置，覆盖本轮采样与 PPO；CPU 运行写 `null` / CSV 空值并显示 `VRAM=CPU`。
+
+第 1 次更新、每次周期保存及最后一次更新自动生成 `training_curves.png`、`training_curves.svg`，含任务表现、回报、PPO/价值诊断、探索、耗时、LR、ETA、VRAM 共 16 张子图，保留完整历史，不平滑或裁掉负损失。也可从记录独立重新绘制：
+
+```bash
+PYTHONPATH=src python -m starter.policies.act_online_metrics /path/to/online/run
+```
+
+在线目录另有周期 checkpoint 和 `policy_last.ckpt`，包含冻结基座、残差、归一化统计量和优化器，不依赖原离线目录；评测时使用同目录 `config.json` 识别类型。沿用 `bash scripts/eval_policy.sh configs/eval.yaml`，将评测配置中的 `ckpt` 换成在线产物即可，评测执行残差均值，不采样噪声。上述日志来自带探索的训练回合；离线与在线模型分别评测，不能用训练成功率代替独立仿真评测成功率。
 
 不利用示范、也不设计内在奖励或课程的随机高斯策略，很难在 550 步内碰到 100 分。选题允许的直接在线学习，指的是 PPO、SAC 这一类，并配上合理的内在奖励、探索或课程，而且仍然不改外部得分。离线策略如果一次都堆不成功，在线阶段也看不到 100 分。15 分是中途信号，可以进入回报，不能改成成功。

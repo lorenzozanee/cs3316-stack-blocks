@@ -41,6 +41,25 @@ cat > "${ICD_PATH}" <<'EOF'
     }
 }
 EOF
+# Generate planner paths in the container namespace from upstream templates.
+# Bind just these generated files over the read-only asset mount; never rewrite
+# shared assets or depend on the checkout path embedded in old curobo.yml files.
+ASSET_CONFIG_MOUNTS="$(PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" python3 - \
+  "${ROOT}/third_party/env_cfg/${ENV_CFG}.yml" \
+  "${ROOT}/third_party/RoboDojo/Assets" \
+  "${ROOT}/outputs/online_env/${NAME}/robot_configs" /workspace/RoboDojo <<'PY'
+import sys
+from pathlib import Path
+from starter.envs.assets import prepare_robot_configs
+
+for source, target in prepare_robot_configs(*(Path(arg) for arg in sys.argv[1:])):
+    print(f"{source}:{target}:ro")
+PY
+)"
+asset_maps=()
+while IFS= read -r mount; do
+  asset_maps+=(-v "${mount}")
+done <<< "${ASSET_CONFIG_MOUNTS}"
 maps=()
 shopt -s nullglob
 for lib in \
@@ -79,6 +98,7 @@ while [[ ! -f "${STOP_FILE}" ]]; do
     -e STACK_BLOCKS_ROOT=/stack-blocks \
     -e PYTHONPATH=/stack-blocks/src:/workspace/RoboDojo \
     -v "${ROOT}/third_party/RoboDojo/Assets:/workspace/RoboDojo/Assets:ro" \
+    "${asset_maps[@]}" \
     -v "${ROOT}/data:/workspace/RoboDojo/data" \
     -v "${ROOT}:/stack-blocks" \
     -v "${ROOT}:${ROOT}" \

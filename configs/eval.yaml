@@ -3,9 +3,22 @@
 task: stack_blocks
 env_cfg: arx_x5
 action_type: ee
-seed: 1
-# native uses the per-task episode count from RoboDojo.
-eval_num: native
+seed: 0
+# Ten curriculum layouts, one episode per layout (14 through 23).
+eval_num: 10
+# Optional: evaluate only these layout ids. Results renumber them 0..N-1 and
+# layout_map.json in the run directory records the original ids.
+layout_ids:
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+  - 21
+  - 22
+  - 23
 # Parallel Isaac environments. The wrapper generates a per-run sim config.
 num_envs: 4
 policy_gpu: 0
@@ -13,4 +26,4 @@ env_gpu: 0
 # Host conda environment for the policy server.
 policy_env: act
 policy_dir: policies/act
-ckpt: /home/cc/startcode_base/outputs/act/RoboDojo-stack_blocks-arx_x5-ee-0/2026.11.14-06.48.15/policy_epoch_4000_seed_0.ckpt
+ckpt: /home/cc/startcode_base/outputs/act_residual/RoboDojo-stack_blocks-arx_x5-ee-0/2026.11.16-15.51.26/policy_last.ckpt

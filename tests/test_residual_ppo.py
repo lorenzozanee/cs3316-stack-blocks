@@ -6,6 +6,7 @@ import math
 import unittest
 
 import torch
+import torch.nn.functional as F
 from torch.distributions import Normal
 
 from starter.policies.residual_ppo import (
@@ -16,6 +17,17 @@ from starter.policies.residual_ppo import (
     compute_gae,
     ppo_update,
 )
+
+
+def _grouped_optimizer(model, lr, optimizer_cls=torch.optim.Adam):
+    """One optimizer with the separate actor and critic parameter groups."""
+
+    return optimizer_cls(
+        [
+            {"params": model.actor_parameters(), "lr": lr},
+            {"params": model.critic_parameters(), "lr": lr},
+        ]
+    )
 
 
 class ComputeGAETest(unittest.TestCase):
@@ -205,7 +217,7 @@ class PPOUpdateTest(unittest.TestCase):
         batch = self._batch(model)
         actor_before = model.mean_head.weight.detach().clone()
         value_before = model.value_head.weight.detach().clone()
-        optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+        optimizer = _grouped_optimizer(model, 3e-3)
 
         metrics = ppo_update(
             model,
@@ -221,7 +233,25 @@ class PPOUpdateTest(unittest.TestCase):
         )
 
         self.assertEqual(metrics["updates"], 16)
-        for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
+        self.assertFalse(metrics["early_stopped"])
+        self.assertEqual(metrics["epochs_completed"], 4)
+        self.assertIsNotNone(metrics["grad_norm"])
+        self.assertIsNotNone(metrics["max_grad_norm_observed"])
+        self.assertTrue(metrics["explained_variance"] is not None)
+        self.assertTrue(math.isfinite(metrics["explained_variance"]))
+        for name in (
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "approx_kl",
+            "clip_fraction",
+            "total_loss",
+            "grad_norm",
+            "max_grad_norm_observed",
+            "policy_std_mean",
+            "policy_std_min",
+            "policy_std_max",
+        ):
             self.assertTrue(math.isfinite(metrics[name]), name)
         self.assertFalse(torch.allclose(model.mean_head.weight, actor_before))
         self.assertFalse(torch.allclose(model.value_head.weight, value_before))
@@ -230,7 +260,7 @@ class PPOUpdateTest(unittest.TestCase):
         torch.manual_seed(2)
         model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
         batch = self._batch(model, seed=4)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+        optimizer = _grouped_optimizer(model, 1e-2)
 
         metrics = ppo_update(
             model,
@@ -246,12 +276,38 @@ class PPOUpdateTest(unittest.TestCase):
         )
 
         self.assertEqual(metrics["updates"], 1)
+        self.assertTrue(metrics["early_stopped"])
+        # The first epoch completed; the stop happened on the next one.
+        self.assertEqual(metrics["epochs_completed"], 1)
+
+    def test_mid_epoch_stop_excludes_incomplete_epoch(self):
+        torch.manual_seed(21)
+        model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
+        batch = self._batch(model, size=64, seed=22)
+        optimizer = _grouped_optimizer(model, 1e-2)
+
+        metrics = ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=4,
+            minibatch_size=16,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            max_grad_norm=0.5,
+            target_kl=1e-8,
+        )
+
+        self.assertEqual(metrics["updates"], 1)
+        self.assertTrue(metrics["early_stopped"])
+        self.assertEqual(metrics["epochs_completed"], 0)
 
     def test_minibatch_larger_than_batch_is_one_batch_per_epoch(self):
         torch.manual_seed(5)
         model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
         batch = self._batch(model, size=5, seed=6)
-        optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+        optimizer = _grouped_optimizer(model, 3e-3)
 
         metrics = ppo_update(
             model,
@@ -267,7 +323,16 @@ class PPOUpdateTest(unittest.TestCase):
         )
 
         self.assertEqual(metrics["updates"], 2)
-        for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
+        self.assertFalse(metrics["early_stopped"])
+        self.assertEqual(metrics["epochs_completed"], 2)
+        for name in (
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "approx_kl",
+            "clip_fraction",
+            "total_loss",
+        ):
             self.assertTrue(math.isfinite(metrics[name]), name)
 
     def test_early_stop_before_first_step_reports_finite_metrics(self):
@@ -277,7 +342,7 @@ class PPOUpdateTest(unittest.TestCase):
         # Force a KL above threshold before any optimizer step.
         batch.log_probs = batch.log_probs + 1.0
         before = {name: value.detach().clone() for name, value in model.named_parameters()}
-        optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+        optimizer = _grouped_optimizer(model, 3e-3)
 
         metrics = ppo_update(
             model,
@@ -293,15 +358,371 @@ class PPOUpdateTest(unittest.TestCase):
         )
 
         self.assertEqual(metrics["updates"], 0)
-        for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
+        self.assertTrue(metrics["early_stopped"])
+        self.assertEqual(metrics["epochs_completed"], 0)
+        self.assertIsNone(metrics["grad_norm"])
+        self.assertIsNone(metrics["max_grad_norm_observed"])
+        self.assertTrue(math.isfinite(metrics["explained_variance"]))
+        for name in (
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "approx_kl",
+            "clip_fraction",
+            "total_loss",
+            "policy_std_mean",
+            "policy_std_min",
+            "policy_std_max",
+        ):
             self.assertTrue(math.isfinite(metrics[name]), name)
         for name, parameter in model.named_parameters():
             torch.testing.assert_close(parameter, before[name], msg=name)
 
+    def test_explained_variance_matches_final_critic(self):
+        torch.manual_seed(23)
+        model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
+        batch = self._batch(model, size=32, seed=24)
+        optimizer = _grouped_optimizer(model, 3e-3)
+
+        metrics = ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=3,
+            minibatch_size=8,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+
+        with torch.no_grad():
+            _, _, final_values = model.evaluate_actions(batch.features, batch.actions)
+        expected = 1.0 - torch.var(batch.returns - final_values, unbiased=False) / torch.var(
+            batch.returns, unbiased=False
+        )
+        self.assertAlmostEqual(metrics["explained_variance"], float(expected), places=6)
+
+    def test_explained_variance_is_none_for_constant_returns(self):
+        torch.manual_seed(25)
+        model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
+        batch = self._batch(model, size=16, seed=26)
+        batch.returns = torch.full_like(batch.returns, 0.25)
+        optimizer = _grouped_optimizer(model, 3e-3)
+
+        metrics = ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=1,
+            minibatch_size=16,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+
+        self.assertEqual(metrics["updates"], 1)
+        self.assertIsNone(metrics["explained_variance"])
+
+    def test_grad_norm_is_measured_before_clipping(self):
+        torch.manual_seed(27)
+        model = ResidualActorCritic(
+            feature_dim=4, action_dim=3, hidden_dim=16, learn_std=True
+        )
+        batch = self._batch(model, size=64, seed=28)
+
+        advantages = batch.advantages
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std(unbiased=False) + 1e-8
+        )
+        new_log_probs, entropy, new_values = model.evaluate_actions(
+            batch.features, batch.actions
+        )
+        log_ratio = new_log_probs - batch.log_probs
+        ratio = log_ratio.exp()
+        policy_loss = -torch.min(
+            ratio * advantages,
+            ratio.clamp(0.8, 1.2) * advantages,
+        ).mean()
+        value_loss = F.mse_loss(new_values, batch.returns)
+        loss = policy_loss + 0.5 * value_loss - 0.01 * entropy.mean()
+        loss.backward()
+
+        def _norm(parameters):
+            return torch.sqrt(
+                sum(
+                    parameter.grad.norm() ** 2
+                    for parameter in parameters
+                    if parameter.grad is not None
+                )
+            )
+
+        expected_actor_norm = _norm(model.actor_parameters())
+        expected_critic_norm = _norm(model.critic_parameters())
+        expected_norm = torch.sqrt(expected_actor_norm**2 + expected_critic_norm**2)
+        model.zero_grad(set_to_none=True)
+        self.assertGreater(float(expected_actor_norm), 1e-3)
+        self.assertGreater(float(expected_critic_norm), 1e-3)
+
+        optimizer = _grouped_optimizer(model, 3e-3)
+        metrics = ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=1,
+            minibatch_size=64,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            max_grad_norm=1e-3,
+            target_kl=10.0,
+        )
+
+        self.assertEqual(metrics["updates"], 1)
+        self.assertAlmostEqual(
+            metrics["actor_grad_norm"], float(expected_actor_norm), places=5
+        )
+        self.assertAlmostEqual(
+            metrics["critic_grad_norm"], float(expected_critic_norm), places=5
+        )
+        self.assertAlmostEqual(metrics["grad_norm"], float(expected_norm), places=5)
+        self.assertAlmostEqual(
+            metrics["max_grad_norm_observed"], float(expected_norm), places=5
+        )
+
+    def test_frozen_std_does_not_drift(self):
+        torch.manual_seed(31)
+        model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
+        self.assertFalse(model.log_std.requires_grad)
+        self.assertFalse(any(p is model.log_std for p in model.actor_parameters()))
+        self.assertFalse(any(p is model.log_std for p in model.critic_parameters()))
+        self.assertIn("log_std", model.state_dict())
+        std_before = model.log_std.detach().clone()
+
+        batch = self._batch(model, size=32, seed=32)
+        optimizer = _grouped_optimizer(model, 3e-2)
+        metrics = ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=2,
+            minibatch_size=16,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=1.0,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+
+        self.assertGreater(metrics["updates"], 0)
+        torch.testing.assert_close(model.log_std, std_before)
+
+    def test_learnable_std_receives_entropy_gradient(self):
+        torch.manual_seed(33)
+        model = ResidualActorCritic(
+            feature_dim=4, action_dim=3, hidden_dim=16, learn_std=True
+        )
+        self.assertTrue(model.log_std.requires_grad)
+        self.assertTrue(any(p is model.log_std for p in model.actor_parameters()))
+        std_before = model.log_std.detach().clone()
+
+        batch = self._batch(model, size=32, seed=34)
+        optimizer = _grouped_optimizer(model, 3e-2)
+        ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=2,
+            minibatch_size=16,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=1.0,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+
+        self.assertFalse(torch.allclose(model.log_std, std_before))
+
+    def test_critic_only_update_does_not_change_actor_output(self):
+        torch.manual_seed(35)
+        model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
+        batch = self._batch(model, size=32, seed=36)
+        # Zero advantages make the clipped policy surrogate exactly flat.
+        batch.advantages = torch.zeros_like(batch.advantages)
+
+        eval_features = torch.randn(17, model.feature_dim)
+        with torch.no_grad():
+            actor_before, _, _ = model.act(eval_features, deterministic=True)
+        actor_parameters_before = [
+            parameter.detach().clone() for parameter in model.actor_parameters()
+        ]
+        value_before = model.value_head.weight.detach().clone()
+
+        optimizer = _grouped_optimizer(model, 1e-2)
+        metrics = ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=2,
+            minibatch_size=8,
+            clip_range=0.2,
+            value_coef=1.0,
+            entropy_coef=0.0,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+
+        self.assertGreater(metrics["updates"], 0)
+        with torch.no_grad():
+            actor_after, _, _ = model.act(eval_features, deterministic=True)
+        torch.testing.assert_close(actor_after, actor_before)
+        for parameter, before in zip(model.actor_parameters(), actor_parameters_before):
+            torch.testing.assert_close(parameter, before)
+        self.assertFalse(torch.allclose(model.value_head.weight, value_before))
+
+    def test_critic_return_magnitude_does_not_change_actor_step(self):
+        torch.manual_seed(37)
+        model_small = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
+        torch.manual_seed(37)
+        model_huge = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
+
+        batch = self._batch(model_small, size=32, seed=38)
+        huge_batch = PPOBatch(
+            features=batch.features.clone(),
+            actions=batch.actions.clone(),
+            log_probs=batch.log_probs.clone(),
+            values=batch.values.clone(),
+            advantages=batch.advantages.clone(),
+            returns=batch.returns * 1e6 + 1e4,
+        )
+        optimizer_small = _grouped_optimizer(model_small, 0.1, torch.optim.SGD)
+        optimizer_huge = _grouped_optimizer(model_huge, 0.1, torch.optim.SGD)
+
+        torch.manual_seed(39)
+        ppo_update(
+            model_small,
+            optimizer_small,
+            batch,
+            update_epochs=1,
+            minibatch_size=32,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=0.0,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+        torch.manual_seed(39)
+        ppo_update(
+            model_huge,
+            optimizer_huge,
+            huge_batch,
+            update_epochs=1,
+            minibatch_size=32,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=0.0,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+
+        for parameter_small, parameter_huge in zip(
+            model_small.actor_parameters(), model_huge.actor_parameters()
+        ):
+            torch.testing.assert_close(parameter_huge, parameter_small)
+        with torch.no_grad():
+            actions_small, _, _ = model_small.act(batch.features, deterministic=True)
+            actions_huge, _, _ = model_huge.act(batch.features, deterministic=True)
+        torch.testing.assert_close(actions_huge, actions_small)
+        self.assertFalse(
+            torch.allclose(model_small.value_head.weight, model_huge.value_head.weight)
+        )
+
+    def test_contextual_bandit_mean_action_reward_improves(self):
+        torch.manual_seed(40)
+        model = ResidualActorCritic(
+            feature_dim=4, action_dim=2, hidden_dim=32, initial_std=0.2
+        )
+        generator = torch.Generator().manual_seed(41)
+        weight = torch.randn(4, 2, generator=generator) * 0.5
+        eval_features = torch.randn(512, 4, generator=generator)
+
+        def target(features):
+            return torch.tanh(features @ weight)
+
+        def mean_action_reward():
+            with torch.no_grad():
+                actions, _, _ = model.act(eval_features, deterministic=True)
+            return float(-(actions - target(eval_features)).pow(2).sum(-1).mean())
+
+        optimizer = _grouped_optimizer(model, 3e-3)
+        before = mean_action_reward()
+        for _round in range(12):
+            features = torch.randn(256, 4)
+            with torch.no_grad():
+                actions, log_probs, values = model.act(features)
+            rewards = -(actions - target(features)).pow(2).sum(-1)
+            ppo_update(
+                model,
+                optimizer,
+                PPOBatch(
+                    features=features,
+                    actions=actions,
+                    log_probs=log_probs,
+                    values=values,
+                    advantages=rewards,
+                    returns=rewards,
+                ),
+                update_epochs=4,
+                minibatch_size=64,
+                clip_range=0.2,
+                value_coef=0.5,
+                entropy_coef=0.0,
+                max_grad_norm=0.5,
+                target_kl=10.0,
+            )
+        after = mean_action_reward()
+
+        self.assertGreater(after, before + 0.1)
+
+    def test_policy_std_metrics_use_clamped_final_std(self):
+        torch.manual_seed(29)
+        model = ResidualActorCritic(
+            feature_dim=4, action_dim=3, hidden_dim=16, learn_std=True
+        )
+        with torch.no_grad():
+            model.log_std.copy_(torch.tensor([math.log(0.001), math.log(0.1), math.log(5.0)]))
+        batch = self._batch(model, size=8, seed=30)
+        optimizer = _grouped_optimizer(model, 3e-3)
+
+        metrics = ppo_update(
+            model,
+            optimizer,
+            batch,
+            update_epochs=1,
+            minibatch_size=8,
+            clip_range=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            max_grad_norm=0.5,
+            target_kl=10.0,
+        )
+
+        expected = model.log_std.detach().clamp(
+            math.log(MIN_STD), math.log(MAX_STD)
+        ).exp()
+        self.assertAlmostEqual(metrics["policy_std_min"], float(expected.min()))
+        self.assertAlmostEqual(metrics["policy_std_max"], float(expected.max()))
+        self.assertAlmostEqual(metrics["policy_std_mean"], float(expected.mean()))
+        self.assertAlmostEqual(metrics["policy_std_min"], MIN_STD)
+        self.assertAlmostEqual(metrics["policy_std_max"], MAX_STD)
+
     def test_bad_hyperparameters_are_rejected(self):
         model = ResidualActorCritic(feature_dim=4, action_dim=3, hidden_dim=16)
         batch = self._batch(model, size=8)
-        optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+        optimizer = _grouped_optimizer(model, 3e-4)
         with self.assertRaises(ValueError):
             ppo_update(
                 model,

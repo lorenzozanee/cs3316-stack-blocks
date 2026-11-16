@@ -2,23 +2,93 @@
 # Supply the selected offline ACT checkpoint using --checkpoint.
 device: cuda
 temporal_agg: true
-finetune_updates: 100
+# Four-hour training budget; finish the current wave, PPO update and save at expiry.
+finetune_updates: 14
+max_train_seconds: 14400
 # Complete waves of num_envs; each scene keeps its own episode boundary.
-finetune_episodes: 8
+finetune_episodes: 16
+# Curriculum layout ids in the seed-0 layout set; cycle evenly across scenes.
+# Extend this list only after independent evaluations meet the stage criterion.
+rollout_layout_ids:
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+  - 21
+  - 22
+  - 23
+# Staged shaping (round14, user's 7-step decomposition). Pure state function
+# using observed grasp geometry plus measured block velocities and gripper
+# joints. Directed upward pair chains prevent a shared upper/lower block from
+# counting twice. Settled, released pairs retarget reach to the next block.
+# Sources: func_parser.is_stacked / is_all_gripper_open, arx_x5 URDF and demo;
+# robosuite stack uses grasp/lift/contact, but here velocity is an explicit
+# settling proxy, not a contact/stability proof. PBRS: Ng 1999, Grzes 2017.
+# Anti-tip lift ramp 15 mm; two raised blocks are needed for a tower.
+# pair_height_low 5 mm exceeds the measured resting |dz| maximum 4.9 mm.
+# Broad alignment supports transport; placement exclusion additionally
+# requires <=20 mm xy and speeds <=0.01 m/s / 0.1 rad/s. Over 0.1 s this allows
+# <=1 mm drift and <=0.35 mm corner motion for a 35 mm cube.
+# Measured release opens fully at the official 0.8 threshold, not at 1.0.
+reach_weight: 2.0
+reach_scale: 0.35
+lift_weight: 1.5
+lift_ramp: 0.015
+lift_plateau: 0.140
+lift_zero: 0.180
+pair_weight: 2.0
+pair_cap: 2.0
+pair_align_saturate: 0.012
+pair_align_zero: 0.400
+pair_height_low: 0.005
+pair_height_full: 0.025
+pair_height_taper: 0.045
+pair_height_zero: 0.058
+# Exclusion 0.9 m exceeds the measured maximum tower->third-block distance
+# (0.8084 m, layout 21). For a FULLY settled pair (xy<=0.012) reach decreases
+# monotonically along the transit (verified for all curriculum distances).
+# Partially aligned settled pairs (0.012<xy<=0.020) can dip up to ~0.74 mid-
+# transit before recovering; path-independent under PBRS, bounded. The offset
+# applies only after measured release + settling, never during carrying.
+# Release/placed use the global min measured openness, matching the official
+# both-arms-open>=0.8 predicate; closing either jaw to grasp the next block
+# costs a bounded transient (net zero over the episode under PBRS).
+placed_exclusion: 0.9
+release_weight: 0.5
+grasp_point_offset: 0.143
+placement_xy_tolerance: 0.020
+settle_linear_speed: 0.010
+settle_angular_speed: 0.100
 hidden_dim: 128
 # Corrections are clipped to this fraction of each offline action std.
-residual_scale: 0.05
-initial_std: 0.1
-lr: 3e-4
-gamma: 0.99
+residual_scale: 0.2
+# ResiP MLP residual init_logstd=-1.5 => std exp(-1.5)~0.2231 (src/config/actor
+# @cf80d12d). round11 mean correction 0.6mm stayed far below both exploration
+# (~3mm) and the ~35mm grasp offset; fixed 0.1 only has diffusion-variant
+# provenance. Single-variable change for round12; learn_std stays false.
+initial_std: 0.2231
+learn_std: false
+# round13 controlled test: 3e-4 (ResiP pinned default, tuned at 1024 envs) was
+# SLOWER than 1e-4 at our 2-env batch (corr peak 0.84 vs 1.25mm; eval 0.0).
+# Reverted to the project-measured better value for round14.
+lr: 1e-4
+critic_lr: 3e-4
+# A score arriving after 400 steps retains 67% weight instead of 1.8%.
+gamma: 0.999
 gae_lambda: 0.95
-ppo_epochs: 10
+# PPO passes over each rollout, with target-KL early stopping.
+# target_kl matches the ResiP pinned default (base_residual_rl.yaml @cf80d12d);
+# 0.02 early-stopped updates after as few as 6 optimizer steps in round10.
+ppo_epochs: 20
 minibatch_size: 256
 clip_range: 0.2
 value_coef: 0.5
 entropy_coef: 0.0
 max_grad_norm: 0.5
-target_kl: 0.02
+target_kl: 0.1
 save_freq: 25
 # Explicit opt-in is needed if policy and Isaac use the same physical GPU.
-allow_shared_gpu: false
+allow_shared_gpu: true

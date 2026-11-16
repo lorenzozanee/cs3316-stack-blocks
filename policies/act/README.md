@@ -1,6 +1,8 @@
 # ACT 评测接入
 
-本目录负责评测适配；模型、离线训练和冻结基座的残差 PPO 在线训练使用 `src/starter/policies/act*.py`。支持 `RoboDojo / stack_blocks / arx_x5 / ee`，输入只使用 `cam_head` RGB 和 16 维末端状态。
+本目录负责评测适配；模型、离线训练和冻结基座的残差 PPO 在线训练使用 `src/starter/policies/act*.py`。支持 `RoboDojo / stack_blocks / arx_x5 / ee`。冻结 ACT 输入 `cam_head` RGB 和 16 维末端状态；残差 actor/critic 额外读取三块积木的场景相对位置和 wxyz 四元数，物体位姿不进入 ACT。
+
+评测入口继续复用 XPolicyLab `demo_policy/deploy.py` 的标准循环；本地 task 代理仅通过 RoboDojo `get_label_pose` 为观测附加位姿，评分与步进保持上游实现。新残差 checkpoint 使用 `act_residual_ppo_v3` 格式，保存独立的 actor/critic；不加载旧共享网络 v2 权重，重新训练时显式指定离线 ACT 基座。
 
 ## 环境
 

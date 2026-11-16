@@ -1,8 +1,9 @@
 """In-process adapter around a RoboDojo stack-blocks task.
 
 The adapter does not edit the task reward. ``step`` returns the score produced
-by ``reward_manager.get_score`` (0, 15, or 100). Block poses are available only
-through ``get_privileged_state``.
+by ``reward_manager.get_score`` (0, 15, or 100). Block poses, measured gripper
+openness and block velocities are available only through
+``get_privileged_state``.
 """
 
 from __future__ import annotations
@@ -10,11 +11,12 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Mapping
 
+import numpy as np
+
 from starter.interfaces import (
     BLOCK_LABELS,
     HEAD_CAMERA,
     POLICY_STATE_KEYS,
-    SUCCESS_SCORE,
     STEP_LIMIT,
     assert_no_privileged,
     pack_ee_action,
@@ -96,6 +98,60 @@ def _record_origin_endpose(task, reward_manager) -> None:
             origins[env_idx][arm_name] = deepcopy(real_endpose[env_idx])
 
 
+def _measured_gripper_openness(task, env_index: int) -> list[float]:
+    """Measured gripper openness per target robot, in ``robot_list`` order.
+
+    Mirrors ``Func_Parser.is_all_gripper_open``: take the measured gripper joint
+    value, average it, and map ``[gripper_scale[0], gripper_scale[1]]`` to
+    ``[0, 1]``. Unlike the policy observation, this never reads the command
+    cache, so it reflects the physical jaws. Missing API raises rather than
+    returning a fallback.
+    """
+
+    robot_manager = getattr(task, "robot_manager", None)
+    if robot_manager is None or not hasattr(robot_manager, "get_end_effector_real_val"):
+        raise AttributeError("Privileged gripper openness requires robot_manager.get_end_effector_real_val.")
+    values = []
+    for robot in robot_manager.robot_list:
+        if robot.type != "target":
+            continue
+        measured = robot_manager.get_end_effector_real_val(robot=robot, env_idx_list=[env_index])[env_index]
+        low, high = robot.gripper_scale
+        values.append(float((float(np.mean(measured)) - low) / (high - low)))
+    return values
+
+
+def _world_vector3(value) -> list[float]:
+    """Three world-frame components from an Isaac numpy array or torch tensor."""
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    if vector.shape != (3,):
+        raise ValueError(f"Expected a 3-D world-frame vector, got shape {vector.shape}.")
+    return vector.tolist()
+
+
+def _block_velocities(task, env_index: int) -> dict:
+    """World-frame linear and angular velocity for each labelled rigid block."""
+
+    scene_manager = getattr(task, "scene_manager", None)
+    layout_manager = getattr(scene_manager, "layout_manager", None)
+    if layout_manager is None:
+        raise AttributeError("Privileged block velocities require task.scene_manager.layout_manager.")
+    velocities = {}
+    for label in BLOCK_LABELS:
+        inst_name = layout_manager.get_instance_name(env_index, label)
+        obj = layout_manager.get_scene_object(env_index, inst_name)
+        for method in ("get_linear_velocity", "get_angular_velocity"):
+            if not hasattr(obj, method):
+                raise AttributeError(f"Rigid block {label} lacks {method}; cannot report velocities.")
+        velocities[label] = {
+            "linear": _world_vector3(obj.get_linear_velocity()),
+            "angular": _world_vector3(obj.get_angular_velocity()),
+        }
+    return velocities
+
+
 class StackBlocksAdapter:
     """Policy-facing view of one RoboDojo environment.
 
@@ -129,7 +185,9 @@ class StackBlocksAdapter:
         self._steps += 1
         raw = self._raw_obs()
         score, success_reward = self._external_signals()
-        terminated = float(score) == SUCCESS_SCORE or float(success_reward) >= 1.0 - 1e-3
+        # Match EvalEnv.is_episode_end: the public score never terminates an
+        # episode; only the run_reward success flag or the step limit does.
+        terminated = float(success_reward) >= 1.0 - 1e-3
         truncated = self._steps >= self.step_limit and not terminated
         info = {
             "success": terminated,
@@ -141,7 +199,17 @@ class StackBlocksAdapter:
         return self.policy_observation(raw), float(score), terminated, truncated, info
 
     def get_privileged_state(self) -> dict:
-        """Block poses for intrinsic rewards. This dict is not a policy input."""
+        """Scene-relative block poses, measured gripper openness and velocities.
+
+        ``gripper_open_measured`` reads the measured gripper joints, not the
+        command cache used by the policy observation, and normalizes them with
+        the same formula as the official ``is_all_gripper_open`` predicate
+        (third_party/RoboDojo/env/reward_manager/func_parser.py:1523-1536).
+        Entries follow ``robot_manager.robot_list`` order filtered to
+        ``robot.type == "target"``. ``block_velocities`` reads each rigid
+        block's world-frame linear and angular velocity from Isaac Sim's
+        ``SingleRigidPrim`` getters; entries follow ``BLOCK_LABELS``.
+        """
 
         parser = self.task.reward_manager.func_parser
         poses = {}
@@ -151,7 +219,11 @@ class StackBlocksAdapter:
                 "pos": _index(pos_list, self.env_index),
                 "rot": _index(rot_list, self.env_index),
             }
-        return {"blocks": poses}
+        return {
+            "blocks": poses,
+            "gripper_open_measured": _measured_gripper_openness(self.task, self.env_index),
+            "block_velocities": _block_velocities(self.task, self.env_index),
+        }
 
     def policy_observation(self, raw: Mapping) -> dict:
         vision = raw.get("vision", {})
@@ -231,12 +303,14 @@ class ParallelAdapter:
             raise ValueError(f"Expected {self.num_envs} seeds, got {len(seeds)}.")
         self.task.reset(seed=seeds if self.num_envs > 1 else seeds[0])
         _seed_gripper_state(self.task)
+        # run_reward/get_score register checks for ALL scenes, as in the
+        # pinned RoboDojo EvalEnv.run_eval. Register once per batch reset.
+        self._slots[0]._arm_reward_checks()
         observations = []
         infos = []
         for index, seed in enumerate(seeds):
             slot = self._slots[index]
             slot._steps = 0
-            slot._arm_reward_checks()
             observations.append(slot.policy_observation(self._raw(index)))
             infos.append({"env_name": type(self.task).__name__, "seed": seed, "env_index": index})
         return observations, infos
@@ -258,7 +332,9 @@ class ParallelAdapter:
             slot = self._slots[index]
             slot._steps += 1
             score, success_reward = slot._external_signals()
-            terminated = float(score) == SUCCESS_SCORE or float(success_reward) >= 1.0 - 1e-3
+            # EvalEnv ends only on run_reward success or time limit, never on
+            # the partial/full public process score.
+            terminated = float(success_reward) >= 1.0 - 1e-3
             truncated = slot._steps >= slot.step_limit and not terminated
             info = {
                 "success": terminated,

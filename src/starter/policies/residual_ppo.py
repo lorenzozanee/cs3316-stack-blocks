@@ -1,4 +1,16 @@
-"""Concise PPO building blocks for a Gaussian action-residual policy.
+"""PPO building blocks for a Gaussian action-residual policy.
+
+The clipped surrogate, GAE, advantage normalization and target-KL early stop
+follow the standard PPO formulation in Schulman et al., "Proximal Policy
+Optimization Algorithms" (arXiv:1707.06347, 2017) and GAE in Schulman et al.,
+"High-Dimensional Continuous Control Using Generalized Advantage Estimation"
+(arXiv:1506.02438, 2016), matching the structure used by CleanRL and
+Stable-Baselines3. Source implementations:
+https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_continuous_action.py
+https://github.com/ankile/robust-rearrangement/blob/cf80d12d4acae9e4751a49407a96f85f07b342e3/src/models/residual.py
+ResiP: "From Imitation to Refinement -- Residual RL for Precise Assembly"
+(arXiv:2407.16677, ICRA 2025). This module adapts these standard equations to
+RoboDojo's bounded action residuals; it is not a verbatim upstream file.
 
 The policy samples raw residual actions. The caller scales and clips them only
 when executing, so the Gaussian log-probabilities stay on the raw sample.
@@ -19,7 +31,13 @@ MAX_STD = 0.5
 
 
 class ResidualActorCritic(nn.Module):
-    """Two-layer tanh trunk with independent Gaussian residual heads."""
+    """Separate actor and critic trunks with independent Gaussian heads.
+
+    The actor and critic use disjoint two-layer tanh trunks so critic gradients
+    cannot reach the policy. This mirrors the independent ``actor_mean`` and
+    critic in ResiP (https://github.com/ankile/robust-rearrangement,
+    ``src/models/residual.py``).
+    """
 
     def __init__(
         self,
@@ -27,6 +45,7 @@ class ResidualActorCritic(nn.Module):
         action_dim: int = 16,
         hidden_dim: int = 128,
         initial_std: float = 0.1,
+        learn_std: bool = False,
     ):
         super().__init__()
         if int(feature_dim) <= 0:
@@ -48,8 +67,17 @@ class ResidualActorCritic(nn.Module):
             nn.Tanh(),
         )
         self.mean_head = nn.Linear(self.hidden_dim, self.action_dim)
+        self.value_trunk = nn.Sequential(
+            nn.Linear(self.feature_dim, self.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Tanh(),
+        )
         self.value_head = nn.Linear(self.hidden_dim, 1)
-        self.log_std = nn.Parameter(torch.full((self.action_dim,), math.log(float(initial_std))))
+        self.log_std = nn.Parameter(
+            torch.full((self.action_dim,), math.log(float(initial_std))),
+            requires_grad=bool(learn_std),
+        )
 
         nn.init.zeros_(self.mean_head.weight)
         nn.init.zeros_(self.mean_head.bias)
@@ -57,14 +85,30 @@ class ResidualActorCritic(nn.Module):
         self._log_min_std = math.log(MIN_STD)
         self._log_max_std = math.log(MAX_STD)
 
+    def actor_parameters(self) -> list[nn.Parameter]:
+        """Parameters trained by the policy loss, for one optimizer group.
+
+        ``log_std`` is included only when it is learnable; with the default
+        frozen std it is still stored in the state dict but receives no update.
+        """
+
+        parameters = list(self.trunk.parameters()) + list(self.mean_head.parameters())
+        if self.log_std.requires_grad:
+            parameters.append(self.log_std)
+        return parameters
+
+    def critic_parameters(self) -> list[nn.Parameter]:
+        """Parameters trained by the value loss, for a separate optimizer group."""
+
+        return list(self.value_trunk.parameters()) + list(self.value_head.parameters())
+
     def _outputs(self, features: torch.Tensor) -> tuple[Normal, torch.Tensor]:
         if features.ndim < 1 or features.shape[-1] != self.feature_dim:
             raise ValueError(
                 f"features must end with dimension {self.feature_dim}, got shape {tuple(features.shape)}."
             )
-        hidden = self.trunk(features)
-        mean = self.mean_head(hidden)
-        value = self.value_head(hidden).squeeze(-1)
+        mean = self.mean_head(self.trunk(features))
+        value = self.value_head(self.value_trunk(features)).squeeze(-1)
         std = self.log_std.clamp(self._log_min_std, self._log_max_std).exp()
         return Normal(mean, std), value
 
@@ -171,7 +215,7 @@ def ppo_update(
     entropy_coef: float,
     max_grad_norm: float,
     target_kl: float,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | bool | None]:
     """Run clipped PPO epochs over one collected batch."""
 
     if int(update_epochs) < 1:
@@ -220,9 +264,16 @@ def ppo_update(
         "entropy": 0.0,
         "approx_kl": 0.0,
         "clip_fraction": 0.0,
+        "total_loss": 0.0,
     }
     scored = 0
     updates = 0
+    epochs_completed = 0
+    grad_norms: list[float] = []
+    actor_grad_norms: list[float] = []
+    critic_grad_norms: list[float] = []
+    actor_parameters = model.actor_parameters()
+    critic_parameters = model.critic_parameters()
     stopped = False
     model.train()
 
@@ -253,6 +304,7 @@ def ppo_update(
             totals["entropy"] += float(entropy_mean.detach()) * size
             totals["approx_kl"] += float(approx_kl.detach()) * size
             totals["clip_fraction"] += float(clip_fraction.detach()) * size
+            totals["total_loss"] += float(loss.detach()) * size
             scored += size
             # Early stop still reports the current minibatch's metrics, without
             # pretending an optimizer step happened.
@@ -262,17 +314,64 @@ def ppo_update(
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            if not torch.isfinite(grad_norm):
+            # The actor and critic parameters are disjoint, so clipping each
+            # group separately prevents large value gradients or one global
+            # norm from rescaling the policy update.
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                actor_parameters, max_grad_norm
+            )
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                critic_parameters, max_grad_norm
+            )
+            if not (
+                torch.isfinite(actor_grad_norm) and torch.isfinite(critic_grad_norm)
+            ):
                 optimizer.zero_grad(set_to_none=True)
                 raise FloatingPointError("PPO gradient norm is non-finite.")
+            # Both returns are pre-clipping norms for disjoint parameter groups.
+            grad_norm = torch.sqrt(actor_grad_norm**2 + critic_grad_norm**2)
+            grad_norms.append(float(grad_norm.detach()))
+            actor_grad_norms.append(float(actor_grad_norm.detach()))
+            critic_grad_norms.append(float(critic_grad_norm.detach()))
             optimizer.step()
             updates += 1
         if stopped:
             break
+        epochs_completed += 1
 
-    metrics: dict[str, float | int] = {
+    metrics: dict[str, float | int | bool | None] = {
         name: total / scored for name, total in totals.items()
     }
     metrics["updates"] = updates
+    metrics["grad_norm"] = sum(grad_norms) / len(grad_norms) if grad_norms else None
+    metrics["actor_grad_norm"] = (
+        sum(actor_grad_norms) / len(actor_grad_norms) if actor_grad_norms else None
+    )
+    metrics["critic_grad_norm"] = (
+        sum(critic_grad_norms) / len(critic_grad_norms) if critic_grad_norms else None
+    )
+    metrics["max_grad_norm_observed"] = max(grad_norms) if grad_norms else None
+    metrics["early_stopped"] = stopped
+    metrics["epochs_completed"] = epochs_completed
+
+    # Evaluate the final critic over the whole batch in bounded chunks.
+    with torch.no_grad():
+        final_values = torch.empty(count, dtype=returns.dtype, device=returns.device)
+        chunk = min(count, 1024)
+        for start in range(0, count, chunk):
+            stop = min(start + chunk, count)
+            _, _, chunk_values = model.evaluate_actions(features[start:stop], actions[start:stop])
+            final_values[start:stop] = chunk_values
+        return_variance = returns.var(unbiased=False)
+        if float(return_variance) == 0.0:
+            explained_variance = None
+        else:
+            residual_variance = (returns - final_values).var(unbiased=False)
+            explained_variance = float(1.0 - residual_variance / return_variance)
+    metrics["explained_variance"] = explained_variance
+
+    final_std = model.log_std.detach().clamp(model._log_min_std, model._log_max_std).exp()
+    metrics["policy_std_mean"] = float(final_std.mean())
+    metrics["policy_std_min"] = float(final_std.min())
+    metrics["policy_std_max"] = float(final_std.max())
     return metrics

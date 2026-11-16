@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -14,12 +15,34 @@ from XPolicyLab.utils.process_data import (
     pack_robot_state,
     unpack_robot_state,
 )
-from starter.interfaces import ACTION_DIM, BENCH_NAME, ENV_CFG, EVAL_TASK, GRIPPER_KEYS, HEAD_CAMERA
-from starter.policies.act_inference import compose_residual_action, load_act_runner
+from starter.interfaces import (
+    ACTION_DIM,
+    BENCH_NAME,
+    ENV_CFG,
+    EVAL_TASK,
+    GRIPPER_KEYS,
+    HEAD_CAMERA,
+)
+from starter.policies.act_inference import block_pose_features, compose_residual_action, load_act_runner
+
+
+def _block_poses(obs: Mapping, env_index: int) -> dict:
+    """Use the same ordered pose validation as the online training runner."""
+    try:
+        blocks = obs["privileged"]["blocks"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"Residual env {env_index} requires privileged block poses.") from error
+    block_pose_features(blocks)
+    return blocks
 
 
 class Model(ModelTemplate):
-    """Only head-camera RGB and ee state enter the frozen policy."""
+    """Frozen ACT sees only head RGB and 16-D proprio.
+
+    Online residual checkpoints additionally read privileged block poses from
+    the flat observation's ``blocks`` entry; those poses never reach the
+    frozen base network.
+    """
 
     def __init__(self, model_cfg):
         for key, expected in (("bench_name", BENCH_NAME), ("task_name", EVAL_TASK),
@@ -63,11 +86,14 @@ class Model(ModelTemplate):
                 raise ValueError(f"ACT proprio must have shape ({ACTION_DIM},).")
             if not np.isfinite(qpos).all():
                 raise ValueError("ACT proprio contains a non-finite value.")
-            observations[int(obs.get("env_idx", 0))] = {
+            observation = {
                 "image": color,
                 "proprio": qpos.tolist(),
                 "camera": HEAD_CAMERA,
             }
+            if self.residual is not None:
+                observation["blocks"] = _block_poses(obs, int(obs.get("env_idx", 0)))
+            observations[int(obs.get("env_idx", 0))] = observation
         self.observations = observations
 
     def _unpack_chunk(self, chunk):

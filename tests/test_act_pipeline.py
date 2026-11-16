@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from starter.config import load_config
 from starter.pipelines import act
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,8 +24,9 @@ class ACTPipelineTest(unittest.TestCase):
         self.assertEqual(config["data_task"], "stack_blocks")
         self.assertEqual(config["camera_names"], ["cam_head"])
         self.assertEqual(config["finetune_episodes"] % config["num_envs"], 0)
-        self.assertEqual(config["residual_scale"], 0.05)
-        self.assertEqual(config["lr"], 3e-4)
+        online_config = load_config(ROOT / "configs/act_online.yaml")
+        for key, value in online_config.items():
+            self.assertEqual(config[key], value, key)
 
     def test_online_requires_checkpoint_before_starting_training(self):
         with mock.patch.object(act, "train_online") as train, contextlib.redirect_stderr(io.StringIO()):

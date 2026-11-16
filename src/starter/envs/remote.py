@@ -1,8 +1,8 @@
 """TCP environment used by the online fine-tunes.
 
 The Isaac process is the server. The learner, running in the ``dp`` or ``act``
-conda environment, is the client. Frames are newline-delimited JSON. Images
-travel as JPEG so a 480p frame stays small.
+conda environment, is the client. Frames are newline-delimited JSON. Camera
+frames use lossless PNG so ACT receives the same RGB pixels as official eval.
 """
 
 from __future__ import annotations
@@ -85,6 +85,14 @@ def serve(env, host: str, port: int, once: bool = False) -> None:
                 break
             else:
                 _write(connection, {"error": f"unknown op {op}"})
+    except Exception as error:
+        # Deliver deterministic simulator/reset failures to the learner. An EOF
+        # alone would be treated as a crashed server and retried for hours.
+        try:
+            _write(connection, {"error": f"{type(error).__name__}: {error}"})
+        except OSError:
+            pass
+        raise
     finally:
         connection.close()
         listener.close()
@@ -272,11 +280,13 @@ def _pack_image(value) -> dict:
         array = np.clip(array, 0, 255).astype(np.uint8)
     if array.ndim == 3 and array.shape[0] in (1, 3) and array.shape[-1] not in (1, 3):
         array = np.moveaxis(array, 0, -1)
-    ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(array, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    # Official XPolicyLab eval transports ndarray pixels without loss. JPEG
+    # chroma subsampling changed the frozen ACT input during online training.
+    ok, encoded = cv2.imencode(".png", cv2.cvtColor(array, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
     if not ok:
         raise RuntimeError("Failed to encode the camera frame.")
     return {
-        "jpeg": base64.b64encode(encoded.tobytes()).decode("ascii"),
+        "png": base64.b64encode(encoded.tobytes()).decode("ascii"),
         "shape": list(array.shape),
     }
 
@@ -285,7 +295,7 @@ def _unpack_image(payload: dict):
     import cv2
     import numpy as np
 
-    raw = base64.b64decode(payload["jpeg"])
+    raw = base64.b64decode(payload["png"])
     array = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
     if array is None:
         raise RuntimeError("Failed to decode the camera frame.")

@@ -110,11 +110,17 @@ class TinyResidual(torch.nn.Module):
         return raw, zeros, zeros
 
 
+def block_poses(x=0.1):
+    return {label: {"pos": [x, 0.2, 0.8], "rot": [1.0, 0.0, 0.0, 0.0]}
+            for label in ("block_0", "block_1", "block_2")}
+
+
 def flat_observation(position=3.0, image_value=255):
     return {
         "image": np.full((8, 8, 3), image_value, dtype=np.uint8),
         "proprio": np.full(16, position, dtype=np.float32),
         "camera": "cam_head",
+        "blocks": block_poses(),
     }
 
 
@@ -139,10 +145,35 @@ class FrozenRunnerTest(unittest.TestCase):
         expected_action = np.ones(16)
         expected_action[[7, 15]] = [2.0, -2.0]
         np.testing.assert_allclose(features[0, 16:32].numpy(), expected_action)
-        np.testing.assert_allclose(features[0, 32:].numpy(), np.arange(512))
+        np.testing.assert_allclose(features[0, 32:544].numpy(), np.arange(512))
+        np.testing.assert_allclose(features[0, 544:].numpy(),
+                                   np.tile([0.1, 0.2, 0.8, 1, 0, 0, 0], 3))
         # The base remains frozen.
         self.assertFalse(self.policy.training)
         self.assertTrue(all(not parameter.requires_grad for parameter in self.policy.parameters()))
+
+    def test_object_poses_change_residual_features_but_not_base_actions(self):
+        first = flat_observation()
+        second = flat_observation()
+        second["blocks"] = block_poses(x=0.4)
+        chunks, features = self.runner.predict_base([first, second], [0, 1], with_features=True)
+        np.testing.assert_array_equal(chunks[0], chunks[1])
+        torch.testing.assert_close(features[0, :544], features[1, :544])
+        self.assertFalse(torch.equal(features[0, 544:], features[1, 544:]))
+        self.assertEqual(self.policy.model.backbones[0].calls, 1)
+
+    def test_missing_or_invalid_object_poses_fail_for_residual_only(self):
+        observation = flat_observation()
+        del observation["blocks"]
+        self.runner.predict_base([observation], [0], with_features=False)
+        with self.assertRaisesRegex(ValueError, "block poses"):
+            self.runner.predict_base([observation], [0], with_features=True)
+        for pose, message in (({"pos": [0, 0, 0], "rot": [0, 0, 0, 0]}, "near zero"),
+                              ({"pos": [float("nan"), 0, 0], "rot": [1, 0, 0, 0]}, "non-finite")):
+            observation = flat_observation()
+            observation["blocks"]["block_0"] = pose
+            with self.assertRaisesRegex(ValueError, message):
+                self.runner.predict_base([observation], [0], with_features=True)
 
     def test_feature_capture_requires_temporal_aggregation(self):
         runner = FrozenACTRunner(
@@ -249,7 +280,7 @@ class OnlineAdapterTest(unittest.TestCase):
 
     def test_online_action_is_deterministic_and_keeps_base_bounds(self):
         model = self.make_model()
-        model.update_obs(robot_observation(0, {"block_0": object()}))
+        model.update_obs(robot_observation(0, {"blocks": block_poses()}))
         actions = model.get_action()
         self.assertTrue(self.residual.deterministic)
         self.assertEqual(self.residual.feature_shape, (1, FEATURE_DIM))
@@ -267,13 +298,16 @@ class OnlineAdapterTest(unittest.TestCase):
         self.assertLessEqual(float(action["left_ee_joint_state"][0]), 1.0)
         self.assertEqual(float(action["right_ee_joint_state"][0]), 0.0)
 
-    def test_privileged_state_does_not_change_actions(self):
+    def test_privileged_state_reaches_only_residual_features(self):
         model = self.make_model()
         model.update_obs_batch([
-            robot_observation(0, {"block_0": 1}),
-            robot_observation(1, {"object_pose": 99}),
+            robot_observation(0, {"blocks": block_poses(x=0.1)}),
+            robot_observation(1, {"blocks": block_poses(x=0.4)}),
         ])
+        self.assertNotEqual(float(model.observations[0]["blocks"]["block_0"]["pos"][0]),
+                            float(model.observations[1]["blocks"]["block_0"]["pos"][0]))
         actions = model.get_action_batch([0, 1])
+        # This fixture's residual outputs a constant, so ACT actions stay equal.
         np.testing.assert_allclose(
             actions[0][0]["left_ee_pose"], actions[1][0]["left_ee_pose"],
         )
@@ -311,7 +345,7 @@ class LoadRunnerTest(unittest.TestCase):
         self._write_config({"policy_type": "act_residual_ppo", "temporal_agg": True})
         residual_config = {"feature_dim": FEATURE_DIM, "hidden_dim": 8, "initial_std": 0.1}
         payload = {
-            "format": "act_residual_ppo_v1",
+            "format": "act_residual_ppo_v3",
             "base_config": {},
             "base_state_dict": TinyPolicy().state_dict(),
             "residual_config": residual_config,
@@ -336,8 +370,23 @@ class LoadRunnerTest(unittest.TestCase):
         self.assertFalse(residual.training)
         self.assertTrue(all(not parameter.requires_grad for parameter in runner.policy.parameters()))
 
+    def test_checkpoint_symlink_uses_target_directory_metadata(self):
+        checkpoint = self._write_online()
+        links = self.root / "useful_checkpoints"
+        links.mkdir()
+        link = links / "selected.ckpt"
+        link.symlink_to(checkpoint)
+        with mock.patch.object(act_inference, "ACTPolicy", TinyPolicy), \
+                mock.patch.object(act_inference, "ResidualActorCritic", TinyResidual):
+            runner, residual, scale = act_inference.load_act_runner(link, "cpu")
+        self.assertIsInstance(residual, TinyResidual)
+        self.assertEqual(scale, 0.25)
+        self.assertTrue(runner.capture_features)
+
     def test_online_rejects_format_and_temporal_mismatch(self):
-        checkpoint = self._write_online(format="something_else")
+        # The independent actor/critic v3 architecture never migrates the old
+        # shared-trunk v2 checkpoint silently.
+        checkpoint = self._write_online(format="act_residual_ppo_v2")
         with mock.patch.object(act_inference, "ACTPolicy", TinyPolicy), \
                 mock.patch.object(act_inference, "ResidualActorCritic", TinyResidual):
             with self.assertRaisesRegex(ValueError, "format"):
