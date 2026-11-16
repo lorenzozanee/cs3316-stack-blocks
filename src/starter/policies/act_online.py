@@ -318,6 +318,19 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
     first_partial_steps = dict.fromkeys(active)
     position_residual_sums = dict(previous_scores)
     phi_sums = dict(previous_scores)
+    # Per-episode extrema (observability only). Final-frame fields cannot show a
+    # transient lift/grasp/release, so coverage conclusions rested on a blind
+    # spot. These accumulate over every step and change no action, reward,
+    # potential or trajectory; they only add keys to episodes/metrics.
+    extrema = {
+        i: {"max_lift_m": 0.0, "max_lift_progress": 0.0, "max_pair_sum": 0.0,
+            "min_d_min_m": float("inf"), "max_min_gripper": 0.0,
+            "max_settled_pair": 0.0, "max_lift_gate": 0.0,
+            "max_lift_per_block_m": {label: 0.0 for label in BLOCK_LABELS},
+            "first_lift_step": None, "first_pair_step": None,
+            "first_both_open_step": None, "first_settled_step": None}
+        for i in active
+    }
     episodes = []
     for _ in range(STEP_LIMIT):
         inputs = torch.stack([current[i][1] for i in active])
@@ -376,6 +389,26 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                 first_partial_steps[i] = step
             previous_scores[i] = score
             peak_scores[i] = max(peak_scores[i], score)
+            ex = extrema[i]
+            ex["max_lift_m"] = max(ex["max_lift_m"], terms["lift"])
+            ex["max_lift_progress"] = max(ex["max_lift_progress"], terms["lift_progress"])
+            ex["max_pair_sum"] = max(ex["max_pair_sum"], terms["pair_sum"])
+            ex["min_d_min_m"] = min(ex["min_d_min_m"], terms["d_min"])
+            ex["max_min_gripper"] = max(ex["max_min_gripper"], terms["min_gripper"])
+            ex["max_settled_pair"] = max(ex["max_settled_pair"], terms["settled_pair"])
+            ex["max_lift_gate"] = max(ex["max_lift_gate"], terms["lift_gate"])
+            for label in BLOCK_LABELS:
+                block_lift = max(0.0, float(step_positions[label][2] - initial_heights[i][label]))
+                if block_lift > ex["max_lift_per_block_m"][label]:
+                    ex["max_lift_per_block_m"][label] = block_lift
+            if ex["first_lift_step"] is None and terms["lift"] > 1e-6:
+                ex["first_lift_step"] = step
+            if ex["first_pair_step"] is None and terms["pair_sum"] >= 1.0:
+                ex["first_pair_step"] = step
+            if ex["first_both_open_step"] is None and terms["min_gripper"] >= 1.0:
+                ex["first_both_open_step"] = step
+            if ex["first_settled_step"] is None and terms["settled_pair"] > 0.0:
+                ex["first_settled_step"] = step
             trajectories[i].append((inputs[pos].cpu(), raw_actions[pos].cpu(),
                                     log_probs[pos].cpu(), values[pos].cpu(), reward,
                                     0.0 if terminated else float(next_values[i]),
@@ -425,7 +458,19 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                                  "final_pair_xy_m": pair_xy,
                                  "final_pair_dz_m": pair_dz,
                                  "final_gripper_openness": [float(proprio_final[7]),
-                                                            float(proprio_final[15])]})
+                                                            float(proprio_final[15])],
+                                 "max_lift_m": extrema[i]["max_lift_m"],
+                                 "max_lift_progress": extrema[i]["max_lift_progress"],
+                                 "max_lift_per_block_m": extrema[i]["max_lift_per_block_m"],
+                                 "max_pair_sum": extrema[i]["max_pair_sum"],
+                                 "min_d_min_m": extrema[i]["min_d_min_m"],
+                                 "max_min_gripper": extrema[i]["max_min_gripper"],
+                                 "max_settled_pair": extrema[i]["max_settled_pair"],
+                                 "max_lift_gate": extrema[i]["max_lift_gate"],
+                                 "first_lift_step": extrema[i]["first_lift_step"],
+                                 "first_pair_step": extrema[i]["first_pair_step"],
+                                 "first_both_open_step": extrema[i]["first_both_open_step"],
+                                 "first_settled_step": extrema[i]["first_settled_step"]})
             else:
                 remaining.append(i)
         active = remaining
@@ -480,6 +525,21 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
         "mean_d_min_m": float(np.mean([ep["d_min_final_m"] for ep in episodes])),
         "fraction_episodes_with_pair": float(np.mean([ep["pair_sum_final"] >= 1.0 for ep in episodes])),
         "fraction_episodes_with_lift": float(np.mean([ep["lift_gate_final"] >= 1.0 for ep in episodes])),
+        # Per-episode extrema aggregates (observability): transient lift/grasp/
+        # release events the final-frame fields miss. *_over_episodes is the
+        # best single episode; episodes_with_* counts any transient occurrence.
+        "max_lift_m_over_episodes": float(max(ep["max_lift_m"] for ep in episodes)),
+        "max_lift_progress_over_episodes": float(max(ep["max_lift_progress"] for ep in episodes)),
+        "max_pair_sum_over_episodes": float(max(ep["max_pair_sum"] for ep in episodes)),
+        "min_d_min_m_over_episodes": float(min(ep["min_d_min_m"] for ep in episodes)),
+        "max_min_gripper_over_episodes": float(max(ep["max_min_gripper"] for ep in episodes)),
+        "max_settled_pair_over_episodes": float(max(ep["max_settled_pair"] for ep in episodes)),
+        "mean_max_lift_m": float(np.mean([ep["max_lift_m"] for ep in episodes])),
+        "mean_max_pair_sum": float(np.mean([ep["max_pair_sum"] for ep in episodes])),
+        "episodes_with_any_lift": sum(ep["first_lift_step"] is not None for ep in episodes),
+        "episodes_with_any_pair": sum(ep["first_pair_step"] is not None for ep in episodes),
+        "episodes_with_both_open": sum(ep["first_both_open_step"] is not None for ep in episodes),
+        "episodes_with_any_settled": sum(ep["first_settled_step"] is not None for ep in episodes),
         "mean_final_min_pair_xy_m": float(np.mean([min(ep["final_pair_xy_m"]) for ep in episodes])),
         "nonzero_reward_steps": sum(ep["nonzero_reward_steps"] for ep in episodes),
         "negative_reward_steps": sum(ep["negative_reward_steps"] for ep in episodes),
@@ -839,6 +899,12 @@ def train_online(config: dict) -> Path:
                       f"KL={record['approx_kl']:.5f} optimizer_steps={record['updates']} "
                       f"early_stop={record['early_stopped']} | lr={record['lr']:.3e} "
                       f"mean_correction_mm={1000 * record['mean_policy_position_residual_m']:.2f} "
+                      f"extrema[max_lift_mm={1000 * record['max_lift_m_over_episodes']:.2f} "
+                      f"max_pair={record['max_pair_sum_over_episodes']:.2f} "
+                      f"min_d_mm={1000 * record['min_d_min_m_over_episodes']:.1f} "
+                      f"anyLift={record['episodes_with_any_lift']}/{len(episodes)} "
+                      f"anyPair={record['episodes_with_any_pair']}/{len(episodes)} "
+                      f"bothOpen={record['episodes_with_both_open']}/{len(episodes)}] "
                       f"rollout={rollout_seconds:.1f}s PPO={optimization_seconds:.1f}s "
                       f"update_time={update_seconds:.1f}s elapsed={timedelta(seconds=int(elapsed))} "
                       f"ETA={timedelta(seconds=int(remaining))} | {memory}", flush=True)

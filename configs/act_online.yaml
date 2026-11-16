@@ -2,9 +2,11 @@
 # Supply the selected offline ACT checkpoint using --checkpoint.
 device: cuda
 temporal_agg: true
-# Four-hour training budget; finish the current wave, PPO update and save at expiry.
-finetune_updates: 14
-max_train_seconds: 14400
+# Eight-hour training budget (round15+); finish the current wave, PPO update and
+# save at expiry. The update cap sits above the expected ~20-22 updates so the
+# budget binds first (round14 measured ~1318 s/update, rising with VRAM creep).
+finetune_updates: 28
+max_train_seconds: 28800
 # Complete waves of num_envs; each scene keeps its own episode boundary.
 finetune_episodes: 16
 # Curriculum layout ids in the seed-0 layout set; cycle evenly across scenes.
@@ -65,11 +67,17 @@ settle_angular_speed: 0.100
 hidden_dim: 128
 # Corrections are clipped to this fraction of each offline action std.
 residual_scale: 0.2
-# ResiP MLP residual init_logstd=-1.5 => std exp(-1.5)~0.2231 (src/config/actor
-# @cf80d12d). round11 mean correction 0.6mm stayed far below both exploration
-# (~3mm) and the ~35mm grasp offset; fixed 0.1 only has diffusion-variant
-# provenance. Single-variable change for round12; learn_std stays false.
-initial_std: 0.2231
+# round15 single behavioral variable: 0.2231 -> 0.02 (validation floor,
+# act_online.py:558). round14 ran 176 episodes at std 0.2231 (~6.7 mm iid position
+# noise) with peak_score=0 throughout; at the base's ~5% all55 event rate that is
+# P~5e-5, so the testable hypothesis is that exploration noise destroys the
+# knife-edge grasp. std 0.02 (~0.6 mm) makes training execution approximate the
+# deterministic eval policy (round14 mean correction 1.05 mm), adjudicating base
+# capability in the training loop over ~200 episodes with per-episode extrema
+# logging. Not a score bet; learn_std stays false and every other hyperparameter
+# and shaping key is unchanged. Prior value provenance: ResiP MLP residual
+# init_logstd=-1.5 => exp(-1.5)~0.2231 (src/config/actor @cf80d12d).
+initial_std: 0.02
 learn_std: false
 # round13 controlled test: 3e-4 (ResiP pinned default, tuned at 1024 envs) was
 # SLOWER than 1e-4 at our 2-env batch (corr peak 0.84 vs 1.25mm; eval 0.0).
