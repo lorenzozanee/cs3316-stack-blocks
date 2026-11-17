@@ -22,61 +22,54 @@ rollout_layout_ids:
   - 21
   - 22
   - 23
-# Staged shaping (round14, user's 7-step decomposition). Pure state function
-# using observed grasp geometry plus measured block velocities and gripper
-# joints. Directed upward pair chains prevent a shared upper/lower block from
-# counting twice. Settled, released pairs retarget reach to the next block.
-# Sources: func_parser.is_stacked / is_all_gripper_open, arx_x5 URDF and demo;
-# robosuite stack uses grasp/lift/contact, but here velocity is an explicit
-# settling proxy, not a contact/stability proof. PBRS: Ng 1999, Grzes 2017.
-# Anti-tip lift ramp 15 mm; two raised blocks are needed for a tower.
-# pair_height_low 5 mm exceeds the measured resting |dz| maximum 4.9 mm.
-# Broad alignment supports transport; placement exclusion additionally
-# requires <=20 mm xy and speeds <=0.01 m/s / 0.1 rad/s. Over 0.1 s this allows
-# <=1 mm drift and <=0.35 mm corner motion for a 35 mm cube.
-# Measured release opens fully at the official 0.8 threshold, not at 1.0.
+# Seven-step internal reward: physical-state PBRS plus one-time milestones.
+# The target uses demo release-command grasp points (100 demos/300 opening
+# upcrossings at 0.5, max radial deviation 6.706 mm; not block/contact ground
+# truth). It is an INTERNAL preference; official scoring
+# has no target-region criterion. Block sizes/table top come from scene data.
+# Reach/lift/transport adapt robosuite/IsaacLab principles, not their reward
+# formula. Geometric support, low velocities and 3 consecutive observations
+# are proxies; no contact-force or static-equilibrium claim is made.
 reach_weight: 2.0
 reach_scale: 0.35
-lift_weight: 1.5
-lift_ramp: 0.015
-lift_plateau: 0.140
-lift_zero: 0.180
-pair_weight: 2.0
-pair_cap: 2.0
-pair_align_saturate: 0.012
-pair_align_zero: 0.400
-pair_height_low: 0.005
-pair_height_full: 0.025
-pair_height_taper: 0.045
-pair_height_zero: 0.058
-# Exclusion 0.9 m exceeds the measured maximum tower->third-block distance
-# (0.8084 m, layout 21). For a FULLY settled pair (xy<=0.012) reach decreases
-# monotonically along the transit (verified for all curriculum distances).
-# Partially aligned settled pairs (0.012<xy<=0.020) can dip up to ~0.74 mid-
-# transit before recovering; path-independent under PBRS, bounded. The offset
-# applies only after measured release + settling, never during carrying.
-# Release/placed use the global min measured openness, matching the official
-# both-arms-open>=0.8 predicate; closing either jaw to grasp the next block
-# costs a bounded transient (net zero over the episode under PBRS).
-placed_exclusion: 0.9
+lift_weight: 1.0
+base_weight: 1.0
+pair_weight: 1.5
 release_weight: 0.5
-grasp_point_offset: 0.143
-placement_xy_tolerance: 0.020
+# Each milestone pays at most once per episode; total 4.5 < official partial15.
+# This event reward is non-PBRS and history-dependent; actor/critic have no
+# latch/dwell input, so the combined reward has no policy-invariance guarantee.
+milestone_grasp: 0.5
+milestone_base: 1.0
+milestone_pair2: 1.0
+milestone_pair3: 2.0
+milestone_dwell_steps: 3
+placement_x: 0.0
+placement_y: -0.2
+placement_radius: 0.01
+placement_soft_scale: 0.15
+grasp_offset: 0.143
+# x5 measured-opening normalization and physical jaw aperture from robot_config,
+# joint7/8 origins and link7/8 STL inner surfaces. Aperture=2*joint+zero_gap.
+gripper_scale_low: -0.01
+gripper_scale_high: 0.044
+gripper_aperture_zero: 0.000807165976524353
+# Internal geometric tolerances relative to actual projected width/block size;
+# neither is a contact-force measurement or calibrated solver tolerance.
+grasp_aperture_fraction: 0.10
+grasp_centering_fraction: 0.50
+support_gap_floor: 0.002
+support_gap_fraction: 0.08
 settle_linear_speed: 0.010
 settle_angular_speed: 0.100
+upright_cos_min: 0.9659258262890683
 hidden_dim: 128
 # Corrections are clipped to this fraction of each offline action std.
 residual_scale: 0.2
-# round15 single behavioral variable: 0.2231 -> 0.02 (validation floor,
-# act_online.py:558). round14 ran 176 episodes at std 0.2231 (~6.7 mm iid position
-# noise) with peak_score=0 throughout; at the base's ~5% all55 event rate that is
-# P~5e-5, so the testable hypothesis is that exploration noise destroys the
-# knife-edge grasp. std 0.02 (~0.6 mm) makes training execution approximate the
-# deterministic eval policy (round14 mean correction 1.05 mm), adjudicating base
-# capability in the training loop over ~200 episodes with per-episode extrema
-# logging. Not a score bet; learn_std stays false and every other hyperparameter
-# and shaping key is unchanged. Prior value provenance: ResiP MLP residual
-# init_logstd=-1.5 => exp(-1.5)~0.2231 (src/config/actor @cf80d12d).
+# Fixed exploration std is a project-controlled choice, retained across this
+# reward change. Heterogeneous all-layout outcomes do not define an iid event
+# rate for curriculum repeats; zero scores alone cannot identify noise as cause.
+# ResiP MLP instead uses learn_std=true, init_logstd=-1.5 (@cf80d12d).
 initial_std: 0.02
 learn_std: false
 # round13 controlled test: 3e-4 (ResiP pinned default, tuned at 1024 envs) was

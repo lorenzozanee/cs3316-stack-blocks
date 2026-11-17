@@ -86,6 +86,16 @@ class FakeLayoutManager:
     def __init__(self, num_envs):
         self.num_envs = num_envs
         self.velocity_calls = []
+        self.table_info = [
+            {"height": 0.765 + 0.01 * index, "pos": [0.0, -0.05, 0.74],
+             "size": [-0.7, -0.55, 0.7, 0.55]}
+            for index in range(num_envs)
+        ]
+
+    def get_instance_metadata(self, env_idx, label):
+        BLOCK_LABELS.index(label)
+        side = 0.03 + 0.005 * env_idx
+        return {"geometry": {"oriented_bbox": {"extents": [side] * 3}}}
 
     def get_instance_name(self, env_index, label):
         return f"{label}_env{env_index}"
@@ -94,6 +104,7 @@ class FakeLayoutManager:
         self.velocity_calls.append((env_index, inst_name))
         index = BLOCK_LABELS.index(inst_name.split("_env")[0])
         return SimpleNamespace(
+            scale=[1.0, 1.0, 1.0],
             get_linear_velocity=lambda: np.array([0.0, 0.0, float(env_index)]),
             get_angular_velocity=lambda: np.array([float(index), 0.0, 0.0]),
         )
@@ -155,6 +166,9 @@ class DeployProxyTest(unittest.TestCase):
             # Measured openness and velocities follow the frame's env_index,
             # not its position in the returned batch.
             self.assertAlmostEqual(frame["privileged"]["gripper_open_measured"][0], 0.1 * env_index)
+            self.assertAlmostEqual(frame["privileged"]["table"]["top_z"], 0.765 + 0.01 * env_index)
+            for extents in frame["privileged"]["block_extents"].values():
+                np.testing.assert_allclose(extents, [0.03 + 0.005 * env_index] * 3)
             velocities = frame["privileged"]["block_velocities"]
             self.assertEqual(list(velocities), list(BLOCK_LABELS))
             for label in BLOCK_LABELS:

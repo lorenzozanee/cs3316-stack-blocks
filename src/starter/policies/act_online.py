@@ -17,7 +17,6 @@ import math
 import pickle
 import time
 from datetime import timedelta
-from itertools import permutations
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +36,7 @@ from starter.policies.act_inference import (
 )
 from starter.policies.act_model import ACTPolicy
 from starter.policies.residual_ppo import PPOBatch, ResidualActorCritic, compute_gae, ppo_update
+from starter.policies.stacking_reward import REWARD_KEYS, StackingReward, validate_reward_config
 
 
 def online_output_dir(config: dict) -> Path:
@@ -92,196 +92,18 @@ def _block_positions(privileged) -> dict:
         raise ValueError("Dense shaping requires privileged block poses.") from error
 
 
-# Staged shaping constants (round14). Geometry sources: arx_x5 URDF finger
-# joints at local +x 0.08657 m with mesh to +0.071 m; demo grasp frames put the
-# grasp centre 0.1431 m below the wrist along local +x (episode_0000000 frame
-# 119). Official predicates: func_parser.is_stacked (xy 0.015/0.0175/0.02 by
-# block size, z gap >= 0.005) and is_all_gripper_open (>= 0.8, both arms).
-SHAPING_KEYS = (
-    "reach_weight", "reach_scale", "lift_weight", "lift_ramp", "lift_plateau",
-    "lift_zero", "pair_weight", "pair_cap", "pair_align_saturate",
-    "pair_align_zero", "pair_height_low", "pair_height_full",
-    "pair_height_taper", "pair_height_zero", "placed_exclusion",
-    "release_weight", "grasp_point_offset", "placement_xy_tolerance",
-    "settle_linear_speed", "settle_angular_speed",
-)
-
-
-def _rotation_wxyz(quat) -> np.ndarray:
-    """Rotation matrix from a wxyz quaternion; reject degenerate norms."""
-    q = np.asarray(quat, dtype=np.float64)
-    norm = float(np.linalg.norm(q))
-    if q.shape != (4,) or not np.isfinite(q).all() or not np.isfinite(norm) or norm < 1e-8:
-        raise ValueError("Dense shaping requires a finite unit-scale wxyz quaternion.")
-    w, x, y, z = q / norm
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-    ])
-
-
-def _grasp_points(proprio, offset) -> np.ndarray:
-    """Grasp-point positions for both arms: wrist + offset * R(q) @ [1,0,0].
-
-    Proprio position is the link6 wrist origin (scene frame); the quaternion
-    is world-oriented wxyz, and env origins carry translation only, so no
-    frame correction is needed. The fingers extend along local +x; using the
-    grasp point instead of wrist xy keeps the reach term faithful when the
-    tool axis rotates from horizontal (transport) to vertical (grasp).
-    """
-    arms = np.asarray(proprio, dtype=np.float64)
-    points = []
-    for start in (0, 8):
-        rotation = _rotation_wxyz(arms[start + 3:start + 7])
-        points.append(arms[start:start + 3] + offset * rotation[:, 0])
-    return np.stack(points)
-
-
-def _pair_scores(positions, cfg) -> tuple[dict[tuple[str, str], float], float]:
-    """Pair scores and the best upward three-block chain, in [0, 2].
-
-    Each edge has a continuous alignment/height window. Only positive-z
-    directed edges contribute to a chain: two table blocks sharing the same
-    upper block cannot count as two layers. Taking the maximum over the six
-    label permutations avoids a discontinuous z-sort at equal heights.
-    This is a geometric shaping proxy, not proof of contact or stability.
-    """
-    labels = list(BLOCK_LABELS)
-    scores = {}
-    upward = {}
-    for a in range(len(labels)):
-        for b in range(a + 1, len(labels)):
-            pa, pb = positions[labels[a]], positions[labels[b]]
-            xy = float(np.linalg.norm(pa[:2] - pb[:2]))
-            signed_dz = float(pb[2] - pa[2])
-            dz = abs(signed_dz)
-            align = float(np.clip(
-                (cfg["pair_align_zero"] - xy)
-                / (cfg["pair_align_zero"] - cfg["pair_align_saturate"]), 0.0, 1.0))
-            height = float(np.clip(
-                (dz - cfg["pair_height_low"])
-                / (cfg["pair_height_full"] - cfg["pair_height_low"]), 0.0, 1.0))
-            height *= float(np.clip(
-                (cfg["pair_height_zero"] - dz)
-                / (cfg["pair_height_zero"] - cfg["pair_height_taper"]), 0.0, 1.0))
-            score = align * height
-            scores[(labels[a], labels[b])] = score
-            upward[(labels[a], labels[b])] = score if signed_dz > 0 else 0.0
-            upward[(labels[b], labels[a])] = score if signed_dz < 0 else 0.0
-    chain = max(upward[(a, b)] + upward[(b, c)]
-                for a, b, c in permutations(labels))
-    return scores, float(chain)
-
-
-def _shaping_terms(positions, proprio, initial_heights, cfg, physical) -> dict:
-    """Staged potential components for RoboDojo stack_blocks (round14).
-
-    Potential-based shaping (Ng, Harada & Russell, ICML 1999): the reward adds
-    gamma*phi(s') - phi(s), so the discounted full-episode shaping return is
-    path-independent (gamma^N * phi_N - phi_0). Phi is a pure function of the
-    current observable state plus per-episode reset constants (initial block
-    heights); no action or history enters it. True terminals force phi=0 in
-    collect_wave (Grzes, AAMAS 2017); truncations keep phi and bootstrap
-    (Pardo et al., ICML 2018). Terms:
-      reach   -reach_weight * tanh(d_min / reach_scale), gated by G_r
-      lift    lift_weight * (sum_k gate(lift_k) - 2), bounded per block
-      pair    pair_weight * (best directed two-edge chain - 2)
-      release -release_weight * settled_pair * (1 - measured_open/0.8)
-    Reach retargets only after a tight, settled, released pair, not merely a
-    broadly aligned hovering block. Release uses measured gripper joints
-    (the official predicate source), not the command cache in proprio.
-    Velocity settling is an instantaneous proxy, not contact or dwell-time
-    proof; the official score remains authoritative. All inputs are physical
-    state or reset constants, not the current action. Phi is C0, piecewise C1.
-    """
-    arms = np.asarray(proprio, dtype=np.float64)
-    if arms.shape != (ACTION_DIM,) or not np.isfinite(arms).all():
-        raise ValueError("Dense shaping requires finite 16-D proprio.")
-    if not all(np.isfinite(position).all() and position.shape == (3,)
-               for position in positions.values()):
-        raise ValueError("Dense shaping received a non-finite block position.")
-    grasp = _grasp_points(arms, cfg["grasp_point_offset"])
-    # Settling is an instantaneous physical proxy, not a contact or dwell-time
-    # guarantee. At 0.01 m/s and 0.1 rad/s, drift over 0.1 s is <=1 mm
-    # translational and <=0.35 mm at a 35 mm cube corner, respectively.
-    velocities = physical["block_velocities"]
-    quiet = {}
-    for label in BLOCK_LABELS:
-        linear = np.asarray(velocities[label]["linear"], dtype=np.float64)
-        angular = np.asarray(velocities[label]["angular"], dtype=np.float64)
-        if (linear.shape != (3,) or angular.shape != (3,)
-                or not np.isfinite(linear).all() or not np.isfinite(angular).all()):
-            raise ValueError("Dense shaping requires finite block velocities.")
-        quiet[label] = float(np.clip(1.0 - np.linalg.norm(linear) / cfg["settle_linear_speed"], 0, 1)
-                             * np.clip(1.0 - np.linalg.norm(angular) / cfg["settle_angular_speed"], 0, 1))
-    measured = np.asarray(physical["gripper_open_measured"], dtype=np.float64)
-    if measured.shape != (2,) or not np.isfinite(measured).all():
-        raise ValueError("Dense shaping requires two finite measured gripper openings.")
-    openness = float(np.clip(measured.min() / 0.8, 0.0, 1.0))
-    pairs, pair_sum = _pair_scores(positions, cfg)
-    capped = min(pair_sum, cfg["pair_cap"])
-    # Broad transport alignment must not classify a block 0.2 m away as
-    # placed. Retarget only near a settled, released pair within the official
-    # xy band (20 mm is its largest curriculum tolerance). The offset (0.9 m)
-    # exceeds the measured max tower->third distance (0.8084 m, layout 21),
-    # making transit reach-monotone; it applies only after measured release
-    # and settling, never while carrying.
-    settled = {}
-    for (a, b), score in pairs.items():
-        xy = float(np.linalg.norm(positions[a][:2] - positions[b][:2]))
-        tight = float(np.clip((cfg["placement_xy_tolerance"] - xy)
-                              / (cfg["placement_xy_tolerance"] - cfg["pair_align_saturate"]), 0, 1))
-        settled[(a, b)] = score * tight * min(quiet[a], quiet[b])
-    placed = {label: openness * max((score for (a, b), score in settled.items()
-                                     if label in (a, b)), default=0.0)
-              for label in positions}
-    distances = {label: float(np.min(np.linalg.norm(grasp - position, axis=1)))
-                 for label, position in positions.items()}
-    d_min = min(distances[label] + cfg["placed_exclusion"] * placed[label]
-                for label in positions)
-    lifts = np.array([max(0.0, float(positions[label][2] - initial_heights[label]))
-                      for label in BLOCK_LABELS])
-    lift = float(lifts.max())
-    lift_gates = np.clip(lifts / cfg["lift_ramp"], 0.0, 1.0)
-    lift_gates *= np.clip((cfg["lift_zero"] - lifts)
-                         / (cfg["lift_zero"] - cfg["lift_plateau"]), 0.0, 1.0)
-    # A tower has two raised blocks. Per-block gates preserve new lift credit
-    # when the second movable block is grasped after the first pair is built.
-    lift_progress = min(float(lift_gates.sum()), 2.0)
-    gate_lift = lift_progress / 2.0
-    reach_gate = 1.0 - capped / cfg["pair_cap"]
-    phi_reach = -cfg["reach_weight"] * float(np.tanh(d_min / cfg["reach_scale"])) * reach_gate
-    phi_lift = cfg["lift_weight"] * (lift_progress - 2.0)
-    phi_pair = cfg["pair_weight"] * (capped - cfg["pair_cap"])
-    settled_pair = max(settled.values())
-    phi_release = -cfg["release_weight"] * settled_pair * (1.0 - openness)
-    return {
-        "phi": phi_reach + phi_lift + phi_pair + phi_release,
-        "phi_reach": phi_reach, "phi_lift": phi_lift,
-        "phi_pair": phi_pair, "phi_release": phi_release,
-        "pair_sum": pair_sum, "reach_gate": reach_gate,
-        "d_min": d_min, "lift": lift, "lift_gate": gate_lift,
-        "min_gripper": openness, "settled_pair": settled_pair,
-        "lift_progress": lift_progress,
-    }
-
-
-def _shaping_potential(positions, proprio, initial_heights, cfg, physical) -> float:
-    """Total staged shaping potential; see _shaping_terms for the contract."""
-    return _shaping_terms(positions, proprio, initial_heights, cfg, physical)["phi"]
-
-
 @torch.no_grad()
 def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale,
-                 shaping_cfg):
+                 reward_cfg):
     """Finish every scene before resetting; never fabricate inactive transitions.
 
     Features and the raw sampled residual are cached before the environment
     action is clipped. Time-limit values use the final observation, not reset.
     Public scores are unchanged; training rewards are successive score deltas
-    plus potential-based shaping (gamma * phi(s') - phi(s)) computed from
-    privileged block poses and arm proprio. Object poses condition only the
+    plus physical-state PBRS and one-time dwell-gated milestone bonuses.
+    Milestones intentionally add a target-region preference beyond the official
+    task; their hidden episode history is not part of actor/critic inputs.
+    Object poses condition only the
     residual actor/critic, never the frozen ACT forward.
     """
     observations, _ = env.reset_batch(seeds)
@@ -293,12 +115,13 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
     initial_heights = {}
     initial_terms = {}
     potentials = {}
+    rewards = {}
     for scene, (observation, privileged) in enumerate(zip(observations, reset_privileged)):
         positions = _block_positions(privileged)
         initial_heights[scene] = {label: float(position[2])
                                   for label, position in positions.items()}
-        terms = _shaping_terms(positions, observation["proprio"],
-                               initial_heights[scene], shaping_cfg, privileged)
+        rewards[scene] = StackingReward(privileged, observation["proprio"], reward_cfg)
+        terms = rewards[scene].initial_terms
         initial_terms[scene] = terms
         potentials[scene] = terms["phi"]
     runner.reset()
@@ -369,15 +192,14 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                 raise ValueError("An episode cannot be both terminated and truncated.")
             ended = bool(terminated or truncated)
             step_positions = _block_positions(privileged_after[pos])
-            terms = _shaping_terms(step_positions, observation["proprio"],
-                                   initial_heights[i], shaping_cfg, privileged_after[pos])
+            terms, bonus = rewards[i].step(observation["proprio"], privileged_after[pos])
             next_potential = terms["phi"]
             # A true terminal is absorbing with zero potential. Time-limit
             # truncations keep phi(next), matching their retained value bootstrap.
             shaping = gamma * (0.0 if terminated else next_potential) - potentials[i]
             potentials[i] = next_potential
             phi_sums[i] += next_potential
-            reward = score - previous_scores[i] + shaping
+            reward = score - previous_scores[i] + shaping + bonus
             step = len(trajectories[i]) + 1
             episode_returns[i] += reward
             shaping_returns[i] += shaping
@@ -432,6 +254,13 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                                  "terminated": bool(terminated), "truncated": bool(truncated),
                                  "episode_return": episode_returns[i],
                                  "shaping_return": shaping_returns[i],
+                                 "milestone_return": rewards[i].milestone_return,
+                                 "milestone_steps": dict(rewards[i].milestone_steps),
+                                 "phi_base_final": terms["phi_base"],
+                                 "base_score_final": terms["base_score"],
+                                 "stable_tower_levels_final": terms["stable_tower_levels"],
+                                 "target_xy": terms["target_xy"],
+                                 "support_gaps_final_m": terms["support_gaps"],
                                  "discounted_return": discounted_returns[i],
                                  "nonzero_reward_steps": nonzero_rewards[i],
                                  "negative_reward_steps": negative_rewards[i],
@@ -515,6 +344,13 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
         "mean_episode_length": float(np.mean([ep["length"] for ep in episodes])),
         "mean_episode_return": float(np.mean([ep["episode_return"] for ep in episodes])),
         "mean_shaping_return": float(np.mean([ep["shaping_return"] for ep in episodes])),
+        "mean_milestone_return": float(np.mean([ep["milestone_return"] for ep in episodes])),
+        "mean_phi_base": float(np.mean([ep["phi_base_final"] for ep in episodes])),
+        "mean_base_score": float(np.mean([ep["base_score_final"] for ep in episodes])),
+        "mean_stable_tower_levels": float(np.mean([ep["stable_tower_levels_final"] for ep in episodes])),
+        **{f"episodes_with_milestone_{name}": sum(ep["milestone_steps"][name] is not None
+                                                for ep in episodes)
+           for name in ("grasp", "base", "pair2", "pair3")},
         "mean_discounted_return": float(np.mean([ep["discounted_return"] for ep in episodes])),
         "mean_phi_final": float(np.mean([ep["phi_final"] for ep in episodes])),
         "mean_phi_reach": float(np.mean([ep["phi_reach_final"] for ep in episodes])),
@@ -593,22 +429,7 @@ def _validate_config(config):
         value = float(require(config, key))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{key} must be positive and finite.")
-    for key in SHAPING_KEYS:
-        value = float(require(config, key))
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(f"{key} must be nonnegative and finite.")
-    if not 0 < float(config["pair_align_saturate"]) < float(config["pair_align_zero"]):
-        raise ValueError("pair_align_saturate must lie in (0, pair_align_zero).")
-    if not (float(config["pair_height_low"]) < float(config["pair_height_full"])
-            <= float(config["pair_height_taper"]) < float(config["pair_height_zero"])):
-        raise ValueError("pair height window must satisfy low < full <= taper < zero.")
-    if not 0 < float(config["lift_ramp"]) < float(config["lift_plateau"]) < float(config["lift_zero"]):
-        raise ValueError("lift window must satisfy 0 < ramp < plateau < zero.")
-    for key in ("pair_cap", "reach_scale", "settle_linear_speed", "settle_angular_speed"):
-        if float(config[key]) <= 0:
-            raise ValueError(f"{key} must be positive.")
-    if float(config["pair_align_saturate"]) >= float(config["placement_xy_tolerance"]):
-        raise ValueError("placement_xy_tolerance must exceed pair_align_saturate.")
+    validate_reward_config({key: require(config, key) for key in REWARD_KEYS})
     if not isinstance(require(config, "learn_std"), bool):
         raise ValueError("learn_std must be a boolean.")
     if not 0 <= float(require(config, "entropy_coef")) < math.inf:
@@ -716,7 +537,7 @@ def train_online(config: dict) -> Path:
     output.mkdir(parents=True, exist_ok=False)
     snapshot = dict(config, base_checkpoint=str(checkpoint), policy_type="act_residual_ppo",
                     residual_scale=residual_scale, resumed_from_update=start_update,
-                    reward_type="score_delta_plus_potential_shaping",
+                    reward_type="score_delta_plus_physical_pbrs_and_milestones",
                     residual_features="normalized_qpos+base_action+frozen_visual+block_poses")
     (output / "config.json").write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
     metadata = {
@@ -728,15 +549,17 @@ def train_online(config: dict) -> Path:
         "trainable_parameters": sum(p.numel() for p in residual.parameters() if p.requires_grad),
         "baseline_pins": (REPO_ROOT / "third_party/pins.lock").read_text(encoding="utf-8"),
         "metrics_scope": "stochastic training rollouts; not held-out evaluation",
-        "reward": "public-score deltas plus potential-based shaping (gamma*phi(s')-phi(s)); "
-                  "staged phi = reach (3-D grasp-point distance, tanh, gated by stack progress) "
-                  "+ bounded lift of two raised blocks + directed upward pair chains "
-                  "+ measured-gripper release after a settled pair; settling uses block "
-                  "linear/angular velocities (a proxy, not contact proof); pure state "
-                  "plus reset block heights; true terminals force zero potential; time truncations retain "
-                  "potential and value bootstrap; shaping is training-only; public 0/15/100 "
-                  "governs evaluation",
-        "shaping_weights": {key: float(config[key]) for key in SHAPING_KEYS},
+        "reward": "public-score deltas + physical-state PBRS gamma*phi(next)-phi(current) "
+                  "+ one-time grasp/base/pair2/pair3 milestones; phi includes 3-D grasp reach, "
+                  "size-normalized bounded lift, held-block transport, table-anchored directed "
+                  "support chains and local measured release; true terminals force phi=0, "
+                  "time truncations retain phi and bootstrap. Geometry, low velocities and "
+                  "consecutive observations are stability proxies, not contact proof. "
+                  "The configured target region and non-PBRS milestones add internal task "
+                  "preferences; milestone history is not in actor/critic inputs, so the "
+                  "combined reward has no policy-invariance or full-observability guarantee. "
+                  "Official 0/15/100 scores remain unchanged.",
+        "reward_config": {key: config[key] for key in REWARD_KEYS},
         "exploration_std": "fixed-std resume applies the configured initial_std to log_std; "
                            "learn_std=true resumes keep the learned log_std and its moments",
         "episode_diagnostics": "phi_initial/final/mean are measured potentials (phi_final is the "
@@ -812,7 +635,7 @@ def train_online(config: dict) -> Path:
                     batch, wave_episodes = collect_wave(
                         env, runner, residual, seeds, gamma=float(config["gamma"]),
                         gae_lambda=float(config["gae_lambda"]), residual_scale=residual_scale,
-                        shaping_cfg={key: float(config[key]) for key in SHAPING_KEYS},
+                        reward_cfg={key: config[key] for key in REWARD_KEYS},
                     )
                     layout_cursor += width
                     waves.append(batch)

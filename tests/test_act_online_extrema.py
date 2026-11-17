@@ -19,10 +19,10 @@ from starter.policies.act_online import collect_wave
 from tests.test_act_online import (
     _privileged_state,
     _RecordingActor,
+    _reward_cfg,
     _ScriptedEnv,
     _ScriptedRunner,
-    _shaping_cfg,
-    _zero_shaping_cfg,
+    _zero_reward_cfg,
 )
 
 
@@ -70,12 +70,12 @@ class ExtremaLoggingTest(unittest.TestCase):
     def test_transient_lift_captured_while_final_frame_at_floor(self):
         scripts = {0: {"length": 3, "terminated": False}}
         scores = {0: [0.0, 0.0, 0.0]}
-        privileged = {0: [_lifted_state(0.1), _lifted_state(0.16), _lifted_state(0.1)]}
+        privileged = {0: [_lifted_state(0.795), _lifted_state(0.855), _lifted_state(0.795)]}
         env = _TransientEnv(scripts, scores, privileged)
         _, episodes = collect_wave(
             env, _ScriptedRunner(), _RecordingActor(), [0],
             gamma=0.999, gae_lambda=0.95, residual_scale=0.2,
-            shaping_cfg=_shaping_cfg(),
+            reward_cfg=_reward_cfg(),
         )
         ep = episodes[0]
         # Final frame is back at the reset height: the old fields see nothing.
@@ -92,6 +92,9 @@ class ExtremaLoggingTest(unittest.TestCase):
         # Other blocks never moved.
         for label in BLOCK_LABELS[1:]:
             self.assertEqual(ep["max_lift_per_block_m"][label], 0.0)
+        # A single lifted block is not a tower and pays no event bonus.
+        self.assertEqual(ep["stable_tower_levels_final"], 0)
+        self.assertEqual(ep["milestone_return"], 0.0)
 
     def test_logging_is_write_only_and_consistent_on_constant_state(self):
         scripts = {0: {"length": 2, "terminated": False},
@@ -102,7 +105,7 @@ class ExtremaLoggingTest(unittest.TestCase):
         actor = _RecordingActor()
         batch, episodes = collect_wave(
             env, runner, actor, [0, 1], gamma=0.9, gae_lambda=0.8,
-            residual_scale=0.05, shaping_cfg=_zero_shaping_cfg(),
+            residual_scale=0.05, reward_cfg=_zero_reward_cfg(),
         )
         # Raw residual is zero in the fixture: actions stay zero, values are the
         # feature sum. The extrema code must not perturb the training batch.
@@ -130,20 +133,22 @@ class ExtremaLoggingTest(unittest.TestCase):
             self.assertIsNone(ep["first_lift_step"])
             self.assertIsNone(ep["first_pair_step"])
             self.assertIsNone(ep["first_settled_step"])
+            self.assertEqual(ep["stable_tower_levels_final"], 0)
+            self.assertEqual(ep["milestone_return"], 0.0)
 
     def test_rollout_metrics_extrema_aggregates_and_json_safe(self):
         scripts = {0: {"length": 3, "terminated": False},
                    1: {"length": 2, "terminated": False}}
         scores = {0: [0.0, 0.0, 0.0], 1: [0.0, 0.0]}
         privileged = {
-            0: [_lifted_state(0.1), _lifted_state(0.16), _lifted_state(0.1)],
+            0: [_lifted_state(0.795), _lifted_state(0.855), _lifted_state(0.795)],
             1: [_privileged_state(), _privileged_state()],
         }
         env = _TransientEnv(scripts, scores, privileged)
         batch, episodes = collect_wave(
             env, _ScriptedRunner(), _RecordingActor(), [0, 1],
             gamma=0.999, gae_lambda=0.95, residual_scale=0.2,
-            shaping_cfg=_shaping_cfg(),
+            reward_cfg=_reward_cfg(),
         )
         metrics = act_online._rollout_metrics(batch, episodes, 0.2)
         self.assertAlmostEqual(metrics["max_lift_m_over_episodes"], 0.06, places=9)

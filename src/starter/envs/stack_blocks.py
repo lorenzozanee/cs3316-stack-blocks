@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from starter.envs.stacking_geometry import stacking_geometry
 from starter.interfaces import (
     BLOCK_LABELS,
     HEAD_CAMERA,
@@ -199,7 +200,7 @@ class StackBlocksAdapter:
         return self.policy_observation(raw), float(score), terminated, truncated, info
 
     def get_privileged_state(self) -> dict:
-        """Scene-relative block poses, measured gripper openness and velocities.
+        """Scene-relative poses/table geometry, scaled extents and measured motion.
 
         ``gripper_open_measured`` reads the measured gripper joints, not the
         command cache used by the policy observation, and normalizes them with
@@ -223,6 +224,7 @@ class StackBlocksAdapter:
             "blocks": poses,
             "gripper_open_measured": _measured_gripper_openness(self.task, self.env_index),
             "block_velocities": _block_velocities(self.task, self.env_index),
+            **stacking_geometry(self.task, self.env_index),
         }
 
     def policy_observation(self, raw: Mapping) -> dict:

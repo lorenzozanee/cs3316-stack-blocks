@@ -8,6 +8,7 @@ import io
 import json
 import math
 import pickle
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,23 +23,44 @@ from starter.policies import act_online
 from starter.policies.act_inference import FEATURE_DIM, load_act_runner
 from starter.policies.act_model import ACTPolicy
 from starter.policies.act_online import collect_wave
+from starter.policies.stacking_reward import REWARD_KEYS
 from tests.test_act import small_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Realistic reset scene shared by the collector fixtures: three 30 mm cubes
+# resting upright on a 0.78 m table, separated so no two starting blocks
+# overlap. The target region (0, -0.2) is empty at reset.
+BLOCK_SIDE = 0.03
+TABLE_TOP = 0.78
+TABLE = {"top_z": TABLE_TOP, "x_min": -0.7, "x_max": 0.7,
+         "y_min": -0.6, "y_max": 0.5}
+BLOCK_EXTENTS = {label: [BLOCK_SIDE, BLOCK_SIDE, BLOCK_SIDE]
+                 for label in BLOCK_LABELS}
+START_POSITIONS = {
+    "block_0": [-0.15, -0.10, TABLE_TOP + BLOCK_SIDE / 2.0],
+    "block_1": [0.00, 0.10, TABLE_TOP + BLOCK_SIDE / 2.0],
+    "block_2": [0.15, -0.10, TABLE_TOP + BLOCK_SIDE / 2.0],
+}
+TARGET_XY = (0.0, -0.2)
 
-def _shaping_cfg(**overrides) -> dict:
-    """Default staged shaping config (configs/act_online.yaml values)."""
-    cfg = {key: float(value) for key, value in load_config(
-        ROOT / "configs/act_online.yaml").items() if key in act_online.SHAPING_KEYS}
+
+def _reward_cfg(**overrides) -> dict:
+    """Reward configuration read from configs/act_online.yaml by REWARD_KEYS.
+
+    A missing key is an error (no silent defaults); dwell stays an int."""
+    config = load_config(ROOT / "configs/act_online.yaml")
+    cfg = {key: config[key] for key in REWARD_KEYS}
     cfg.update(overrides)
     return cfg
 
 
-def _zero_shaping_cfg() -> dict:
-    """All stage weights zero: shaping contributes nothing to rewards."""
-    return _shaping_cfg(reach_weight=0.0, lift_weight=0.0, pair_weight=0.0,
-                        release_weight=0.0)
+def _zero_reward_cfg() -> dict:
+    """All dense and milestone weights zero: reward is pure score delta."""
+    return _reward_cfg(reach_weight=0.0, lift_weight=0.0, base_weight=0.0,
+                       pair_weight=0.0, release_weight=0.0,
+                       milestone_grasp=0.0, milestone_base=0.0,
+                       milestone_pair2=0.0, milestone_pair3=0.0)
 
 
 def _test_proprio() -> np.ndarray:
@@ -58,13 +80,26 @@ def _observation(scene: int, step: int) -> dict:
     }
 
 
-def _privileged_state(z: float = 0.1) -> dict:
-    return {"blocks": {label: {"pos": [0.0, 0.0, z], "rot": [1.0, 0.0, 0.0, 0.0]}
+def _privileged_state(positions: dict | None = None) -> dict:
+    """Full reward-state fixture, including the module's reset geometry contract."""
+    positions = START_POSITIONS if positions is None else positions
+    return {"blocks": {label: {"pos": [float(value) for value in positions[label]],
+                               "rot": [1.0, 0.0, 0.0, 0.0]}
                        for label in BLOCK_LABELS},
+            "block_extents": {label: list(BLOCK_EXTENTS[label])
+                              for label in BLOCK_LABELS},
+            "table": dict(TABLE),
             "gripper_open_measured": [1.0, 1.0],
             "block_velocities": {label: {"linear": [0.0, 0.0, 0.0],
                                          "angular": [0.0, 0.0, 0.0]}
                                  for label in BLOCK_LABELS}}
+
+
+def _state_with_block_lift(dz: float) -> dict:
+    """Fresh state with block_0 raised by dz above its reset height."""
+    positions = {label: list(value) for label, value in START_POSITIONS.items()}
+    positions["block_0"][2] += dz
+    return _privileged_state(positions)
 
 
 class _ScriptedRunner:
@@ -177,7 +212,7 @@ class CollectWaveTest(unittest.TestCase):
 
         batch, episodes = collect_wave(
             env, runner, actor, [0, 1, 2, 3], gamma=0.9, gae_lambda=0.8,
-            residual_scale=0.05, shaping_cfg=_zero_shaping_cfg(),
+            residual_scale=0.05, reward_cfg=_zero_reward_cfg(),
         )
 
         self.assertEqual(env.reset_calls, [[0, 1, 2, 3]])
@@ -216,7 +251,7 @@ class CollectWaveTest(unittest.TestCase):
                            {0: [PARTIAL_SCORE, PARTIAL_SCORE, 0.0, SUCCESS_SCORE]})
         batch, episodes = collect_wave(
             env, _ScriptedRunner(), _RecordingActor(), [42], gamma=0.9,
-            gae_lambda=0.8, residual_scale=0.05, shaping_cfg=_zero_shaping_cfg(),
+            gae_lambda=0.8, residual_scale=0.05, reward_cfg=_zero_reward_cfg(),
         )
         episode = episodes[0]
         self.assertEqual(episode["episode_return"], SUCCESS_SCORE)
@@ -239,65 +274,82 @@ class CollectWaveTest(unittest.TestCase):
         self.assertAlmostEqual(diagnostics["advantage_std"],
                                float(batch.advantages.std(unbiased=False)))
 
-    def test_episode_diagnostics_log_potential_components_and_pair_geometry(self):
-        # Static fixture: blocks at [0,0,0.1]; identity-quat proprio, grippers
-        # open. Grasp point = wrist + [0.143,0,0]; d_min identical at both steps.
-        cfg = _shaping_cfg()
+    def test_episode_diagnostics_log_potential_components_and_tower_state(self):
+        # Static fixture: three resting cubes, identity-quat proprio, open
+        # grippers. Every measurement is identical at both frames.
+        cfg = _reward_cfg()
         env = _ScriptedEnv({0: {"length": 2, "terminated": False}}, {0: [0.0, 0.0]})
         _, episodes = collect_wave(
             env, _ScriptedRunner(), _RecordingActor(), [14], gamma=0.9, gae_lambda=0.8,
-            residual_scale=0.05, shaping_cfg=cfg,
+            residual_scale=0.05, reward_cfg=cfg,
         )
         ep = episodes[0]
-        proprio = _test_proprio().astype(np.float64)
-        grasp = proprio[8:11] + np.array([0.143, 0.0, 0.0])
-        d_min = float(np.linalg.norm(grasp - np.array([0.0, 0.0, 0.1])))
-        phi_static = -2.0 * math.tanh(d_min / 0.35) - 3.0 - 4.0
-        for field in ("phi_initial", "phi_final", "phi_mean"):
-            self.assertAlmostEqual(ep[field], phi_static, places=5)
-        self.assertAlmostEqual(ep["d_min_initial_m"], d_min, places=6)
-        self.assertAlmostEqual(ep["d_min_final_m"], d_min, places=6)
+        self.assertEqual(ep["phi_initial"], ep["phi_final"])
+        self.assertEqual(ep["phi_initial"], ep["phi_mean"])
+        self.assertAlmostEqual(
+            ep["phi_final"],
+            ep["phi_reach_final"] + ep["phi_lift_final"] + ep["phi_base_final"]
+            + ep["phi_pair_final"] + ep["phi_release_final"], places=6)
+        self.assertAlmostEqual(ep["d_min_initial_m"], ep["d_min_final_m"], places=9)
+        self.assertGreater(ep["d_min_final_m"], 0.0)
         self.assertEqual(ep["lift_initial_m"], 0.0)
         self.assertEqual(ep["lift_final_m"], 0.0)
         self.assertEqual(ep["pair_sum_final"], 0.0)
         self.assertEqual(ep["reach_gate_final"], 1.0)
-        self.assertAlmostEqual(ep["phi_lift_final"], -3.0, places=6)
-        self.assertAlmostEqual(ep["phi_pair_final"], -4.0, places=6)
+        self.assertAlmostEqual(ep["phi_lift_final"], -2.0 * cfg["lift_weight"])
+        self.assertAlmostEqual(ep["phi_pair_final"], -2.0 * cfg["pair_weight"])
+        # Nearest starting cube (block_0) is still outside the 10 mm target
+        # radius; its transport/base geometry contributes only a soft fraction.
+        target_distance = math.hypot(START_POSITIONS["block_0"][0] - TARGET_XY[0],
+                                     START_POSITIONS["block_0"][1] - TARGET_XY[1])
+        proximity = 1.0 - math.tanh(
+            max(0.0, target_distance - cfg["placement_radius"]) / cfg["placement_soft_scale"])
+        self.assertAlmostEqual(ep["phi_base_final"], -cfg["base_weight"] * (1.0 - proximity))
         self.assertEqual(ep["phi_release_final"], 0.0)
         self.assertEqual(ep["min_gripper_final"], 1.0)
         self.assertEqual(ep["settled_pair_final"], 0.0)
         self.assertEqual(ep["lift_progress_final"], 0.0)
         self.assertEqual(ep["final_gripper_open_measured"], [1.0, 1.0])
-        self.assertEqual(ep["final_pair_xy_m"], [0.0, 0.0, 0.0])
         self.assertEqual(ep["final_pair_dz_m"], [0.0, 0.0, 0.0])
         np.testing.assert_allclose(ep["final_gripper_openness"], [1.0, 1.0], atol=1e-6)
+        # Starting cubes are separated: every label pair is a real xy distance.
+        for xy in ep["final_pair_xy_m"]:
+            self.assertGreater(xy, 0.0)
+        # Milestone diagnostics are present and empty for a static episode.
+        self.assertEqual(ep["milestone_return"], 0.0)
+        self.assertEqual(ep["milestone_steps"],
+                         {"grasp": None, "base": None, "pair2": None, "pair3": None})
+        self.assertEqual(ep["stable_tower_levels_final"], 0)
+        # Two truncated steps keep the (constant) potential each time.
+        self.assertAlmostEqual(ep["shaping_return"],
+                               2.0 * (0.9 * ep["phi_final"] - ep["phi_initial"]), places=6)
 
-        # Lifted final frame: all three blocks rise 0.05 m (fixture lifts every
-        # block); per-block gates sum to 2 (capped), phi_lift=0; pair dz stays 0.
-        # Truncation keeps the final potential instead of zeroing it.
+        # Lift block_0 by 0.05 m on the final step: the bounded per-block gate
+        # saturates at one, so phi_lift rises by exactly lift_weight while the
+        # tower level stays zero. Truncation keeps that final potential.
         env = _ScriptedEnv({0: {"length": 2, "terminated": False}}, {0: [0.0, 0.0]})
-        import sys
+        static_state = _privileged_state()
         with mock.patch.object(sys.modules[__name__], "_privileged_state",
-                               side_effect=[_privileged_state(0.1), _privileged_state(0.1),
-                                            _privileged_state(0.15)]):
+                               side_effect=[_privileged_state(), static_state,
+                                            _state_with_block_lift(0.05)]):
             _, episodes = collect_wave(
                 env, _ScriptedRunner(), _RecordingActor(), [14], gamma=0.9, gae_lambda=0.8,
-                residual_scale=0.05, shaping_cfg=cfg,
+                residual_scale=0.05, reward_cfg=cfg,
             )
         ep = episodes[0]
         self.assertAlmostEqual(ep["lift_initial_m"], 0.0, places=6)
         self.assertAlmostEqual(ep["lift_final_m"], 0.05, places=6)
-        self.assertAlmostEqual(ep["lift_gate_final"], 1.0, places=6)
-        self.assertAlmostEqual(ep["phi_initial"], phi_static, places=5)
-        # All blocks move 0.05 up: d_min shrinks (grasp point z 0.1 vs 0.15).
-        d_lift = float(np.linalg.norm(grasp - np.array([0.0, 0.0, 0.15])))
-        phi_lifted = -2.0 * math.tanh(d_lift / 0.35) + 0.0 - 4.0
-        self.assertAlmostEqual(ep["phi_final"], phi_lifted, places=5)
-        self.assertAlmostEqual(ep["phi_mean"], (phi_static + phi_lifted) / 2, places=5)
-        # Two truncation steps: (g*phi1 - phi0) + (g*phi2 - phi1).
+        self.assertAlmostEqual(ep["lift_gate_final"], 0.5, places=6)
+        self.assertAlmostEqual(ep["lift_progress_final"], 1.0, places=6)
+        self.assertAlmostEqual(ep["phi_lift_final"], -cfg["lift_weight"], places=6)
+        self.assertAlmostEqual(ep["phi_initial"], ep["phi_mean"] * 2 - ep["phi_final"],
+                               places=6)
+        self.assertNotAlmostEqual(ep["phi_final"], ep["phi_initial"], places=6)
+        self.assertEqual(ep["stable_tower_levels_final"], 0)
+        self.assertEqual(ep["pair_sum_final"], 0.0)
+        phi0, phi1 = ep["phi_initial"], ep["phi_final"]
         self.assertAlmostEqual(ep["shaping_return"],
-                               0.9 * phi_static - phi_static
-                               + 0.9 * phi_lifted - phi_static, places=5)
+                               0.9 * phi0 - phi0 + 0.9 * phi1 - phi0, places=6)
 
     def test_truncation_bootstraps_from_terminal_observation(self):
         scripts = {
@@ -311,7 +363,7 @@ class CollectWaveTest(unittest.TestCase):
 
         batch, episodes = collect_wave(
             env, runner, actor, [10, 11], gamma=0.9, gae_lambda=0.8,
-            residual_scale=0.05, shaping_cfg=_zero_shaping_cfg(),
+            residual_scale=0.05, reward_cfg=_zero_reward_cfg(),
         )
 
         # Terminated scene 0: next value is zero. Truncated scene 1: the value
@@ -336,288 +388,114 @@ class CollectWaveTest(unittest.TestCase):
         self.assertEqual([episode["terminated"] for episode in episodes], [True, False])
 
 
-class _ShapingEnv:
-    """One two-step episode where the arm aligns horizontally and lifts block_0."""
+class PBRSCollectorTest(unittest.TestCase):
+    """Collector PBRS: reward.step terms drive terminal/truncation shaping."""
 
-    def __init__(self):
-        self._step = 0
-        self._privileged = []
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(1)
 
-    def reset_batch(self, seeds):
-        self._step = 0
-        self._privileged = [_privileged_state() for _ in seeds]
-        return [self._observation(0.05)], [{}]
+    def _collect(self, terminated: bool, after_state: dict, score: float):
+        env = _ScriptedEnv({0: {"length": 1, "terminated": terminated}}, {0: [score]})
+        # Milestone weights zero: isolate the potential-based shaping term.
+        cfg = _reward_cfg(milestone_grasp=0.0, milestone_base=0.0,
+                          milestone_pair2=0.0, milestone_pair3=0.0)
+        with mock.patch.object(sys.modules[__name__], "_privileged_state",
+                               side_effect=[_privileged_state(), after_state]):
+            return collect_wave(
+                env, _ScriptedRunner(), _RecordingActor(), [0], gamma=0.9,
+                gae_lambda=0.8, residual_scale=0.05, reward_cfg=cfg,
+            )
 
-    def _observation(self, end_effector_x):
-        proprio = np.zeros(ACTION_DIM, dtype=np.float32)
-        proprio[[0, 8]] = end_effector_x
-        proprio[[2, 10]] = 0.24
-        proprio[[3, 11]] = 1.0  # identity wxyz
-        proprio[[7, 15]] = 1.0  # open grippers
-        return {"scene": 0, "step": self._step, "proprio": proprio}
+    def test_true_terminal_forces_zero_potential_and_telescopes(self):
+        batch, episodes = self._collect(True, _state_with_block_lift(0.05),
+                                        SUCCESS_SCORE)
+        ep = episodes[0]
+        self.assertTrue(ep["terminated"])
+        self.assertEqual(ep["final_score"], SUCCESS_SCORE)
+        self.assertEqual(ep["milestone_return"], 0.0)
+        # The final frame really has a different potential, so the terminal
+        # zero is doing work rather than matching a constant phi.
+        self.assertNotAlmostEqual(ep["phi_final"], ep["phi_initial"], places=6)
+        # True terminal: gamma * phi(terminal) = 0, so shaping telescopes to
+        # -phi(start) over the single step (Grzes, AAMAS 2017).
+        expected_shaping = -ep["phi_initial"]
+        self.assertAlmostEqual(ep["shaping_return"], expected_shaping, places=6)
+        self.assertAlmostEqual(ep["episode_return"],
+                               SUCCESS_SCORE + expected_shaping, places=6)
+        self.assertAlmostEqual(ep["discounted_return"], ep["episode_return"], places=6)
+        # No value bootstrap at a true terminal: the return is reward only.
+        self.assertAlmostEqual(float(batch.returns[0]),
+                               SUCCESS_SCORE + expected_shaping, delta=1e-4)
 
-    def step_batch(self, actions, active):
-        self._step += 1
-        if self._step == 1:
-            return [(self._observation(0.02), 0.0, False, False, {})]
-        self._privileged[0]["blocks"]["block_0"]["pos"][2] = 0.15
-        return [(self._observation(0.02), 0.0, True, False, {})]
+    def test_truncation_retains_final_potential_and_bootstraps(self):
+        batch, episodes = self._collect(False, _state_with_block_lift(0.05), 0.0)
+        ep = episodes[0]
+        self.assertTrue(ep["truncated"])
+        self.assertNotAlmostEqual(ep["phi_final"], 0.0, places=6)
+        # Truncation keeps phi(next) instead of zeroing it (Pardo, ICML 2018):
+        # reward = gamma * phi(s') - phi(s).
+        expected_shaping = 0.9 * ep["phi_final"] - ep["phi_initial"]
+        self.assertAlmostEqual(ep["shaping_return"], expected_shaping, places=6)
+        self.assertAlmostEqual(ep["episode_return"], expected_shaping, places=6)
+        self.assertAlmostEqual(ep["discounted_return"], expected_shaping, places=6)
+        # The terminal observation's critic value (feature sum 0+1+1) is still
+        # bootstrapped, unlike the true terminal case above.
+        self.assertAlmostEqual(float(batch.returns[0]),
+                               expected_shaping + 0.9 * 2.0, delta=1e-4)
 
 
-class ShapingTest(unittest.TestCase):
-    """Hand-computed staged potential checks (round14 spec values)."""
+class MilestoneBonusTest(unittest.TestCase):
+    """One-time, dwell-gated bonuses are outside the PBRS shaping return."""
 
-    def _terms(self, positions, proprio, heights=None, physical=None, **overrides):
-        if heights is None:
-            heights = {label: float(pos[2]) for label, pos in positions.items()}
-        if physical is None:
-            physical = _privileged_state()
-        return act_online._shaping_terms(positions, proprio, heights,
-                                         _shaping_cfg(**overrides), physical)
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(1)
 
-    def _down_proprio(self, wrist):
-        """Both arms at wrist, tool axis pointing down (R@[1,0,0]=[0,0,-1])."""
-        proprio = np.zeros(ACTION_DIM, dtype=np.float64)
-        for start in (0, 8):
-            proprio[start:start + 3] = wrist
-            # wxyz quat rotating +x to -z: 90 deg about y -> [cos45,0,sin45,0]
-            proprio[start + 3:start + 7] = [np.sqrt(0.5), 0.0, np.sqrt(0.5), 0.0]
-        proprio[[7, 15]] = 1.0
-        return proprio
+    @staticmethod
+    def _target_state() -> dict:
+        positions = {label: list(value) for label, value in START_POSITIONS.items()}
+        positions["block_0"][:2] = list(TARGET_XY)
+        return _privileged_state(positions)
 
-    def test_grasp_point_uses_quaternion_not_wrist_xy(self):
-        offset = 0.143
-        # Identity quat: grasp point = wrist + [offset,0,0].
-        points = act_online._grasp_points(_test_proprio(), offset)
-        np.testing.assert_allclose(points[0], _test_proprio()[:3] + [offset, 0, 0], atol=1e-6)
-        # Demo-like downward tool axis: grasp point directly below wrist.
-        proprio = self._down_proprio([0.0, 0.0, 0.243])
-        points = act_online._grasp_points(proprio, offset)
-        np.testing.assert_allclose(points, [[0, 0, 0.1], [0, 0, 0.1]], atol=1e-6)
-        with self.assertRaises(ValueError):
-            act_online._grasp_points(np.zeros(ACTION_DIM), offset)
+    def _collect_static(self, cfg: dict, length: int) -> dict:
+        state = self._target_state()
+        env = _ScriptedEnv({0: {"length": length, "terminated": False}},
+                           {0: [0.0] * length})
+        with mock.patch.object(sys.modules[__name__], "_privileged_state",
+                               side_effect=[state] * (length + 1)):
+            _, episodes = collect_wave(
+                env, _ScriptedRunner(), _RecordingActor(), [0], gamma=0.9,
+                gae_lambda=0.8, residual_scale=0.05, reward_cfg=cfg,
+            )
+        return episodes[0]
 
-    def test_reach_term_rewards_grasp_point_approach_in_3d(self):
-        positions = {"block_0": np.array([0.0, 0.0, 0.1]),
-                     "block_1": np.array([0.45, 0.0, 0.1]),
-                     "block_2": np.array([0.0, 0.45, 0.1])}
-        heights = {label: 0.1 for label in positions}
-        far = self._down_proprio([0.0, 0.0, 0.493])  # grasp point z 0.35, d 0.25
-        near = self._down_proprio([0.0, 0.0, 0.393])  # grasp point z 0.25, d 0.15
-        phi_far = self._terms(positions, far, heights)["phi"]
-        phi_near = self._terms(positions, near, heights)["phi"]
-        self.assertGreater(phi_near, phi_far)
-        # Exact reach value at d=0.15, no lift/pair/release: -2*tanh(0.15/0.35) - 1.5 - 4.
-        expected = -2.0 * math.tanh(0.15 / 0.35) - 3.0 - 4.0
-        self.assertAlmostEqual(phi_near, expected, places=6)
-        # Grasp point on block centre: reach contributes 0.
-        on = self._down_proprio([0.0, 0.0, 0.243])
-        self.assertAlmostEqual(self._terms(positions, on, heights)["phi_reach"], 0.0, places=6)
+    def test_bonus_paid_once_and_accounted_separately_from_shaping(self):
+        cfg = _reward_cfg(milestone_dwell_steps=2)
+        ep = self._collect_static(cfg, length=4)
+        self.assertEqual(ep["final_score"], 0.0)
+        # The base predicate holds from step 2 onward; the bonus latches once.
+        self.assertAlmostEqual(ep["milestone_return"], cfg["milestone_base"])
+        self.assertEqual(ep["milestone_steps"],
+                         {"grasp": None, "base": 2, "pair2": None, "pair3": None})
+        self.assertNotEqual(ep["shaping_return"], 0.0)
+        # Shaping and milestone accounting are disjoint but both reach the
+        # episode return: shaping inside shaping_return, bonus outside it.
+        self.assertAlmostEqual(ep["episode_return"],
+                               ep["final_score"] + ep["shaping_return"]
+                               + ep["milestone_return"], places=6)
 
-    def test_lift_gate_ramp_plateau_and_decay(self):
-        positions = {"block_0": np.array([0.0, 0.0, 0.1]),
-                     "block_1": np.array([0.45, 0.0, 0.1]),
-                     "block_2": np.array([0.0, 0.45, 0.1])}
-        heights = {label: 0.1 for label in positions}
-        proprio = self._down_proprio([0.0, 0.0, 0.243])
-        cases = {0.0: -3.0, 0.0075: -2.25, 0.015: -1.5, 0.100: -1.5,
-                 0.140: -1.5, 0.160: -2.25, 0.180: -3.0}
-        for lift, expected in cases.items():
-            moved = {label: pos.copy() for label, pos in positions.items()}
-            moved["block_0"][2] += lift
-            terms = self._terms(moved, proprio, heights)
-            self.assertAlmostEqual(terms["phi_lift"], expected, places=6,
-                                   msg=f"lift={lift}")
-        # Anti-tip: max tip-only centre rise 8.3mm earns at most 0.55 gate.
-        moved = {label: pos.copy() for label, pos in positions.items()}
-        moved["block_0"][2] += 0.0083
-        self.assertLessEqual(self._terms(moved, proprio, heights)["lift_gate"], 0.28)
-        moved["block_2"][2] += 0.015
-        terms = self._terms(moved, proprio, heights)
-        self.assertAlmostEqual(terms["lift_progress"], 1.0 + 0.0083 / 0.015)
-        self.assertGreater(terms["phi_lift"], -1.5)
-
-    def test_pair_window_matches_official_predicate_and_resting_exclusion(self):
-        # Resting mixed-size blocks (|dz|=0.0049) must NOT register a pair.
-        resting = {"block_0": np.array([0.0, 0.0, 0.7803]),
-                   "block_1": np.array([0.0, 0.0, 0.7852]),
-                   "block_2": np.array([0.45, 0.0, 0.78])}
-        proprio = self._down_proprio([0.0, 0.0, 0.92])
-        self.assertEqual(self._terms(resting, proprio)["pair_sum"], 0.0)
-        # One adjacent layer: xy=0.01 (inside official 0.015), dz=0.03 (block h).
-        stacked = {"block_0": np.array([0.0, 0.0, 0.78]),
-                   "block_1": np.array([0.01, 0.0, 0.81]),
-                   "block_2": np.array([0.45, 0.0, 0.78])}
-        terms = self._terms(stacked, proprio)
-        align = min((0.4 - 0.01) / (0.4 - 0.012), 1.0)
-        self.assertAlmostEqual(terms["pair_sum"], align, places=6)
-        self.assertAlmostEqual(terms["phi_pair"], 2.0 * (align - 2.0), places=6)
-        # Two layers up (dz=0.06 > 0.058) gets no direct pair credit.
-        two_up = {"block_0": np.array([0.0, 0.0, 0.78]),
-                  "block_1": np.array([0.45, 0.0, 0.78]),
-                  "block_2": np.array([0.0, 0.0, 0.84])}
-        self.assertEqual(self._terms(two_up, proprio)["pair_sum"], 0.0)
-        # Full 3-stack at xy=0: S capped at 2, reach gate 0, phi_pair 0.
-        full = {"block_0": np.array([0.0, 0.0, 0.78]),
-                "block_1": np.array([0.0, 0.0, 0.81]),
-                "block_2": np.array([0.0, 0.0, 0.84])}
-        terms = self._terms(full, proprio)
-        # (0,2) spans two layers (dz 0.06 > 0.058) -> 0; adjacent pairs sum to 2.
-        self.assertAlmostEqual(terms["pair_sum"], 2.0, places=6)
-        self.assertAlmostEqual(terms["phi_pair"], 0.0, places=6)
-        self.assertEqual(terms["reach_gate"], 0.0)
-        self.assertEqual(terms["phi_reach"], 0.0)
-        # Label permutations, including negative label-order dz, preserve a tower.
-        for order in ((2, 1, 0), (1, 0, 2)):
-            relabelled = {f"block_{i}": full[f"block_{j}"].copy()
-                          for i, j in enumerate(order)}
-            self.assertAlmostEqual(self._terms(relabelled, proprio)["pair_sum"], 2.0)
-
-    def test_pair_chain_does_not_count_shared_upper_block_twice(self):
-        # Two blocks at table height with one above cannot be a three-layer tower.
-        fork = {"block_0": np.array([0.0, 0.0, 0.78]),
-                "block_1": np.array([0.0, 0.0, 0.81]),
-                "block_2": np.array([0.03, 0.0, 0.78])}
-        proprio = self._down_proprio([0.0, 0.0, 0.92])
-        terms = self._terms(fork, proprio)
-        self.assertAlmostEqual(terms["pair_sum"], 1.0)
-        self.assertAlmostEqual(terms["phi_pair"], -2.0)
-        # Also reject the inverted fork (two top blocks sharing one bottom).
-        fork["block_2"][2] = 0.81
-        self.assertAlmostEqual(self._terms(fork, proprio)["pair_sum"], 1.0)
-
-    def test_release_only_after_pair_and_open_grippers_pay(self):
-        stacked = {"block_0": np.array([0.0, 0.0, 0.78]),
-                   "block_1": np.array([0.0, 0.0, 0.81]),
-                   "block_2": np.array([0.45, 0.0, 0.78])}
-        proprio = self._down_proprio([0.0, 0.0, 0.92])
-        open_terms = self._terms(stacked, proprio)
-        physical = _privileged_state()
-        physical["gripper_open_measured"] = [0.3, 0.3]
-        closed_terms = self._terms(stacked, proprio, physical=physical)
-        self.assertAlmostEqual(open_terms["phi_release"], 0.0, places=6)
-        self.assertAlmostEqual(closed_terms["phi_release"], -0.5 * 1.0 * (1.0 - 0.3 / 0.8), places=6)
-        for openings in ([1.0, 0.2], [0.2, 1.0]):
-            physical = _privileged_state()
-            physical["gripper_open_measured"] = openings
-            self.assertAlmostEqual(self._terms(stacked, proprio, physical=physical)["phi_release"], -0.375)
-        # Measured release, not the command in proprio, determines credit.
-        proprio[[7, 15]] = 0.0
-        self.assertEqual(self._terms(stacked, proprio)["phi_release"], 0.0)
-        physical = _privileged_state()
-        physical["gripper_open_measured"] = [0.8, 0.8]
-        self.assertEqual(self._terms(stacked, proprio, physical=physical)["phi_release"], 0.0)
-        physical["gripper_open_measured"] = [0.0, 1.0]
-        self.assertAlmostEqual(self._terms(stacked, proprio, physical=physical)["phi_release"], -0.5)
-        # Moving blocks are not settled, even with the same positions.
-        physical["block_velocities"]["block_0"]["linear"] = [0.01, 0.0, 0.0]
-        self.assertEqual(self._terms(stacked, proprio, physical=physical)["phi_release"], 0.0)
-        # Angular motion alone also kills settling.
-        physical = _privileged_state()
-        physical["block_velocities"]["block_1"]["angular"] = [0.1, 0.0, 0.0]
-        self.assertEqual(self._terms(stacked, proprio, physical=physical)["phi_release"], 0.0)
-        # No pair -> release exactly zero regardless of gripper state.
-        apart = {"block_0": np.array([0.0, 0.0, 0.78]),
-                 "block_1": np.array([0.45, 0.0, 0.78]),
-                 "block_2": np.array([0.0, 0.45, 0.78])}
-        self.assertEqual(self._terms(apart, proprio)["phi_release"], 0.0)
-
-    def test_placed_exclusion_retargets_reach_to_next_block(self):
-        stacked = {"block_0": np.array([0.0, 0.0, 0.78]),
-                   "block_1": np.array([0.0, 0.0, 0.81]),
-                   "block_2": np.array([0.2, 0.0, 0.78])}
-        # Downward tool axis: grasp point [0,0,0.78] sits on block_0 centre.
-        proprio = self._down_proprio([0.0, 0.0, 0.923])
-        terms = self._terms(stacked, proprio)
-        # Broad geometry alone cannot label the block 0.2 m away as placed.
-        self.assertAlmostEqual(terms["d_min"], 0.2, places=6)
-        settled = {"block_0": np.array([0.0, 0.0, 0.78]),
-                   "block_1": np.array([0.01, 0.0, 0.81]),
-                   "block_2": np.array([0.2, 0.0, 0.78])}
-        terms = self._terms(settled, proprio)
-        expected_align = min((0.4 - 0.01) / (0.4 - 0.012), 1.0)
-        expected_tight = min((0.02 - 0.01) / (0.02 - 0.012), 1.0)
-        expected = min(0.2, 0.9 * expected_align * expected_tight)
-        self.assertAlmostEqual(terms["d_min"], expected, places=6)
-        # Measured max tower->third distance (layout 21) must transit monotonically.
-        far = {"block_0": np.array([0.0, 0.0, 0.78]),
-               "block_1": np.array([0.0, 0.0, 0.81]),
-               "block_2": np.array([0.8084, 0.0, 0.78])}
-        values = []
-        for t in np.linspace(0.0, 0.8084, 20):
-            arm = self._down_proprio([t, 0.0, 0.923])
-            values.append(self._terms(far, arm)["phi_reach"])
-        self.assertTrue(all(b >= a - 1e-9 for a, b in zip(values, values[1:])))
-        # Retarget requires measured release: closed jaws keep the tower nearest.
-        physical = _privileged_state()
-        physical["gripper_open_measured"] = [0.0, 0.0]
-        self.assertAlmostEqual(self._terms(settled, proprio, physical=physical)["d_min"], 0.0, places=6)
-
-    def test_potential_shaping_rewards_approach_and_lift(self):
-        cfg = _shaping_cfg()
-        env = _ShapingEnv()
-        _, episodes = collect_wave(
-            env, _ScriptedRunner(), _RecordingActor(), [0], gamma=0.9,
-            gae_lambda=0.8, residual_scale=0.05, shaping_cfg=cfg,
-        )
-        # _ShapingEnv: identity quat, wrist [x,0,0.24] -> grasp point
-        # [x+0.143,0,0.24]; blocks coincide at [0,0,0.1], block_0 rises to
-        # 0.15 at the final step (creating dz=0.05 pairs with the other two).
-        def phi(x, z0):
-            pos = {"block_0": np.array([0.0, 0.0, z0]),
-                   "block_1": np.array([0.0, 0.0, 0.1]),
-                   "block_2": np.array([0.0, 0.0, 0.1])}
-            proprio = np.zeros(ACTION_DIM)
-            proprio[[0, 8]] = x
-            proprio[[2, 10]] = 0.24
-            proprio[[3, 11]] = 1.0
-            proprio[[7, 15]] = 1.0
-            heights = {"block_0": 0.1, "block_1": 0.1, "block_2": 0.1}
-            return act_online._shaping_potential(pos, proprio, heights, cfg, _privileged_state())
-        phi0, phi_mid, phi1 = phi(0.05, 0.1), phi(0.02, 0.1), phi(0.02, 0.15)
-        # True termination: phi(terminal)=0 even with a lifted final frame.
-        expected = (0.9 * phi_mid - phi0) + (0.0 - phi_mid)
-        episode = episodes[0]
-        self.assertEqual(episode["final_score"], 0.0)
-        self.assertAlmostEqual(episode["shaping_return"], expected, places=5)
-        self.assertAlmostEqual(episode["episode_return"], expected, places=5)
-
-    def test_terminal_shaping_telescopes_but_truncation_keeps_potential(self):
-        cfg = _shaping_cfg()
-        _, terminal_episodes = collect_wave(
-            _ShapingEnv(), _ScriptedRunner(), _RecordingActor(), [0], gamma=0.9,
-            gae_lambda=0.8, residual_scale=0.05, shaping_cfg=cfg,
-        )
-        pos0 = {label: np.array([0.0, 0.0, 0.1]) for label in BLOCK_LABELS}
-        proprio0 = np.zeros(ACTION_DIM)
-        proprio0[[0, 8]] = 0.05
-        proprio0[[2, 10]] = 0.24
-        proprio0[[3, 11]] = 1.0
-        proprio0[[7, 15]] = 1.0
-        heights = {label: 0.1 for label in BLOCK_LABELS}
-        phi0 = act_online._shaping_potential(pos0, proprio0, heights, cfg, _privileged_state())
-        # Discounted shaping over a terminated trajectory = -phi(start).
-        self.assertAlmostEqual(terminal_episodes[0]["discounted_return"], -phi0, places=5)
-
-        truncated = _ShapingEnv()
-        step = truncated.step_batch
-
-        def truncate(actions, active):
-            return [(obs, score, False, terminated, info)
-                    for obs, score, terminated, _, info in step(actions, active)]
-
-        truncated.step_batch = truncate
-        _, episodes = collect_wave(
-            truncated, _ScriptedRunner(), _RecordingActor(), [0], gamma=0.9,
-            gae_lambda=0.8, residual_scale=0.05, shaping_cfg=cfg,
-        )
-        pos1 = {label: np.array([0.0, 0.0, 0.1]) for label in BLOCK_LABELS}
-        pos1["block_0"] = np.array([0.0, 0.0, 0.15])
-        proprio1 = proprio0.copy()
-        proprio1[[0, 8]] = 0.02
-        phi_final = act_online._shaping_potential(pos1, proprio1, heights, cfg, _privileged_state())
-        self.assertAlmostEqual(episodes[0]["discounted_return"],
-                               -phi0 + 0.9 ** 2 * phi_final, places=5)
+    def test_zero_milestone_weights_suppress_the_event_reward(self):
+        cfg = _zero_reward_cfg()
+        cfg["milestone_dwell_steps"] = 1
+        ep = self._collect_static(cfg, length=3)
+        # The latch still records the event, but a zero weight pays nothing.
+        self.assertEqual(ep["milestone_return"], 0.0)
+        self.assertEqual(ep["milestone_steps"],
+                         {"grasp": None, "base": 1, "pair2": None, "pair3": None})
+        # All dense weights are zero too, so the reward is the pure score delta.
+        self.assertEqual(ep["shaping_return"], 0.0)
+        self.assertEqual(ep["episode_return"], ep["final_score"])
 
 
 class _OnlineFakeEnv:
@@ -677,6 +555,9 @@ class _OnlineFakeEnv:
 def _online_config(base_checkpoint: Path) -> dict:
     config = load_config(ROOT / "configs/env.yaml")
     config.update(load_config(ROOT / "configs/act_online.yaml"))
+    # The reward configuration travels in the same flat dict as the trainer
+    # hyperparameters; REWARD_KEYS is the module contract.
+    config.update(_reward_cfg())
     config.update(
         base_checkpoint=str(base_checkpoint),
         device="cpu",
@@ -743,8 +624,10 @@ class TrainOnlineTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     act_online._validate_config(config)
 
-    def test_shaping_weights_must_be_nonnegative_and_finite(self):
-        for key in act_online.SHAPING_KEYS:
+    def test_reward_weights_must_be_nonnegative_and_finite(self):
+        for key in ("reach_weight", "lift_weight", "base_weight", "pair_weight",
+                    "release_weight", "milestone_grasp", "milestone_base",
+                    "milestone_pair2", "milestone_pair3"):
             for value in (-1, float("inf"), float("nan")):
                 with self.subTest(key=key, value=value):
                     config = _online_config(Path("/unused/offline.ckpt"))
@@ -752,18 +635,60 @@ class TrainOnlineTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         act_online._validate_config(config)
 
-    def test_shaping_window_ordering_is_validated(self):
-        for key, value in (("pair_align_saturate", 0.5), ("pair_height_low", 0.03),
-                           ("pair_height_zero", 0.04), ("lift_ramp", 0.2),
-                           ("lift_plateau", 0.01), ("pair_cap", 0.0), ("reach_scale", 0.0),
-                           ("settle_linear_speed", 0.0), ("settle_angular_speed", 0.0),
-                           ("placement_xy_tolerance", 0.012),
-                           ("pair_height_full", 0.05)):
+    def test_reward_geometry_constraints_are_validated(self):
+        # Positive scales and tolerances (zero is invalid for each).
+        for key in ("reach_scale", "placement_radius", "placement_soft_scale",
+                    "grasp_offset", "grasp_aperture_fraction", "grasp_centering_fraction",
+                    "gripper_scale_high", "settle_linear_speed",
+                    "settle_angular_speed", "support_gap_fraction"):
+            with self.subTest(key=key):
+                config = _online_config(Path("/unused/offline.ckpt"))
+                config[key] = 0.0
+                with self.assertRaises(ValueError):
+                    act_online._validate_config(config)
+        cases = {
+            # placement_radius must stay strictly inside the soft scale.
+            "placement_radius": 0.2,
+            "support_gap_floor": -0.001,
+        }
+        for key, value in cases.items():
             with self.subTest(key=key, value=value):
                 config = _online_config(Path("/unused/offline.ckpt"))
                 config[key] = value
                 with self.assertRaises(ValueError):
                     act_online._validate_config(config)
+        for value in (0.0, 1.0, -0.5):
+            with self.subTest(key="upright_cos_min", value=value):
+                config = _online_config(Path("/unused/offline.ckpt"))
+                config["upright_cos_min"] = value
+                with self.assertRaises(ValueError):
+                    act_online._validate_config(config)
+
+    def test_milestone_dwell_must_be_a_true_integer(self):
+        for value in (0, -1, 1.5, 2.0, True, False, "3", None):
+            with self.subTest(value=value):
+                config = _online_config(Path("/unused/offline.ckpt"))
+                config["milestone_dwell_steps"] = value
+                with self.assertRaises(ValueError):
+                    act_online._validate_config(config)
+        for value in (1, 3):
+            with self.subTest(value=value):
+                config = _online_config(Path("/unused/offline.ckpt"))
+                config["milestone_dwell_steps"] = value
+                act_online._validate_config(config)
+
+    def test_milestone_total_bonus_must_stay_below_partial_score(self):
+        config = _online_config(Path("/unused/offline.ckpt"))
+        # 0.5 + 1.0 + 1.0 + 13.0 = 15.5 >= the 15-point partial score.
+        config["milestone_pair3"] = 13.0
+        with self.assertRaises(ValueError):
+            act_online._validate_config(config)
+
+    def test_negative_placement_xy_is_valid_configuration(self):
+        config = _online_config(Path("/unused/offline.ckpt"))
+        config["placement_x"] = -0.3
+        config["placement_y"] = -0.25
+        act_online._validate_config(config)
 
     def test_mean_policy_metrics_measure_learned_correction_without_sampling(self):
         model = act_online.ResidualActorCritic(feature_dim=3, hidden_dim=8)
@@ -880,7 +805,9 @@ class TrainOnlineTest(unittest.TestCase):
             self.assertEqual([row["layout_id"] for row in episode_rows], ["0"] * 8)
             for episode, row in zip(episode_records, episode_rows):
                 self.assertAlmostEqual(episode["episode_return"],
-                                       episode["final_score"] + episode["shaping_return"])
+                                       episode["final_score"] + episode["shaping_return"]
+                                       + episode["milestone_return"])
+                self.assertEqual(episode["milestone_return"], 0.0)
                 self.assertAlmostEqual(float(row["discounted_return"]), episode["discounted_return"])
                 self.assertGreaterEqual(episode["position_residual_mean_m"], 0.0)
             self.assertEqual(episode_records[-1]["first_partial_step"], 2)

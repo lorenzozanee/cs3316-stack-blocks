@@ -54,6 +54,7 @@ class _FakeRobotManager:
 
 class _FakeBlock:
     def __init__(self, linear, angular) -> None:
+        self.scale = [1.0, 1.0, 1.0]
         self._linear = np.asarray(linear, dtype=np.float64)
         self._angular = np.asarray(angular, dtype=np.float64)
 
@@ -67,12 +68,21 @@ class _FakeBlock:
 class _FakeLayoutManager:
     def __init__(self, num_envs: int) -> None:
         self._num_envs = num_envs
+        self.table_info = [
+            {"height": 0.765, "pos": [0.0, -0.05, 0.715],
+             "size": [-0.7, -0.55, 0.7, 0.55]}
+            for _ in range(num_envs)
+        ]
         self._instances = {
             (env_index, label): f"block_{index}_env{env_index}"
             for env_index in range(num_envs)
             for index, label in enumerate(BLOCK_LABELS)
         }
         self.velocity_calls = []
+
+    def get_instance_metadata(self, env_idx, label):
+        self.get_instance_name(env_idx, label)
+        return {"geometry": {"oriented_bbox": {"extents": [0.03, 0.03, 0.03]}}}
 
     def get_instance_name(self, env_index, label):
         return self._instances[(env_index, label)]
@@ -207,6 +217,37 @@ class ObservationContractTest(unittest.TestCase):
         self.assertIn("block_0", privileged["blocks"])
         self.assertNotIn("blocks", observation)
 
+    def test_privileged_geometry_roundtrips_into_reward_without_policy_leak(self):
+        import json
+        from starter.envs.remote import _pack
+        from starter.policies.stacking_reward import REWARD_KEYS, StackingReward
+
+        task = _multi_env_task(2)
+        task.scene_manager.layout_manager.table_info[1]["height"] = 0.8
+        raw_observation = task.get_obs
+
+        def valid_observation():
+            raw = raw_observation()
+            for key in ("left_ee_pose", "right_ee_pose"):
+                raw["state"][key] = [0.3, 0.3, 0.9, 1.0, 0.0, 0.0, 0.0]
+            return raw
+
+        task.get_obs = valid_observation
+        adapter = StackBlocksAdapter(task, env_index=1)
+        observation, _ = adapter.reset(seed=0)
+        physical = json.loads(json.dumps(_pack(adapter.get_privileged_state()), allow_nan=False))
+        self.assertEqual(physical["table"]["top_z"], 0.8)
+        self.assertEqual(physical["block_extents"],
+                         {label: [0.03, 0.03, 0.03] for label in BLOCK_LABELS})
+        config = load_config(ROOT / "configs/act_online.yaml")
+        reward = StackingReward(physical, observation["proprio"],
+                                {key: config[key] for key in REWARD_KEYS})
+        terms, bonus = reward.step(observation["proprio"], physical)
+        self.assertTrue(np.isfinite(terms["phi"]))
+        self.assertEqual(bonus, 0.0)
+        for key in ("table", "block_extents", "blocks"):
+            self.assertNotIn(key, observation)
+
     def test_measured_gripper_openness_uses_joints_not_command(self):
         # Command cache in the observation reads 0.0 for both jaws, while the
         # measured joint values encode a closed left jaw (0.0) and a half-open
@@ -241,8 +282,9 @@ class ObservationContractTest(unittest.TestCase):
         for index, label in enumerate(BLOCK_LABELS):
             self.assertEqual(velocities[label]["linear"], [1.0, float(index), 0.5])
             self.assertEqual(velocities[label]["angular"], [0.0, float(index), -1.0])
+        # Object reads serve measured velocities and scaled geometry, in label order.
         self.assertEqual(task.scene_manager.layout_manager.velocity_calls,
-                         [(1, f"block_{index}_env1") for index in range(len(BLOCK_LABELS))])
+                         [(1, f"block_{index}_env1") for index in range(len(BLOCK_LABELS))] * 2)
 
     def test_privileged_state_requires_measured_apis(self):
         task = FakeTask(score=0.0)
