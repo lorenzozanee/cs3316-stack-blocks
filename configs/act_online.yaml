@@ -81,15 +81,17 @@ critic_lr: 3e-4
 gamma: 0.999
 gae_lambda: 0.95
 # PPO passes over each rollout, with target-KL early stopping.
-# target_kl matches the ResiP pinned default (base_residual_rl.yaml @cf80d12d);
-# 0.02 early-stopped updates after as few as 6 optimizer steps in round10.
+# ResiP pinned default is 0.1 (base_residual_rl.yaml @cf80d12d) and its repo
+# sweep reaches 0.3 (sweeps/residual_ppo_1.yaml: 0.01-0.3). At initial_std=0.02,
+# target_kl=0.1 early-stopped all 17/17 round17 updates after 2-20 Adam steps
+# (median 6, 0 completed epochs); round18 tests 0.3 as the single variable.
 ppo_epochs: 20
 minibatch_size: 256
 clip_range: 0.2
 value_coef: 0.5
 entropy_coef: 0.0
 max_grad_norm: 0.5
-target_kl: 0.1
+target_kl: 0.3
 save_freq: 25
 # Explicit opt-in is needed if policy and Isaac use the same physical GPU.
 allow_shared_gpu: true

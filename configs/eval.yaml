@@ -26,4 +26,4 @@ env_gpu: 0
 # Host conda environment for the policy server.
 policy_env: act
 policy_dir: policies/act
-ckpt: /home/cc/startcode_base/outputs/act_residual/RoboDojo-stack_blocks-arx_x5-ee-0/2026.11.17-14.32.08/policy_last.ckpt
+ckpt: /home/cc/startcode_base/outputs/act_residual/RoboDojo-stack_blocks-arx_x5-ee-0/2026.11.17-23.18.18/policy_last.ckpt
