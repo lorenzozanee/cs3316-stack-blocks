@@ -66,11 +66,9 @@ upright_cos_min: 0.9659258262890683
 hidden_dim: 128
 # Corrections are clipped to this fraction of each offline action std.
 residual_scale: 0.2
-# Fixed exploration std is a project-controlled choice, retained across this
-# reward change. Heterogeneous all-layout outcomes do not define an iid event
-# rate for curriculum repeats; zero scores alone cannot identify noise as cause.
-# ResiP MLP instead uses learn_std=true, init_logstd=-1.5 (@cf80d12d).
-initial_std: 0.02
+# Fixed std sets the sampling width on resume. ResiP's MLP instead learns std
+# (init_logstd=-1.5, src/config/actor @cf80d12d).
+initial_std: 0.10
 learn_std: false
 # round13 controlled test: 3e-4 (ResiP pinned default, tuned at 1024 envs) was
 # SLOWER than 1e-4 at our 2-env batch (corr peak 0.84 vs 1.25mm; eval 0.0).
