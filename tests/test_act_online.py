@@ -57,8 +57,8 @@ def _reward_cfg(**overrides) -> dict:
 
 def _zero_reward_cfg() -> dict:
     """All dense and milestone weights zero: reward is pure score delta."""
-    return _reward_cfg(reach_weight=0.0, lift_weight=0.0, base_weight=0.0,
-                       pair_weight=0.0, release_weight=0.0,
+    return _reward_cfg(reach_weight=0.0, manipulation_weight=0.0, base_weight=0.0,
+                       pair_weight=0.0, release_weight=0.0, waypoint_bonus=0.0,
                        milestone_grasp=0.0, milestone_base=0.0,
                        milestone_pair2=0.0, milestone_pair3=0.0)
 
@@ -288,15 +288,15 @@ class CollectWaveTest(unittest.TestCase):
         self.assertEqual(ep["phi_initial"], ep["phi_mean"])
         self.assertAlmostEqual(
             ep["phi_final"],
-            ep["phi_reach_final"] + ep["phi_lift_final"] + ep["phi_base_final"]
+            ep["phi_reach_final"] + ep["phi_manipulation_final"] + ep["phi_base_final"]
             + ep["phi_pair_final"] + ep["phi_release_final"], places=6)
         self.assertAlmostEqual(ep["d_min_initial_m"], ep["d_min_final_m"], places=9)
         self.assertGreater(ep["d_min_final_m"], 0.0)
         self.assertEqual(ep["lift_initial_m"], 0.0)
         self.assertEqual(ep["lift_final_m"], 0.0)
         self.assertEqual(ep["pair_sum_final"], 0.0)
-        self.assertEqual(ep["reach_gate_final"], 1.0)
-        self.assertAlmostEqual(ep["phi_lift_final"], -2.0 * cfg["lift_weight"])
+        self.assertAlmostEqual(ep["phi_manipulation_final"], -3.0 * cfg["manipulation_weight"])
+        self.assertEqual(ep["grasp_attempts"], {})
         self.assertAlmostEqual(ep["phi_pair_final"], -2.0 * cfg["pair_weight"])
         # Nearest starting cube (block_0) is still outside the 10 mm target
         # radius; its transport/base geometry contributes only a soft fraction.
@@ -324,9 +324,8 @@ class CollectWaveTest(unittest.TestCase):
         self.assertAlmostEqual(ep["shaping_return"],
                                2.0 * (0.9 * ep["phi_final"] - ep["phi_initial"]), places=6)
 
-        # Lift block_0 by 0.05 m on the final step: the bounded per-block gate
-        # saturates at one, so phi_lift rises by exactly lift_weight while the
-        # tower level stays zero. Truncation keeps that final potential.
+        # Airborne but not held: lift is logged, not rewarded as manipulation.
+        # Truncation still keeps the observed final potential.
         env = _ScriptedEnv({0: {"length": 2, "terminated": False}}, {0: [0.0, 0.0]})
         static_state = _privileged_state()
         with mock.patch.object(sys.modules[__name__], "_privileged_state",
@@ -341,10 +340,11 @@ class CollectWaveTest(unittest.TestCase):
         self.assertAlmostEqual(ep["lift_final_m"], 0.05, places=6)
         self.assertAlmostEqual(ep["lift_gate_final"], 0.5, places=6)
         self.assertAlmostEqual(ep["lift_progress_final"], 1.0, places=6)
-        self.assertAlmostEqual(ep["phi_lift_final"], -cfg["lift_weight"], places=6)
+        self.assertAlmostEqual(ep["phi_manipulation_final"], -3.0 * cfg["manipulation_weight"])
+        self.assertEqual(ep["max_manipulation_progress"], 0.0)
         self.assertAlmostEqual(ep["phi_initial"], ep["phi_mean"] * 2 - ep["phi_final"],
                                places=6)
-        self.assertNotAlmostEqual(ep["phi_final"], ep["phi_initial"], places=6)
+        self.assertAlmostEqual(ep["phi_final"], ep["phi_initial"], places=6)
         self.assertEqual(ep["stable_tower_levels_final"], 0)
         self.assertEqual(ep["pair_sum_final"], 0.0)
         phi0, phi1 = ep["phi_initial"], ep["phi_final"]
@@ -408,8 +408,8 @@ class PBRSCollectorTest(unittest.TestCase):
             )
 
     def test_true_terminal_forces_zero_potential_and_telescopes(self):
-        batch, episodes = self._collect(True, _state_with_block_lift(0.05),
-                                        SUCCESS_SCORE)
+        placed = {**START_POSITIONS, "block_0": [*TARGET_XY, START_POSITIONS["block_0"][2]]}
+        batch, episodes = self._collect(True, _privileged_state(placed), SUCCESS_SCORE)
         ep = episodes[0]
         self.assertTrue(ep["terminated"])
         self.assertEqual(ep["final_score"], SUCCESS_SCORE)
@@ -625,7 +625,7 @@ class TrainOnlineTest(unittest.TestCase):
                     act_online._validate_config(config)
 
     def test_reward_weights_must_be_nonnegative_and_finite(self):
-        for key in ("reach_weight", "lift_weight", "base_weight", "pair_weight",
+        for key in ("reach_weight", "manipulation_weight", "base_weight", "pair_weight",
                     "release_weight", "milestone_grasp", "milestone_base",
                     "milestone_pair2", "milestone_pair3"):
             for value in (-1, float("inf"), float("nan")):

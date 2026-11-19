@@ -30,8 +30,12 @@ if policy_gpu == env_gpu and not require(cfg, 'allow_shared_gpu'):
     raise ValueError('Set allow_shared_gpu=true explicitly when policy and Isaac share a GPU.')
 if not torch.cuda.is_available() or min(policy_gpu, env_gpu) < 0 or max(policy_gpu, env_gpu) >= torch.cuda.device_count():
     raise ValueError('Configured policy_gpu/env_gpu is unavailable; check configs/env.yaml.')
+min_reset_free_vram_mib = cfg.get('min_reset_free_vram_mib', 0)
+if type(min_reset_free_vram_mib) is not int or min_reset_free_vram_mib < 0:
+    raise ValueError('min_reset_free_vram_mib must be a nonnegative integer.')
 for key in ('policy_gpu', 'env_gpu', 'env_port', 'rollout_task', 'env_cfg', 'num_envs'):
     print(require(cfg, key))
+print(min_reset_free_vram_mib)
 PY
 )"
 mapfile -t META <<< "${META_TEXT}"
@@ -41,7 +45,8 @@ STOP="${ROOT}/outputs/act_residual/.stop"
 mkdir -p "${ROOT}/outputs/act_residual"
 rm -f "${STOP}"
 bash "${ROOT}/scripts/run_online_env.sh" \
-  "${META[1]}" "${META[2]}" "${META[3]}" "${META[4]}" "${META[5]}" 0 "${STOP}" stack-blocks-act-env &
+  "${META[1]}" "${META[2]}" "${META[3]}" "${META[4]}" "${META[5]}" 0 "${STOP}" \
+  stack-blocks-act-env "${META[6]}" &
 ENV_PID=$!
 cleanup() {
   touch "${STOP}"

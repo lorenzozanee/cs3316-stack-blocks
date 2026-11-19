@@ -41,6 +41,11 @@ def _grip_measured(size: float) -> float:
 REAL_GRIP_30 = _grip_measured(SIZE)
 REAL_GRIP_35 = _grip_measured(0.035)
 REAL_GRIP_40 = _grip_measured(0.040)
+M_GRASP = DEFAULTS["milestone_grasp"]
+M_BASE = DEFAULTS["milestone_base"]
+M_PAIR2 = DEFAULTS["milestone_pair2"]
+M_PAIR3 = DEFAULTS["milestone_pair3"]
+M_LEVEL = M_BASE + M_PAIR2 + M_PAIR3
 # Measured value at the real joint limit q=0: jaws closed with no cube.
 EMPTY_CLOSED = (0.0 - DEFAULTS["gripper_scale_low"]) / (
     DEFAULTS["gripper_scale_high"] - DEFAULTS["gripper_scale_low"])
@@ -132,10 +137,11 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertFalse(isinstance(value, bool))
 
     def test_default_milestone_sum_below_partial_score(self):
-        total = sum(DEFAULTS[f"milestone_{name}"]
-                    for name in ("grasp", "base", "pair2", "pair3"))
-        self.assertAlmostEqual(total, 4.5)
-        self.assertLess(total, 15.0)
+        total = len(BLOCK_LABELS) * M_GRASP + M_LEVEL
+        self.assertAlmostEqual(total, 11.6)
+        waypoints = 2 * len(BLOCK_LABELS) * DEFAULTS["waypoint_count"] * DEFAULTS["waypoint_bonus"]
+        self.assertAlmostEqual(waypoints, 2.7)
+        self.assertLess(total + waypoints, 15.0)
 
     def test_missing_key_rejected(self):
         cfg = _cfg()
@@ -146,7 +152,7 @@ class ConfigValidationTests(unittest.TestCase):
     def test_nonfinite_and_wrong_types_rejected(self):
         for key, value in (("reach_weight", float("nan")),
                            ("reach_weight", "1.0"),
-                           ("lift_weight", True),
+                           ("manipulation_weight", True),
                            ("placement_x", float("inf"))):
             with self.subTest(key=key, value=value):
                 with self.assertRaises(ValueError):
@@ -195,9 +201,17 @@ class ConfigValidationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_reward_config(_cfg(milestone_dwell_steps=value))
 
+    def test_waypoint_count_must_be_positive_int_not_bool(self):
+        for value in (0, 1.5, True, False):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_reward_config(_cfg(waypoint_count=value))
+
     def test_milestone_sum_must_stay_below_15(self):
         with self.assertRaises(ValueError):
             validate_reward_config(_cfg(milestone_pair3=15.0))
+        with self.assertRaises(ValueError):
+            validate_reward_config(_cfg(milestone_pair3=4.0, waypoint_bonus=0.5))
 
     def test_support_gap_floor_nonnegative(self):
         with self.assertRaises(ValueError):
@@ -270,7 +284,7 @@ class FullTowerTests(unittest.TestCase):
         terms = reward.terms(_proprio(), state)
         self.assertAlmostEqual(terms["phi"], 0.0, places=8)
         self.assertAlmostEqual(terms["phi_reach"], 0.0, places=8)
-        self.assertAlmostEqual(terms["phi_lift"], 0.0, places=8)
+        self.assertAlmostEqual(terms["phi_manipulation"], 0.0, places=8)
         self.assertAlmostEqual(terms["phi_base"], 0.0, places=8)
         self.assertAlmostEqual(terms["phi_pair"], 0.0, places=8)
         self.assertAlmostEqual(terms["phi_release"], 0.0, places=8)
@@ -280,7 +294,6 @@ class FullTowerTests(unittest.TestCase):
         self.assertTrue(terms["pair2_ok"])
         self.assertTrue(terms["pair3_ok"])
         self.assertEqual(terms["stable_tower_levels"], 3)
-        self.assertAlmostEqual(terms["reach_gate"], 0.0, places=8)
         self.assertAlmostEqual(terms["base_score"], 1.0, places=8)
 
     def test_holding_full_tower_pays_once_in_stage_order(self):
@@ -288,11 +301,11 @@ class FullTowerTests(unittest.TestCase):
         state = _state(positions=_tower_positions())
         bonuses = [reward.step(_proprio(), state)[1] for _ in range(5)]
         self.assertEqual(bonuses[:2], [0.0, 0.0])
-        self.assertAlmostEqual(bonuses[2], 4.0)  # no grasp in this fixture
+        self.assertAlmostEqual(bonuses[2], M_LEVEL)  # no grasp in this fixture
         self.assertEqual(bonuses[3:], [0.0, 0.0])
         self.assertEqual(reward.milestone_steps,
                          {"grasp": None, "base": 3, "pair2": 3, "pair3": 3})
-        self.assertAlmostEqual(reward.milestone_return, 4.0)
+        self.assertAlmostEqual(reward.milestone_return, M_LEVEL)
 
     def test_sequential_stages_and_no_rebuild_payment(self):
         reward = _reward()
@@ -308,19 +321,19 @@ class FullTowerTests(unittest.TestCase):
         neutral = _reset()
         for _ in range(3):
             reward.step(_proprio(), base)
-        self.assertAlmostEqual(reward.milestone_return, 1.0)
+        self.assertAlmostEqual(reward.milestone_return, M_BASE)
         for _ in range(3):
             reward.step(_proprio(), pair2)
-        self.assertAlmostEqual(reward.milestone_return, 2.0)
+        self.assertAlmostEqual(reward.milestone_return, M_BASE + M_PAIR2)
         for _ in range(3):
             reward.step(_proprio(), pair3)
-        self.assertAlmostEqual(reward.milestone_return, 4.0)
+        self.assertAlmostEqual(reward.milestone_return, M_LEVEL)
         # Destroy and rebuild: nothing is paid twice.
         for _ in range(3):
             reward.step(_proprio(), neutral)
         for _ in range(3):
             reward.step(_proprio(), pair3)
-        self.assertAlmostEqual(reward.milestone_return, 4.0)
+        self.assertAlmostEqual(reward.milestone_return, M_LEVEL)
 
     def test_grasp_milestone_completes_per_episode_max(self):
         reward = _reward()
@@ -336,11 +349,11 @@ class FullTowerTests(unittest.TestCase):
         self.assertTrue(reward.terms(proprio, held_state)["grasp_ok"])
         for _ in range(3):
             reward.step(proprio, held_state)
-        self.assertAlmostEqual(reward.milestone_return, 0.5)
+        self.assertAlmostEqual(reward.milestone_return, M_GRASP)
         tower = _state(positions=_tower_positions())
         for _ in range(3):
             reward.step(_proprio(), tower)
-        self.assertAlmostEqual(reward.milestone_return, 4.5)
+        self.assertAlmostEqual(reward.milestone_return, M_GRASP + M_LEVEL)
         self.assertLess(reward.milestone_return, 15.0)
 
     def test_per_episode_state_is_independent(self):
@@ -349,13 +362,13 @@ class FullTowerTests(unittest.TestCase):
         tower = _state(positions=_tower_positions())
         for _ in range(3):
             first.step(_proprio(), tower)
-        self.assertAlmostEqual(first.milestone_return, 4.0)
+        self.assertAlmostEqual(first.milestone_return, M_LEVEL)
         self.assertEqual(second.milestone_return, 0.0)
         for _ in range(2):
             second.step(_proprio(), tower)
         self.assertAlmostEqual(second.milestone_return, 0.0)
         second.step(_proprio(), tower)
-        self.assertAlmostEqual(second.milestone_return, 4.0)
+        self.assertAlmostEqual(second.milestone_return, M_LEVEL)
 
     def test_terms_are_pure(self):
         reward = _reward()
@@ -693,7 +706,7 @@ class DwellTests(unittest.TestCase):
         reward.step(_proprio(), first)
         self.assertEqual(reward.milestone_return, 0.0)
         _, bonus = reward.step(_proprio(), first)
-        self.assertAlmostEqual(bonus, 1.0)
+        self.assertAlmostEqual(bonus, M_BASE)
 
     def test_identity_swap_resets_dwell(self):
         reward = _reward()
@@ -706,7 +719,7 @@ class DwellTests(unittest.TestCase):
         reward.step(_proprio(), first)
         self.assertEqual(reward.milestone_return, 0.0)
         _, bonus = reward.step(_proprio(), first)
-        self.assertAlmostEqual(bonus, 1.0)
+        self.assertAlmostEqual(bonus, M_BASE)
 
     def test_milestone_steps_exposes_event_time(self):
         reward = _reward()
@@ -719,54 +732,76 @@ class DwellTests(unittest.TestCase):
 
 
 class DenseSignalTests(unittest.TestCase):
-    def test_transport_improves_towards_target_while_held(self):
-        reward = _reward()
-        reset = _reset()
-        values = []
-        for distance in (0.4, 0.2, 0.05):
-            position = [0.0 + distance, -0.2, TOP + 2 * HALF]
-            positions = {
-                "block_0": position,
-                "block_1": [0.5, 0.3, TOP + HALF],
-                "block_2": [0.55, 0.3, TOP + HALF],
-            }
-            left = np.array(position) - np.array([0.143, 0.0, 0.0])
-            proprio = _proprio(left=left)
-            state = _state(positions=positions, measured=(REAL_GRIP_30, 1.0))
-            terms = reward.terms(proprio, state)
-            values.append(terms["phi_base"])
-        self.assertLess(values[0], values[1])
-        self.assertLess(values[1], values[2])
+    @staticmethod
+    def _held_at(reward, positions, label, aperture, offset=0.0):
+        wrist = np.asarray(positions[label]) + [offset - DEFAULTS["grasp_offset"], 0, 0]
+        state = _state(positions=positions, measured=(aperture, 1.0))
+        return reward.terms(_proprio(left=wrist), state)
 
-    def test_transport_not_erased_by_open_nearby_gripper(self):
+    def test_arrival_rewards_matching_width_then_clearing_support(self):
         reward = _reward()
-        position = [0.05, -0.2, TOP + 2 * HALF]
-        positions = {
-            "block_0": position,
-            "block_1": [0.5, 0.3, TOP + HALF],
-            "block_2": [0.55, 0.3, TOP + HALF],
-        }
-        left = np.array(position) - np.array([0.143, 0.0, 0.0])
-        closed = reward.terms(_proprio(left=left),
-                              _state(positions=positions, measured=(REAL_GRIP_30, 1.0)))
-        open_ = reward.terms(_proprio(left=left),
-                             _state(positions=positions, measured=(1.0, 1.0)))
-        self.assertGreater(closed["phi_base"], open_["phi_base"])
+        positions = {label: data["pos"] for label, data in _reset()["blocks"].items()}
+        label = "block_0"
 
-    def test_high_lift_tapers(self):
+        def sample(aperture, offset=0.0):
+            return self._held_at(reward, positions, label, aperture, offset)
+
+        open_ = sample(1.0)["phi_manipulation"]
+        self.assertEqual(sample(EMPTY_CLOSED)["phi_manipulation"], open_)
+        self.assertEqual(sample(REAL_GRIP_30, SIZE)["phi_manipulation"], open_)
+        partly_closed = sample(0.75)["phi_manipulation"]
+        matched = sample(REAL_GRIP_30)
+        self.assertGreater(partly_closed, open_)
+        self.assertGreater(matched["phi_manipulation"], partly_closed)
+        self.assertFalse(matched["grasp_ok"])
+        positions[label][2] += SIZE / 8
+        lifted = sample(REAL_GRIP_30)
+        self.assertGreater(lifted["phi_manipulation"], matched["phi_manipulation"])
+        self.assertFalse(lifted["grasp_ok"])
+        self.assertEqual(sample(1.0)["phi_manipulation"], open_)
+
+    def test_transport_descend_and_release_at_each_support(self):
         reward = _reward()
-        phi = {}
-        for ratio in (2.0, 2.5, 3.0, 3.5):
-            positions = {
-                "block_0": [0.3, 0.2, TOP + HALF + ratio * SIZE],
-                "block_1": [-0.3, 0.2, TOP + HALF],
-                "block_2": [0.45, 0.2, TOP + HALF],
-            }
-            phi[ratio] = reward.terms(
-                _proprio(), _state(positions=positions))["phi_lift"]
-        self.assertGreater(phi[2.0], phi[2.5])
-        self.assertGreater(phi[2.5], phi[3.0])
-        self.assertAlmostEqual(phi[3.5], -2.0, places=8)
+        positions = {label: data["pos"] for label, data in _reset()["blocks"].items()}
+        for level, label in enumerate(BLOCK_LABELS):
+            with self.subTest(level=level):
+                top = TOP + level * SIZE
+                x, y = (0.0, -0.2) if level == 0 else positions[BLOCK_LABELS[level - 1]][:2]
+                # The first block is off-centre but inside the table target.
+                if level == 0:
+                    x += DEFAULTS["placement_radius"] / 2
+                poses = [(x + 0.14, y, top + HALF + 0.06),
+                         (x + 0.08, y, top + HALF + 0.06),
+                         (x, y, top + HALF + 0.06),
+                         (x, y, top + HALF + SIZE / 4),
+                         (x, y, top + HALF + 0.0024),
+                         (x, y, top + HALF + 0.002),
+                         (x, y, top + HALF + 0.001),
+                         (x, y, top + HALF)]
+                phi = []
+                for point in poses:
+                    positions[label] = point
+                    held = self._held_at(reward, positions, label, REAL_GRIP_30)
+                    phi.append(held["phi"])
+                    self.assertEqual(held["stable_tower_levels"], level)
+                    if point == poses[1]:
+                        opened = self._held_at(reward, positions, label, 1.0)
+                        self.assertLess(opened["phi_manipulation"], held["phi_manipulation"])
+                self.assertTrue(all(a < b for a, b in zip(phi, phi[1:])), phi)
+                released = self._held_at(reward, positions, label, 1.0)
+                self.assertEqual(released["stable_tower_levels"], level + 1)
+                self.assertGreaterEqual(released["phi_manipulation"], held["phi_manipulation"])
+                self.assertGreater(released["phi"], phi[-1])
+
+    def test_hover_without_holding_does_not_earn_transport(self):
+        reward = _reward()
+        positions = _tower_positions()
+        positions["block_2"][2] += 0.02
+        airborne = self._held_at(reward, positions, "block_2", 1.0)
+        self.assertEqual(airborne["manipulation_progress"], 2.0)
+        positions["block_0"][0] += 0.15
+        no_anchor = self._held_at(reward, positions, "block_2", 1.0)
+        self.assertEqual(no_anchor["manipulation_progress"], 0.0)
 
     def test_stable_pair_and_next_grasp_improve(self):
         reward = _reward()
@@ -802,7 +837,7 @@ class DenseSignalTests(unittest.TestCase):
         for state in cases:
             terms = reward.terms(_proprio(), state)
             self.assertLessEqual(terms["phi"], 1e-9)
-            for key in ("phi_reach", "phi_lift", "phi_base",
+            for key in ("phi_reach", "phi_manipulation", "phi_base",
                         "phi_pair", "phi_release"):
                 self.assertLessEqual(terms[key], 1e-9)
                 self.assertTrue(math.isfinite(terms[key]))
@@ -812,8 +847,9 @@ class DenseSignalTests(unittest.TestCase):
         reward = _reward()
         terms = reward.terms(_proprio(), _reset())
         required = {
-            "phi", "phi_reach", "phi_lift", "phi_pair", "phi_release",
-            "pair_sum", "reach_gate", "d_min", "lift", "lift_gate",
+            "phi", "phi_reach", "phi_manipulation", "phi_pair", "phi_release",
+            "manipulation_progress",
+            "pair_sum", "d_min", "lift", "lift_gate",
             "min_gripper", "settled_pair", "lift_progress", "phi_base",
             "base_score", "base_ok", "pair2_ok", "pair3_ok", "grasp_ok",
             "stable_tower_levels", "target_xy", "per_block_lift",
@@ -852,12 +888,9 @@ class GraspGeometryTests(unittest.TestCase):
                 held = self._pickup_terms(size, measured)
                 open_ = self._pickup_terms(size, 1.0)
                 empty = self._pickup_terms(size, EMPTY_CLOSED)
-                self.assertGreater(
-                    held["phi_base"], open_["phi_base"] + 1e-6)
-                # Near-empty pinched jaws cannot match a cube width, so they
-                # score exactly like fully open jaws.
-                self.assertAlmostEqual(
-                    empty["phi_base"], open_["phi_base"], places=9)
+                self.assertTrue(held["grasp_ok"])
+                self.assertFalse(open_["grasp_ok"])
+                self.assertFalse(empty["grasp_ok"])
 
     def test_rotated_cube_uses_projected_jaw_width(self):
         size = 0.030
@@ -870,241 +903,260 @@ class GraspGeometryTests(unittest.TestCase):
         side_grip = self._pickup_terms(
             size, _grip_measured(size), rotation=rotation)
         open_ = self._pickup_terms(size, 1.0, rotation=rotation)
-        self.assertGreater(
-            matched["phi_base"], side_grip["phi_base"] + 1e-6)
-        # A side-length opening is 41% off the rotated projection: no hold.
-        self.assertAlmostEqual(
-            side_grip["phi_base"], open_["phi_base"], places=9)
+        self.assertTrue(matched["grasp_ok"])
+        self.assertFalse(side_grip["grasp_ok"])
+        self.assertFalse(open_["grasp_ok"])
 
 
-class TransportGuidanceTests(unittest.TestCase):
-    """Second/third placement transport uses the real support top, not contact."""
-
-    BASE_XY = (0.0, -0.2)
-    MOVING = 0.05  # above settle_linear_speed: quiet/release are unavailable
-
-    @classmethod
-    def setUpClass(cls):
-        cls.second_z = TOP + 3 * HALF
-        cls.third_z = TOP + 5 * HALF
+class SupportedBlockGraspTests(unittest.TestCase):
+    """A cube still resting on the tower must not pay the grasp milestone."""
 
     @staticmethod
-    def _held_proprio(position):
-        left = np.array(position, dtype=np.float64) - np.array([0.143, 0.0, 0.0])
-        return _proprio(left=tuple(left))
+    def _held(positions, label):
+        centre = np.asarray(positions[label], dtype=np.float64)
+        return centre, _proprio(left=centre - np.array([0.143, 0.0, 0.0]))
 
-    def _moving_linear(self, label):
-        linear = {name: [0.0, 0.0, 0.0] for name in BLOCK_LABELS}
-        linear[label] = [self.MOVING, 0.0, 0.0]
-        return linear
-
-    def _second_carry(self, reward, offset, z=None, velocities=None,
-                      measured=(REAL_GRIP_30, 1.0)):
-        x, y = self.BASE_XY
-        position = [x + offset, y, self.second_z if z is None else z]
-        positions = {
-            "block_0": [x, y, TOP + HALF],
-            "block_1": position,
-            "block_2": [0.45, 0.2, TOP + HALF],
-        }
-        state = _state(positions=positions, measured=measured,
-                       linear=velocities or self._moving_linear("block_1"))
-        return reward.terms(self._held_proprio(position), state)
-
-    def _third_carry(self, reward, offset, z=None, measured=(REAL_GRIP_30, 1.0)):
-        x, y = self.BASE_XY
-        position = [x + offset, y, self.third_z if z is None else z]
-        positions = {
-            "block_0": [x, y, TOP + HALF],
-            "block_1": [x, y, self.second_z],
-            "block_2": position,
-        }
-        state = _state(positions=positions, measured=measured,
-                       linear=self._moving_linear("block_2"))
-        return reward.terms(self._held_proprio(position), state)
-
-    def test_second_block_transport_monotonic_while_moving(self):
+    def test_stationary_supported_cube_pays_nothing(self):
         reward = _reward()
-        values = [self._second_carry(reward, offset)["phi_pair"]
-                  for offset in (0.4, 0.2, 0.01)]
-        self.assertLess(values[0], values[1])
-        self.assertLess(values[1], values[2])
-        # Transport-only progress stays strictly below a completed edge; the
-        # completed second edge keeps the quiet/released support credit.
-        completed = reward.terms(
-            _proprio(),
-            _state(positions={
-                "block_0": [0.0, -0.2, TOP + HALF],
-                "block_1": [0.0, -0.2, self.second_z],
-                "block_2": [0.45, 0.2, TOP + HALF],
-            }))
-        self.assertTrue(completed["pair2_ok"])
-        self.assertLess(values[2], completed["phi_pair"])
-        for value in values:
-            self.assertGreaterEqual(value, -2.0 * DEFAULTS["pair_weight"]
-                                    - 1e-9)
-            self.assertLessEqual(value, 0.0)
+        # Away from the target so the base milestone cannot pay in this fixture.
+        positions = _tower_positions(xy=(0.3, 0.2))
+        _centre, proprio = self._held(positions, "block_1")
+        state = _state(positions=positions, measured=(REAL_GRIP_30, 1.0))
+        for _ in range(4):
+            terms, bonus = reward.step(proprio, state)
+            self.assertFalse(terms["grasp_ok"])
+            self.assertAlmostEqual(bonus, 0.0)
+        self.assertIsNone(reward.grasp_steps_by_block["block_1"])
+        self.assertNotIn("block_1", reward._carry)
 
-    def test_second_transport_does_not_need_quiet_release_or_gap(self):
+    def test_lifting_off_the_support_pays_grasp(self):
         reward = _reward()
-        terms = self._second_carry(reward, 0.01)
-        # The carried block is moving and not released; transport still works.
-        self.assertFalse(terms["pair2_ok"])
-        self.assertEqual(terms["settled_pair"], 0.0)
-        self.assertGreater(terms["phi_pair"],
-                           -2.0 * DEFAULTS["pair_weight"])
-        # Holding the upper block no longer revokes the placed base release.
-        self.assertTrue(terms["base_ok"])
-        self.assertEqual(terms["stable_tower_levels"], 1)
+        positions = _tower_positions(xy=(0.3, 0.2))
+        positions["block_1"] = np.array(positions["block_1"]) + [0.0, 0.0, 0.10]
+        _centre, proprio = self._held(positions, "block_1")
+        state = _state(positions=positions, measured=(REAL_GRIP_30, 1.0))
+        for _ in range(2):
+            terms, bonus = reward.step(proprio, state)
+            self.assertTrue(terms["grasp_ok"])
+            self.assertAlmostEqual(bonus, 0.0)
+        terms, bonus = reward.step(proprio, state)
+        self.assertTrue(terms["grasp_ok"])
+        self.assertAlmostEqual(bonus, M_GRASP)
 
-    def test_third_block_transport_persists_after_complete_second_edge(self):
+    def test_tilted_lower_support_still_blocks_grasp(self):
         reward = _reward()
-        values = [self._third_carry(reward, offset) for offset in (0.4, 0.2, 0.01)]
-        phis = [terms["phi_pair"] for terms in values]
-        self.assertLess(phis[0], phis[1])
-        self.assertLess(phis[1], phis[2])
-        # The second edge is a completed hard support independent of the held
-        # third; transport must never complete the third edge.
-        for terms in values:
-            self.assertTrue(terms["pair2_ok"])
-            self.assertFalse(terms["pair3_ok"])
-            self.assertEqual(terms["stable_tower_levels"], 2)
-        completed_third = reward.terms(
-            _proprio(),
-            _state(positions={
-                "block_0": [0.0, -0.2, TOP + HALF],
-                "block_1": [0.0, -0.2, self.second_z],
-                "block_2": [0.0, -0.2, self.third_z],
-            }))
-        self.assertTrue(completed_third["pair3_ok"])
-        self.assertAlmostEqual(completed_third["phi_pair"], 0.0, places=8)
-        # Strictly below the completed third edge, and above the completed
-        # second-only baseline once the carried block is near.
-        self.assertLess(phis[2], completed_third["phi_pair"])
-        completed_second = reward.terms(
-            _proprio(),
-            _state(positions={
-                "block_0": [0.0, -0.2, TOP + HALF],
-                "block_1": [0.0, -0.2, self.second_z],
-                "block_2": [0.45, 0.2, TOP + HALF],
-            }))
-        self.assertTrue(completed_second["pair2_ok"])
-        self.assertGreater(phis[2], completed_second["phi_pair"])
-
-    def test_quiet_held_alignment_hands_off_without_rewarding_hold(self):
-        reward = _reward()
-        # The carried block is held exactly at its resting place and is quiet:
-        # transport fades out and the quiet support edge carries the value.
-        still = {name: [0.0, 0.0, 0.0] for name in BLOCK_LABELS}
-        held = self._second_carry(reward, 0.0, velocities=still)
-        released = reward.terms(
-            _proprio(),
-            _state(positions={
-                "block_0": [0.0, -0.2, TOP + HALF],
-                "block_1": [0.0, -0.2, self.second_z],
-                "block_2": [0.45, 0.2, TOP + HALF],
-            }))
-        self.assertAlmostEqual(held["phi_pair"], released["phi_pair"], places=8)
-        self.assertAlmostEqual(held["phi_pair"],
-                               -DEFAULTS["pair_weight"], places=8)
-        self.assertFalse(held["pair2_ok"])   # still held: hard support false
-        self.assertTrue(released["pair2_ok"])
-
-    def test_transport_target_uses_pairwise_half_heights(self):
-        for lower_size, upper_size in ((0.030, 0.040), (0.040, 0.030)):
-            with self.subTest(lower=lower_size, upper=upper_size):
-                extents = _extents({
-                    "block_0": [lower_size, lower_size, lower_size],
-                    "block_1": [upper_size, upper_size, upper_size],
-                    "block_2": [upper_size, upper_size, upper_size],
-                })
-                reward = _reward(extents)
-                base_z = TOP + lower_size / 2.0
-                target_z = base_z + lower_size / 2.0 + upper_size / 2.0
-                values = []
-                for dz in (0.0, 0.010, 0.020):
-                    terms = reward.terms(
-                        self._held_proprio([0.01, -0.2, target_z + dz]),
-                        _state(positions={
-                            "block_0": [0.0, -0.2, base_z],
-                            "block_1": [0.01, -0.2, target_z + dz],
-                            "block_2": [0.45, 0.2, TOP + upper_size / 2.0],
-                        }, extents=extents,
-                           measured=(_grip_measured(upper_size), 1.0),
-                           linear=self._moving_linear("block_1")))
-                    values.append(terms["phi_pair"])
-                # Highest potential at the real support top plus the upper
-                # block's own half-height; higher carry heights lose signal.
-                self.assertGreater(values[0], values[1])
-                self.assertGreater(values[1], values[2])
-
-    def test_unanchored_held_block_gets_no_support_transport(self):
-        reward = _reward()
-        # No block rests at the target: the first-block guidance stays in
-        # phi_base, and no floating chain may earn pair transport.
-        for offset in (0.4, 0.0):
-            position = [offset, -0.2, self.second_z]
-            terms = reward.terms(
-                self._held_proprio(position),
-                _state(positions={
-                    "block_0": [-0.35, -0.4, TOP + HALF],
-                    "block_1": position,
-                    "block_2": [0.25, -0.4, TOP + HALF],
-                }, measured=(REAL_GRIP_30, 1.0),
-                   linear=self._moving_linear("block_1")))
-            self.assertAlmostEqual(terms["phi_pair"],
-                                   -2.0 * DEFAULTS["pair_weight"], places=8)
-            self.assertFalse(terms["pair2_ok"])
-            self.assertEqual(terms["stable_tower_levels"], 0)
-
-    def test_equal_support_tops_choose_deterministically(self):
-        # Two anchored supports share the same real top.  Transport must not
-        # depend on label/hash order: the same geometry with labels swapped
-        # gives the same value.
-        extents = _extents()
-        carried = [0.0, -0.2, TOP + 1.5 * SIZE]
-        states = (
-            {"block_0": [0.005, -0.2, TOP + HALF],
-             "block_1": [0.0, -0.2, TOP + HALF],
-             "block_2": carried},
-            {"block_0": [0.0, -0.2, TOP + HALF],
-             "block_1": [0.005, -0.2, TOP + HALF],
-             "block_2": carried},
-        )
-        values = []
-        for positions in states:
-            terms = _reward(extents).terms(
-                self._held_proprio(carried),
-                _state(positions=positions, extents=extents,
-                       measured=(REAL_GRIP_30, 1.0),
-                       linear=self._moving_linear("block_2")))
-            values.append(terms["phi_pair"])
-        self.assertAlmostEqual(values[0], values[1], places=9)
-        self.assertAlmostEqual(
-            values[0], DEFAULTS["pair_weight"] * (0.5 - 2.0), places=9)
-
-    def test_transport_never_triggers_pair3_milestone_or_settled_credit(self):
-        reward = _reward()
-        terms = self._third_carry(reward, 0.0)
-        self.assertFalse(terms["pair3_ok"])
-        self.assertTrue(terms["pair2_ok"])
-        self.assertEqual(terms["stable_tower_levels"], 2)
+        angle = math.radians(20.0)
+        positions = _tower_positions(xy=(0.3, 0.2))
+        rotations = {label: [1.0, 0.0, 0.0, 0.0] for label in BLOCK_LABELS}
+        rotations["block_0"] = [math.cos(angle / 2.0), math.sin(angle / 2.0),
+                                0.0, 0.0]
+        _centre, proprio = self._held(positions, "block_1")
+        state = _state(positions=positions, rotations=rotations,
+                       measured=(REAL_GRIP_30, 1.0))
         for _ in range(3):
-            reward.step(self._held_proprio([0.0, -0.2, self.third_z]),
-                        _state(positions={
-                            "block_0": [0.0, -0.2, TOP + HALF],
-                            "block_1": [0.0, -0.2, self.second_z],
-                            "block_2": [0.0, -0.2, self.third_z],
-                        }, measured=(REAL_GRIP_30, 1.0),
-                           linear=self._moving_linear("block_2")))
-        self.assertEqual(reward.milestone_steps["pair3"], None)
-        # The completed second support legitimately pays pair2; the
-        # transported third never completes the third edge.
-        self.assertEqual(reward.milestone_steps["pair2"], 3)
-        self.assertAlmostEqual(reward.milestone_return,
-                               DEFAULTS["milestone_base"]
-                               + DEFAULTS["milestone_pair2"]
-                               + DEFAULTS["milestone_grasp"])
+            terms, bonus = reward.step(proprio, state)
+            self.assertFalse(terms["grasp_ok"])
+            self.assertAlmostEqual(bonus, 0.0)
+
+    def test_bridged_support_still_blocks_grasp(self):
+        reward = _reward()
+        positions = {
+            "block_0": [-HALF, 0.2, TOP + HALF],
+            "block_1": [HALF, 0.2, TOP + HALF],
+            "block_2": [0.0, 0.2, TOP + SIZE + HALF],
+        }
+        _centre, proprio = self._held(positions, "block_2")
+        state = _state(positions=positions, measured=(REAL_GRIP_30, 1.0))
+        for _ in range(3):
+            terms, bonus = reward.step(proprio, state)
+            self.assertFalse(terms["grasp_ok"])
+            self.assertAlmostEqual(bonus, 0.0)
+
+    def test_lift_below_the_ramp_pays_nothing(self):
+        reward = _reward()
+        positions = _tower_positions(xy=(0.3, 0.2))
+        positions["block_1"] = np.array(positions["block_1"]) + [0.0, 0.0, 0.003]
+        _centre, proprio = self._held(positions, "block_1")
+        state = _state(positions=positions, measured=(REAL_GRIP_30, 1.0))
+        for _ in range(3):
+            terms, bonus = reward.step(proprio, state)
+            self.assertFalse(terms["grasp_ok"])
+            self.assertAlmostEqual(bonus, 0.0)
+
+    def test_lift_clearance_includes_exact_quarter_side(self):
+        for clearance, expected in ((SIZE / 4 - 1e-6, False), (SIZE / 4, True)):
+            with self.subTest(clearance=clearance):
+                reward = _reward()
+                positions = _tower_positions(xy=(0.3, 0.2))
+                positions["block_2"] = [0.5, 0.2, TOP + HALF]
+                positions["block_1"][2] += clearance
+                _, proprio = self._held(positions, "block_1")
+                state = _state(positions=positions, measured=(REAL_GRIP_30, 1.0))
+                for expected_bonus in (0.0, 0.0, M_GRASP if expected else 0.0):
+                    terms, bonus = reward.step(proprio, state)
+                    self.assertEqual(terms["grasp_ok"], expected)
+                    self.assertAlmostEqual(bonus, expected_bonus)
+
+
+class GraspAttemptTests(unittest.TestCase):
+    def test_failed_entry_and_other_arm_success_are_counted_separately(self):
+        reward = _reward()
+        floor = _reset()
+        positions = {label: np.asarray(block["pos"])
+                     for label, block in floor["blocks"].items()}
+        label = "block_0"
+        point = positions[label]
+        wrist = point - [DEFAULTS["grasp_offset"], 0, 0]
+        lifted = {**positions, label: point + [0, 0, 0.05]}
+        lifted_right = _proprio(right=wrist + [0, 0, 0.05])
+        physical = _state(positions=lifted, measured=(1.0, REAL_GRIP_30))
+        reward.terms(_proprio(left=wrist), floor)
+        self.assertEqual(reward.grasp_attempts, {})
+        reward.step(_proprio(), floor)
+        for _ in range(2):
+            reward.step(_proprio(left=wrist), floor)
+        reward.step(_proprio(), floor)
+        reward.step(_proprio(right=wrist), floor)
+        for _ in range(5):
+            reward.step(lifted_right, physical)
+        self.assertEqual(reward.grasp_attempts, {
+            "0:block_0": {"arrivals": 1, "confirmed": 0, "steps_to_grasp": 0},
+            "1:block_0": {"arrivals": 1, "confirmed": 1, "steps_to_grasp": 3},
+        })
+        self.assertEqual(reward.grasp_steps_by_block[label], 8)
+        self.assertAlmostEqual(reward.milestone_return, M_GRASP)
+        reward.step(_proprio(), floor)
+        for _ in range(3):
+            reward.step(lifted_right, physical)
+        self.assertEqual(reward.grasp_attempts["1:block_0"],
+                         {"arrivals": 2, "confirmed": 2, "steps_to_grasp": 5})
+        self.assertAlmostEqual(reward.milestone_return, M_GRASP)
+
+
+class WaypointRewardTests(unittest.TestCase):
+    @staticmethod
+    def _wrist(point):
+        return np.array(point) - np.array([DEFAULTS["grasp_offset"], 0.0, 0.0])
+
+    @staticmethod
+    def _positions(reset):
+        return {label: np.array(reset["blocks"][label]["pos"]) for label in BLOCK_LABELS}
+
+    def _hold(self, reward, positions, label, point, extents=None, arm=0, measured=None):
+        moved = {**positions, label: np.asarray(point)}
+        side = SIZE if extents is None else extents[label][0]
+        opening = _grip_measured(side) if measured is None else measured
+        proprio = _proprio(**{("left", "right")[arm]: self._wrist(point)})
+        openings = (opening, 1.0) if arm == 0 else (1.0, opening)
+        return reward.step(proprio, _state(positions=moved, measured=openings, extents=extents))[0]
+
+    def test_approach_crosses_in_order_on_one_arm(self):
+        reset = _reset()
+        label = "block_0"
+        goal = self._positions(reset)[label]
+        left = goal + [0.0, -0.24, 0.0]
+        right = goal + [0.0, 0.24, 0.0]
+        def proprio(a, b):
+            return _proprio(left=self._wrist(a), right=self._wrist(b))
+        reward = StackingReward(reset, proprio(left, right), _cfg())
+        route = f"approach:{label}"
+        terms, _ = reward.step(proprio(left, right), reset)
+        self.assertEqual(terms["waypoint_counts"][route], 0)
+        off_route = left + [0.05, 0.0, 0.0]
+        reward.step(proprio(off_route, right), reset)
+        terms, _ = reward.step(proprio(off_route + [0.0, 0.13, 0.0], right), reset)
+        self.assertEqual(terms["waypoint_counts"][route], 0)
+        reward.step(proprio(left, right), reset)
+        terms, _ = reward.step(proprio(left + [0.0, 0.08, 0.0], right), reset)
+        self.assertEqual(terms["waypoint_counts"][route], 1)
+        terms, _ = reward.step(proprio(left + [0.0, 0.08, 0.0], goal), reset)
+        self.assertEqual(terms["waypoint_counts"][route], 1)
+        terms, _ = reward.step(proprio(goal, goal), reset)
+        self.assertEqual(terms["waypoint_counts"][route], 3)
+        reward.step(proprio(left, right), reset)
+        terms, _ = reward.step(proprio(goal, right), reset)
+        self.assertEqual(terms["waypoint_counts"][route], 3)
+
+    def test_zero_length_route_and_stationary_samples_pay_nothing(self):
+        reset = _reset()
+        point = self._positions(reset)["block_0"]
+        proprio = _proprio(left=self._wrist(point))
+        reward = StackingReward(reset, proprio, _cfg())
+        for _ in range(4):
+            terms, bonus = reward.step(proprio, reset)
+            self.assertEqual(bonus, 0.0)
+            self.assertEqual(terms["waypoint_counts"]["approach:block_0"], 0)
+
+    def test_carry_starts_in_air_and_uses_each_support_height(self):
+        sizes = _extents({label: [size] * 3 for label, size in zip(BLOCK_LABELS, (0.04, 0.03, 0.035))})
+        reset = _reset(sizes)
+        reward = StackingReward(reset, _proprio(), _cfg())
+        positions = self._positions(reset)
+        support_z = TOP
+        for level, label in enumerate(BLOCK_LABELS):
+            side = sizes[label][2]
+            destination = np.array([0.0, -0.2, support_z + side / 2.0])
+            lift_start = positions[label] + [0.0, 0.0, 0.13]
+            key = f"carry:{label}"
+            terms = self._hold(reward, positions, label, positions[label], sizes)
+            self.assertEqual(terms["waypoint_counts"][key], 0)
+            for _ in range(3):
+                terms = self._hold(reward, positions, label, lift_start, sizes)
+                self.assertEqual(terms["waypoint_counts"][key], 0)
+            self.assertIsNotNone(reward.grasp_steps_by_block[label])
+            # Sweeping through 25%, 50%, and 75% must use the actual unequal support heights.
+            delta = destination - lift_start
+            terms = self._hold(reward, positions, label, lift_start + 0.78 * delta, sizes)
+            self.assertEqual(terms["waypoint_counts"][key], 3)
+            milestone = ("base", "pair2", "pair3")[level]
+            self.assertIsNone(reward.milestone_steps[milestone])
+            positions[label] = destination
+            for _ in range(3):
+                reward.step(_proprio(), _state(positions=positions, extents=sizes))
+            self.assertIsNotNone(reward.milestone_steps[milestone])
+            support_z += side
+        self.assertAlmostEqual(reward.milestone_return, M_LEVEL + 3 * M_GRASP)
+        self.assertAlmostEqual(reward.waypoint_return,
+                               sum(reward.waypoint_counts.values()) * DEFAULTS["waypoint_bonus"])
+
+    def test_drop_and_other_arm_cannot_bridge_carried_waypoints(self):
+        reset = _reset()
+        reward = StackingReward(reset, _proprio(), _cfg())
+        positions = self._positions(reset)
+        label = "block_0"
+        start = positions[label] + [0.0, 0.0, 0.10]
+        goal = np.array([0.0, -0.2, TOP + HALF])
+        direction = goal - start
+        for _ in range(3):
+            self._hold(reward, positions, label, start)
+        terms = self._hold(reward, positions, label, start + 0.30 * direction)
+        self.assertEqual(terms["waypoint_counts"]["carry:block_0"], 1)
+        terms = self._hold(reward, positions, label, start + 0.85 * direction, measured=1.0)
+        self.assertEqual(terms["waypoint_counts"]["carry:block_0"], 1)
+        terms = self._hold(reward, positions, label, start + 0.85 * direction, arm=1)
+        self.assertEqual(terms["waypoint_counts"]["carry:block_0"], 1)
+        for _ in range(3):
+            terms = self._hold(reward, positions, label, start + 0.85 * direction, arm=1)
+        self.assertEqual(terms["waypoint_counts"]["carry:block_0"], 1)
+
+    def test_disturbed_base_blocks_upper_carry(self):
+        reset = _reset()
+        reward = StackingReward(reset, _proprio(), _cfg())
+        positions = self._positions(reset)
+        positions["block_0"] = np.array([0.0, -0.2, TOP + HALF])
+        for _ in range(3):
+            reward.step(_proprio(), _state(positions=positions))
+        self.assertIsNotNone(reward.milestone_steps["base"])
+        label = "block_1"
+        start = positions[label] + [0.0, 0.0, 0.10]
+        goal = np.array([0.0, -0.2, TOP + 3 * HALF])
+        for _ in range(3):
+            self._hold(reward, positions, label, start)
+        self.assertIn(label, reward._carry)
+        positions["block_0"][1] += 0.15
+        terms = self._hold(reward, positions, label, start + 0.8 * (goal - start))
+        self.assertEqual(terms["waypoint_counts"]["carry:block_1"], 0)
+        self.assertIsNone(reward.milestone_steps["pair2"])
 
 
 if __name__ == "__main__":

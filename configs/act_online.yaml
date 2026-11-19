@@ -32,18 +32,22 @@ rollout_layout_ids:
 # are proxies; no contact-force or static-equilibrium claim is made.
 reach_weight: 2.0
 reach_scale: 0.35
-lift_weight: 1.0
+# One bounded progress unit per placed layer; no standalone height reward.
+manipulation_weight: 1.0
 base_weight: 1.0
 pair_weight: 1.5
 release_weight: 0.5
-# Each milestone pays at most once per episode; total 4.5 < official partial15.
-# This event reward is non-PBRS and history-dependent; actor/critic have no
-# latch/dwell input, so the combined reward has no policy-invariance guarantee.
-milestone_grasp: 0.5
-milestone_base: 1.0
-milestone_pair2: 1.0
-milestone_pair3: 2.0
+# One grasp milestone per block and one placement milestone per level.
+# Waypoints and milestones use episode history, which the policy does not observe.
+# The combined event bonus is capped below 15 points.
+milestone_grasp: 1.2
+milestone_base: 2.0
+milestone_pair2: 2.5
+milestone_pair3: 3.5
 milestone_dwell_steps: 3
+waypoint_count: 3
+waypoint_bonus: 0.15
+waypoint_radius: 0.025
 placement_x: 0.0
 placement_y: -0.2
 placement_radius: 0.01

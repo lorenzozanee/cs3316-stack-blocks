@@ -99,8 +99,8 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
 
     Features and the raw sampled residual are cached before the environment
     action is clipped. Time-limit values use the final observation, not reset.
-    Public scores are unchanged; training rewards are successive score deltas
-    plus physical-state PBRS and one-time dwell-gated milestone bonuses.
+    Training combines public score deltas, physical-state PBRS, ordered
+    approach and carry waypoints, and dwell-gated grasp and placement bonuses.
     Milestones intentionally add a target-region preference beyond the official
     task; their hidden episode history is not part of actor/critic inputs.
     Object poses condition only the
@@ -147,6 +147,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
     # potential or trajectory; they only add keys to episodes/metrics.
     extrema = {
         i: {"max_lift_m": 0.0, "max_lift_progress": 0.0, "max_pair_sum": 0.0,
+            "max_manipulation_progress": initial_terms[i]["manipulation_progress"],
             "min_d_min_m": float("inf"), "max_min_gripper": 0.0,
             "max_settled_pair": 0.0, "max_lift_gate": 0.0,
             "max_lift_per_block_m": {label: 0.0 for label in BLOCK_LABELS},
@@ -214,6 +215,8 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             ex = extrema[i]
             ex["max_lift_m"] = max(ex["max_lift_m"], terms["lift"])
             ex["max_lift_progress"] = max(ex["max_lift_progress"], terms["lift_progress"])
+            ex["max_manipulation_progress"] = max(
+                ex["max_manipulation_progress"], terms["manipulation_progress"])
             ex["max_pair_sum"] = max(ex["max_pair_sum"], terms["pair_sum"])
             ex["min_d_min_m"] = min(ex["min_d_min_m"], terms["d_min"])
             ex["max_min_gripper"] = max(ex["max_min_gripper"], terms["min_gripper"])
@@ -256,6 +259,10 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                                  "shaping_return": shaping_returns[i],
                                  "milestone_return": rewards[i].milestone_return,
                                  "milestone_steps": dict(rewards[i].milestone_steps),
+                                 "grasp_steps_by_block": dict(rewards[i].grasp_steps_by_block),
+                                 "grasp_attempts": rewards[i].grasp_attempts,
+                                 "waypoint_return": terms["waypoint_return"],
+                                 "waypoint_counts": terms["waypoint_counts"],
                                  "phi_base_final": terms["phi_base"],
                                  "base_score_final": terms["base_score"],
                                  "stable_tower_levels_final": terms["stable_tower_levels"],
@@ -270,11 +277,11 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                                  "phi_final": terms["phi"],
                                  "phi_mean": phi_sums[i] / step,
                                  "phi_reach_final": terms["phi_reach"],
-                                 "phi_lift_final": terms["phi_lift"],
+                                 "phi_manipulation_final": terms["phi_manipulation"],
+                                 "max_manipulation_progress": ex["max_manipulation_progress"],
                                  "phi_pair_final": terms["phi_pair"],
                                  "phi_release_final": terms["phi_release"],
                                  "pair_sum_final": terms["pair_sum"],
-                                 "reach_gate_final": terms["reach_gate"],
                                  "d_min_initial_m": terms0["d_min"],
                                  "d_min_final_m": terms["d_min"],
                                  "lift_initial_m": terms0["lift"],
@@ -331,7 +338,16 @@ def concatenate_batches(batches):
 def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: float) -> dict:
     """Summarize genuine rollout samples before PPO normalizes advantages."""
     actions = batch.actions
+    attempts = [counts for ep in episodes for counts in ep["grasp_attempts"].values()]
+    arrivals = sum(counts["arrivals"] for counts in attempts)
+    confirmed = sum(counts["confirmed"] for counts in attempts)
     return {
+        "grasp_arrivals": arrivals,
+        "grasp_confirmed": confirmed,
+        "grasp_conversion_rate": confirmed / arrivals if arrivals else None,
+        "mean_steps_from_arrival_to_grasp": (
+            sum(counts["steps_to_grasp"] for counts in attempts) / confirmed
+            if confirmed else None),
         "rollout_steps": len(batch.features),
         "episodes_this_update": len(episodes),
         "success_count": sum(ep["success"] for ep in episodes),
@@ -354,7 +370,8 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
         "mean_discounted_return": float(np.mean([ep["discounted_return"] for ep in episodes])),
         "mean_phi_final": float(np.mean([ep["phi_final"] for ep in episodes])),
         "mean_phi_reach": float(np.mean([ep["phi_reach_final"] for ep in episodes])),
-        "mean_phi_lift": float(np.mean([ep["phi_lift_final"] for ep in episodes])),
+        "mean_phi_manipulation": float(np.mean([ep["phi_manipulation_final"] for ep in episodes])),
+        "mean_max_manipulation_progress": float(np.mean([ep["max_manipulation_progress"] for ep in episodes])),
         "mean_phi_pair": float(np.mean([ep["phi_pair_final"] for ep in episodes])),
         "mean_phi_release": float(np.mean([ep["phi_release_final"] for ep in episodes])),
         "mean_pair_sum": float(np.mean([ep["pair_sum_final"] for ep in episodes])),
@@ -537,7 +554,7 @@ def train_online(config: dict) -> Path:
     output.mkdir(parents=True, exist_ok=False)
     snapshot = dict(config, base_checkpoint=str(checkpoint), policy_type="act_residual_ppo",
                     residual_scale=residual_scale, resumed_from_update=start_update,
-                    reward_type="score_delta_plus_physical_pbrs_and_milestones",
+                    reward_type="score_delta_plus_physical_pbrs_waypoints_and_milestones",
                     residual_features="normalized_qpos+base_action+frozen_visual+block_poses")
     (output / "config.json").write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
     metadata = {
@@ -549,16 +566,14 @@ def train_online(config: dict) -> Path:
         "trainable_parameters": sum(p.numel() for p in residual.parameters() if p.requires_grad),
         "baseline_pins": (REPO_ROOT / "third_party/pins.lock").read_text(encoding="utf-8"),
         "metrics_scope": "stochastic training rollouts; not held-out evaluation",
-        "reward": "public-score deltas + physical-state PBRS gamma*phi(next)-phi(current) "
-                  "+ one-time grasp/base/pair2/pair3 milestones; phi includes 3-D grasp reach, "
-                  "size-normalized bounded lift, held-block transport, table-anchored directed "
-                  "support chains and local measured release; true terminals force phi=0, "
-                  "time truncations retain phi and bootstrap. Geometry, low velocities and "
-                  "consecutive observations are stability proxies, not contact proof. "
-                  "The configured target region and non-PBRS milestones add internal task "
-                  "preferences; milestone history is not in actor/critic inputs, so the "
-                  "combined reward has no policy-invariance or full-observability guarantee. "
-                  "Official 0/15/100 scores remain unchanged.",
+        "reward": "Public-score deltas + physical-state PBRS gamma*phi(next)-phi(current) "
+                  "+ ordered approach and carry waypoints + grasp and placement milestones. "
+                  "True terminals force phi=0; time truncations retain phi and bootstrap. "
+                  "Grasp and placement use measured jaw aperture, lift, support geometry, "
+                  "release and low velocity as proxies. "
+                  "The configured target region and trajectory events add internal preferences. "
+                  "The policy does not receive route, latch or dwell history. "
+                  "Official scores use the 0/15/100 task logic.",
         "reward_config": {key: config[key] for key in REWARD_KEYS},
         "exploration_std": "fixed-std resume applies the configured initial_std to log_std; "
                            "learn_std=true resumes keep the learned log_std and its moments",

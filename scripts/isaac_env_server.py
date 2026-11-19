@@ -21,8 +21,11 @@ parser.add_argument("--port", type=int, required=True)
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--once", action="store_true")
+parser.add_argument("--min-reset-free-vram-mib", type=int, default=0)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+if args.min_reset_free_vram_mib < 0:
+    parser.error("--min-reset-free-vram-mib must be nonnegative")
 
 from env.camera_manager.capture.render_sync import add_zero_delay_kit_args
 
@@ -87,7 +90,25 @@ def main() -> None:
     install_parallel_control(task, eval_cfg.get("observation", {}), task_name)
     layout_count = bind_eval_layouts(task, task_name, args.env_cfg, seed=0)
     print(f"[env] task {task_name} ready num_envs {width} layouts {layout_count}", flush=True)
-    serve(ParallelAdapter(task), args.host, args.port, once=args.once)
+    recycled = serve(
+        ParallelAdapter(task), args.host, args.port, once=args.once,
+        should_recycle=_vram_below_reset_headroom if args.min_reset_free_vram_mib else None,
+    )
+    if recycled:
+        # The RPC sockets are closed. Let the container release the renderer even if Kit teardown hangs.
+        os._exit(0)
+
+
+def _vram_below_reset_headroom() -> bool:
+    import torch
+
+    free_bytes, _ = torch.cuda.mem_get_info(args.device)
+    free_mib = free_bytes // 2**20
+    if free_mib >= args.min_reset_free_vram_mib:
+        return False
+    print(f"[env] recycling before reset: free VRAM {free_mib} MiB below "
+          f"{args.min_reset_free_vram_mib} MiB", flush=True)
+    return True
 
 
 if __name__ == "__main__":

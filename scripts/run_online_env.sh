@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Restart the Isaac env server until STOP_FILE appears.
-# Usage: run_online_env.sh <gpu> <port> <task> <env_cfg> <num_envs> <once:0|1> <stop_file> <container_name>
+# Usage: run_online_env.sh <gpu> <port> <task> <env_cfg> <num_envs> <once:0|1> <stop_file> <container_name> [min_reset_free_vram_mib]
 set -euo pipefail
 
 GPU="$1"
@@ -11,6 +11,7 @@ NUM_ENVS="$5"
 ONCE="$6"
 STOP_FILE="$7"
 NAME="$8"
+MIN_RESET_FREE_VRAM_MIB="${9:-0}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
@@ -113,6 +114,7 @@ while [[ ! -f "${STOP_FILE}" ]]; do
       --headless \
       --enable_cameras \
       --device cuda:0 \
+      --min-reset-free-vram-mib "${MIN_RESET_FREE_VRAM_MIB}" \
       --kit_args "${KIT_ARGS}" \
       "${ONCE_ARG[@]}" || true
   if [[ -f "${STOP_FILE}" ]]; then

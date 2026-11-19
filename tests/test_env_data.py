@@ -461,6 +461,71 @@ class RemoteImageParityTest(unittest.TestCase):
 
 
 class RemoteResetTimeoutTest(unittest.TestCase):
+    def test_recycle_between_waves_retries_the_same_layouts_on_a_fresh_server(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, call, patch
+        from starter.envs.remote import RemoteEnv, serve
+
+        first_server, first_client = socket.socketpair()
+        second_server, second_client = socket.socketpair()
+        first_listener, second_listener = Mock(), Mock()
+        first_listener.accept.return_value = (first_server, None)
+        second_listener.accept.return_value = (second_server, None)
+        first = SimpleNamespace(
+            num_envs=2,
+            reset_batch=Mock(return_value=([{}, {}], [{}, {}])),
+            step_batch=Mock(side_effect=lambda _actions, active: [
+                ({}, 15.0, False, True, {}) for _ in active
+            ]),
+            privileged_batch=Mock(side_effect=lambda active: [{} for _ in active]),
+        )
+        second = SimpleNamespace(
+            num_envs=2,
+            reset_batch=Mock(return_value=([{}, {}], [{"layout": 18}, {"layout": 19}])),
+            privileged_batch=Mock(return_value=[{}, {}]),
+        )
+        recycle = Mock(side_effect=[False, True])
+        fresh_recycle = Mock(return_value=True)
+        env = RemoteEnv("127.0.0.1", 9, reset_timeout=8)
+        first_thread = threading.Thread(target=serve, args=(first, "127.0.0.1", 9),
+                                        kwargs={"should_recycle": recycle})
+        second_thread = threading.Thread(target=serve, args=(second, "127.0.0.1", 9),
+                                         kwargs={"should_recycle": fresh_recycle})
+        with (patch("starter.envs.remote.socket.socket", return_value=first_listener),
+              patch("starter.envs.remote.socket.create_connection",
+                    side_effect=[first_client, second_client]) as connect):
+            first_thread.start()
+            try:
+                env.reset_batch([14, 15])
+                recycle.assert_not_called()
+                self.assertTrue(env.step_batch([[0.0]], [0])[0][3])
+                self.assertTrue(env.step_batch([[0.0]], [1])[0][3])
+                env.reset_batch([16, 17])
+                recycle.assert_called_once_with()
+                env.step_batch([[0.0], [0.0]], [0, 1])
+                with patch("starter.envs.remote.socket.socket", return_value=second_listener):
+                    second_thread.start()
+                    observations, infos = env.reset_batch([18, 19])
+                self.assertEqual(observations, [{}, {}])
+                self.assertEqual(infos, [{"layout": 18}, {"layout": 19}])
+                self.assertEqual(connect.call_count, 2)
+                self.assertEqual(env._request({"op": "close"}), {"ok": True})
+            finally:
+                env.close()
+                for sock in (first_client, second_client):
+                    sock.close()
+                for thread in (first_thread, second_thread):
+                    if thread.ident is not None:
+                        thread.join(timeout=2)
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(first.reset_batch.call_args_list, [call([14, 15]), call([16, 17])])
+        self.assertEqual(recycle.call_count, 2)
+        second.reset_batch.assert_called_once_with([18, 19])
+        fresh_recycle.assert_not_called()
+        first_listener.close.assert_called_once()
+        second_listener.close.assert_called_once()
+
     def test_server_reset_error_reaches_learner_without_reconnect(self):
         from types import SimpleNamespace
         from unittest.mock import Mock, patch

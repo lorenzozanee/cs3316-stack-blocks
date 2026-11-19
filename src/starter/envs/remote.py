@@ -11,6 +11,7 @@ import base64
 import json
 import socket
 import time
+from collections.abc import Callable
 from typing import Any
 
 
@@ -19,12 +20,16 @@ class _Buffer:
         self._buffer = b""
 
 
-def serve(env, host: str, port: int, once: bool = False) -> None:
-    """Serve batched ``reset`` / ``step`` until the client closes.
+def serve(
+    env, host: str, port: int, once: bool = False, *,
+    should_recycle: Callable[[], bool] | None = None,
+) -> bool:
+    """Serve batched ``reset`` / ``step`` and return true for a planned recycle.
 
     One message steps every active scene. ``once`` exits after the first wave
     of ``num_envs`` episodes, so Diffusion Policy can start a fresh Isaac
-    process instead of resetting this one a second time.
+    process instead of resetting this one a second time. ``should_recycle``
+    can request a fresh server when the next reset follows a complete wave.
     """
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -36,7 +41,7 @@ def serve(env, host: str, port: int, once: bool = False) -> None:
     connection, _address = listener.accept()
     print("[env] learner connected", flush=True)
     incoming = _Buffer()
-    finished = 0
+    finished = finished_at_reset = 0
     try:
         while True:
             message = _read(connection, incoming)
@@ -49,7 +54,12 @@ def serve(env, host: str, port: int, once: bool = False) -> None:
                 seeds = message.get("seeds")
                 if seeds is None:
                     seeds = [message.get("seed")]
+                if (should_recycle is not None and finished - finished_at_reset == width
+                        and len(seeds) == width and should_recycle()):
+                    # EOF lets the client retry these layouts on the replacement server.
+                    return True
                 observations, infos = env.reset_batch(seeds)
+                finished_at_reset = finished
                 privileged = env.privileged_batch(list(range(width)))
                 _write(
                     connection,
@@ -97,6 +107,7 @@ def serve(env, host: str, port: int, once: bool = False) -> None:
         connection.close()
         listener.close()
         print(f"[env] closed after {finished} episode(s)", flush=True)
+    return False
 
 
 class RemoteEnv:
