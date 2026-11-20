@@ -34,6 +34,9 @@ reach_weight: 2.0
 reach_scale: 0.25
 # One bounded progress unit per placed layer; no standalone height reward.
 manipulation_weight: 1.0
+grasp_closure_weight: 0.25
+# Fraction of the constant reach, manipulation, base and pair deficits removed.
+potential_offset_fraction: 0.0
 base_weight: 1.0
 pair_weight: 1.5
 release_weight: 0.5

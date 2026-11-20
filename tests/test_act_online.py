@@ -274,6 +274,33 @@ class CollectWaveTest(unittest.TestCase):
         self.assertAlmostEqual(diagnostics["advantage_std"],
                                float(batch.advantages.std(unbiased=False)))
 
+    def test_centered_potential_preserves_terminal_and_timeout_telescoping(self):
+        gamma, length = 0.9, 2
+        baseline = _reward_cfg(potential_offset_fraction=0.0)
+        centered = _reward_cfg(potential_offset_fraction=1.0)
+        offset = sum(baseline[key] * count for key, count in (
+            ("reach_weight", 1), ("manipulation_weight", len(BLOCK_LABELS)),
+            ("base_weight", 1), ("pair_weight", 2),
+        ))
+
+        for terminated in (False, True):
+            with self.subTest(terminated=terminated):
+                def run(config):
+                    env = _ScriptedEnv({0: {"length": length, "terminated": terminated}},
+                                       {0: [0.0, 0.0]})
+                    _, episodes = collect_wave(env, _ScriptedRunner(), _RecordingActor(), [14],
+                                               gamma=gamma, gae_lambda=0.8,
+                                               residual_scale=0.05, reward_cfg=config)
+                    return episodes[0]
+
+                old, new = run(baseline), run(centered)
+                self.assertAlmostEqual(new["phi_initial"] - old["phi_initial"], offset)
+                final_offset = 0.0 if terminated else gamma ** length * offset
+                self.assertAlmostEqual(new["discounted_return"] - old["discounted_return"],
+                                       final_offset - offset)
+                self.assertEqual(new["milestone_steps"], old["milestone_steps"])
+                self.assertEqual(new["waypoint_counts"], old["waypoint_counts"])
+
     def test_episode_diagnostics_log_potential_components_and_tower_state(self):
         # Static fixture: three resting cubes, identity-quat proprio, open
         # grippers. Every measurement is identical at both frames.
@@ -611,6 +638,14 @@ class TrainOnlineTest(unittest.TestCase):
                 config["rollout_layout_ids"] = value
                 with self.assertRaises(ValueError):
                     act_online._validate_config(config)
+
+    def test_residual_scale_allows_half_a_demonstration_std(self):
+        config = _online_config(Path("/unused/offline.ckpt"))
+        config["residual_scale"] = 0.5
+        act_online._validate_config(config)
+        config["residual_scale"] = 0.51
+        with self.assertRaisesRegex(ValueError, "residual_scale"):
+            act_online._validate_config(config)
 
     def test_max_train_seconds_is_required_and_positive(self):
         config = _online_config(Path("/unused/offline.ckpt"))

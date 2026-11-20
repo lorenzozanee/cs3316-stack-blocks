@@ -105,6 +105,8 @@ DEFAULTS = {
     "reach_weight": 2.0,
     "reach_scale": 0.35,
     "manipulation_weight": 1.0,
+    "grasp_closure_weight": 0.25,
+    "potential_offset_fraction": 0.0,
     "base_weight": 1.0,
     "pair_weight": 1.5,
     "release_weight": 0.5,
@@ -233,6 +235,10 @@ def validate_reward_config(cfg: Mapping) -> None:
     for key in _POSITIVE_KEYS:
         if float(cfg[key]) <= 0.0:
             raise ValueError(f"Reward parameter {key!r} must be positive.")
+    if not 0.0 <= cfg["grasp_closure_weight"] <= 0.5:
+        raise ValueError("grasp_closure_weight must lie in [0, 0.5].")
+    if not 0.0 <= cfg["potential_offset_fraction"] <= 1.0:
+        raise ValueError("potential_offset_fraction must lie in [0, 1].")
     if float(cfg["placement_radius"]) >= float(cfg["placement_soft_scale"]):
         raise ValueError("placement_radius must be smaller than placement_soft_scale.")
     milestone_sum = (sum(float(cfg[f"milestone_{name}"]) for name in _MILESTONES[1:])
@@ -669,12 +675,13 @@ class StackingReward:
         inside_table = {
             label: self._inside_table(label, pos[label]) for label in BLOCK_LABELS
         }
-        base_geom = {
-            label: (target_proximity[label] * table_contact[label]
-                    * upright_score[label] * quiet[label]
-                    * (1.0 if inside_table[label] else 0.0))
+        table_support = {
+            label: (table_contact[label] * upright_score[label] * quiet[label]
+                    * float(inside_table[label]))
             for label in BLOCK_LABELS
         }
+        base_geom = {label: target_proximity[label] * table_support[label]
+                     for label in BLOCK_LABELS}
         base_score = {
             label: base_geom[label] * release_block[label]
             for label in BLOCK_LABELS
@@ -689,7 +696,8 @@ class StackingReward:
                 and released_hard[label])
             for label in BLOCK_LABELS
         }
-        phi_base = float(self.cfg["base_weight"]) * (max(base_score.values()) - 1.0)
+        deficit_offset = 1.0 - float(self.cfg["potential_offset_fraction"])
+        phi_base = float(self.cfg["base_weight"]) * (max(base_score.values()) - deficit_offset)
 
         # Directed support edges.  Upper means strictly higher centre; equal
         # z is a side-by-side or tabletop co-planar pair and carries no edge.
@@ -736,22 +744,21 @@ class StackingReward:
                 chain_id = (lower, middle, upper)
         pair_sum = min(pair_sum, 2.0)
 
-        # Stable support must be anchored to the tabletop target base and use
-        # the same directed permutation for both edges.
+        # Official stacking has no target XY; only the release route retains it.
         pair_level = 0.0
         support_member = dict(base_geom)
         for lower, middle, upper in permutations(BLOCK_LABELS):
-            anchor = base_geom[lower]
             first = quiet_edge.get((lower, middle), 0.0)
             second = quiet_edge.get((middle, upper), 0.0)
-            weighted_first = anchor * first
-            weighted_second = weighted_first * second
-            support_member[middle] = max(support_member[middle], weighted_first)
-            support_member[upper] = max(support_member[upper], weighted_second)
-            pair_level = max(pair_level, weighted_first + weighted_second)
+            supported_first = table_support[lower] * first
+            supported_second = supported_first * second
+            pair_level = max(pair_level, supported_first + supported_second)
+            target = target_proximity[lower]
+            support_member[middle] = max(support_member[middle], target * supported_first)
+            support_member[upper] = max(support_member[upper], target * supported_second)
         pair_level = min(pair_level, 2.0)
 
-        phi_pair = float(self.cfg["pair_weight"]) * (pair_level - 2.0)
+        phi_pair = float(self.cfg["pair_weight"]) * (pair_level - 2.0 * deficit_offset)
 
         # Table-anchored, released, quiet support (diagnostic and release
         # penalty weight); the lower block need not be at the target.
@@ -830,6 +837,7 @@ class StackingReward:
         reach_scale = float(self.cfg["reach_scale"])
         stage_reach_weight = float(self.cfg["reach_weight"]) / len(BLOCK_LABELS)
         manipulation_weight = float(self.cfg["manipulation_weight"])
+        closure_weight = float(self.cfg["grasp_closure_weight"])
         next_reach = next_manipulation = 0.0
         best_score = -1.0
         # robosuite Stack.staged_rewards uses lift-gated XY alignment. Track
@@ -857,7 +865,7 @@ class StackingReward:
             tracking = 1.0 - math.tanh(math.hypot(lateral, gap) / soft)
             # Reserve transport credit for actual aperture match and clearance;
             # only aligned blocks can retain it while descending to the surface.
-            grasp_lift_carry = (0.25 * grasp_closure_by_block[label]
+            grasp_lift_carry = (closure_weight * grasp_closure_by_block[label]
                                + max(raised, descent) * held_by_block[label]
                                * (0.25 + 0.25 * tracking))
             seated = aligned * _clip01(
@@ -870,9 +878,9 @@ class StackingReward:
             if score > best_score:
                 best_score = score
                 next_reach, next_manipulation = reach, manipulation
-        remaining = len(BLOCK_LABELS) - stable_level
-        phi_reach = stage_reach_weight * (next_reach - remaining)
-        phi_manipulation = manipulation_weight * (next_manipulation - remaining)
+        stage_deficit = len(BLOCK_LABELS) * deficit_offset - stable_level
+        phi_reach = stage_reach_weight * (next_reach - stage_deficit)
+        phi_manipulation = manipulation_weight * (next_manipulation - stage_deficit)
         manipulation_progress = stable_level + next_manipulation
 
         support_gaps = []

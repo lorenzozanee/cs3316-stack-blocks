@@ -474,6 +474,23 @@ class SupportRejectionTests(unittest.TestCase):
         reward = _reward()
         return reward.terms(_proprio(), _state(positions=positions, **kwargs))
 
+    def test_pair_potential_accepts_table_support_away_from_target(self):
+        at_target = self._terms(self._base_positions())
+        off_target = self._base_positions()
+        for label in ("block_0", "block_1"):
+            off_target[label][0] = 0.15
+        supported = self._terms(off_target)
+        self.assertAlmostEqual(supported["phi_pair"], at_target["phi_pair"], places=8)
+        self.assertLess(supported["phi_base"], at_target["phi_base"])
+        self.assertFalse(supported["base_ok"])
+        self.assertFalse(supported["pair2_ok"])
+
+        for label in ("block_0", "block_1"):
+            off_target[label][2] += 0.05
+        floating = self._terms(off_target)
+        self.assertAlmostEqual(floating["pair_sum"], 1.0, places=8)
+        self.assertAlmostEqual(floating["phi_pair"], -2.0 * DEFAULTS["pair_weight"], places=8)
+
     def test_airborne_pair_rejected(self):
         positions = self._base_positions()
         positions["block_1"][2] += 0.010
@@ -759,6 +776,24 @@ class DenseSignalTests(unittest.TestCase):
         self.assertGreater(lifted["phi_manipulation"], matched["phi_manipulation"])
         self.assertFalse(lifted["grasp_ok"])
         self.assertEqual(sample(1.0)["phi_manipulation"], open_)
+
+    def test_closure_weight_strengthens_local_signal_without_changing_grasp_gate(self):
+        original = _reward(grasp_closure_weight=0.25)
+        stronger = _reward(grasp_closure_weight=0.5)
+        positions = {label: data["pos"] for label, data in _reset()["blocks"].items()}
+        label = "block_0"
+        for offset in (0.0, SIZE / 4):
+            old = self._held_at(original, positions, label, REAL_GRIP_30, offset)
+            new = self._held_at(stronger, positions, label, REAL_GRIP_30, offset)
+            self.assertGreater(new["phi_manipulation"], old["phi_manipulation"])
+            self.assertEqual(new["grasp_ok"], old["grasp_ok"])
+        positions[label][2] += SIZE / 2
+        for reward in (original, stronger):
+            self.assertTrue(self._held_at(reward, positions, label, REAL_GRIP_30)["grasp_ok"])
+            self.assertFalse(self._held_at(reward, positions, label, EMPTY_CLOSED)["grasp_ok"])
+        far_old = self._held_at(original, positions, label, REAL_GRIP_30, SIZE)
+        far_new = self._held_at(stronger, positions, label, REAL_GRIP_30, SIZE)
+        self.assertEqual(far_new["phi_manipulation"], far_old["phi_manipulation"])
 
     def test_transport_descend_and_release_at_each_support(self):
         reward = _reward()

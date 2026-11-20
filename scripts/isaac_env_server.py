@@ -45,7 +45,11 @@ def main() -> None:
     src = os.path.join(repo, "src")
     if src not in sys.path:
         sys.path.insert(0, src)
-    from starter.envs.isaac_batch import bind_eval_layouts, install_parallel_control
+    from starter.envs.isaac_batch import (
+        bind_eval_layouts,
+        install_parallel_control,
+        install_room_fixture_cleanup,
+    )
     from starter.envs.remote import serve
     from starter.envs.stack_blocks import ParallelAdapter
 
@@ -87,6 +91,7 @@ def main() -> None:
     )
     env_cfg.sim.seed = [0 for _ in range(width)]
     task = task_class(env_cfg, simulation_app)
+    install_room_fixture_cleanup(task.scene_manager)
     install_parallel_control(task, eval_cfg.get("observation", {}), task_name)
     layout_count = bind_eval_layouts(task, task_name, args.env_cfg, seed=0)
     print(f"[env] task {task_name} ready num_envs {width} layouts {layout_count}", flush=True)

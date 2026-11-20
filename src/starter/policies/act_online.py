@@ -451,8 +451,8 @@ def _validate_config(config):
         raise ValueError("learn_std must be a boolean.")
     if not 0 <= float(require(config, "entropy_coef")) < math.inf:
         raise ValueError("entropy_coef must be nonnegative and finite.")
-    if float(config["residual_scale"]) > 0.2:
-        raise ValueError("residual_scale must not exceed 0.2 of the demonstration action std.")
+    if float(config["residual_scale"]) > 0.5:
+        raise ValueError("residual_scale must not exceed 0.5 of the demonstration action std.")
     if not 0.02 <= float(config["initial_std"]) <= 0.5:
         raise ValueError("initial_std must lie in [0.02, 0.5].")
     for key in ("ppo_epochs", "minibatch_size", "hidden_dim", "save_freq"):

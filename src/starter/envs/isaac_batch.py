@@ -113,6 +113,23 @@ def _install_capture_lifecycle(capture) -> None:
     capture.destroy = destroy
 
 
+def install_room_fixture_cleanup(scene_manager) -> None:
+    """Match the pinned layout manager's plural USD path for room fixtures."""
+    from isaacsim.core.utils.prims import delete_prim, is_prim_path_valid
+
+    delete_fixture = scene_manager.delete_fixture_prims
+
+    def delete_fixture_prims(env_id: int, types: str) -> None:
+        if types == "Room":
+            path = f"{scene_manager.env_roots[env_id]}/Rooms"
+            if is_prim_path_valid(path):
+                delete_prim(path)
+        else:
+            delete_fixture(env_id, types)
+
+    scene_manager.delete_fixture_prims = delete_fixture_prims
+
+
 def bind_eval_layouts(task, task_name: str, config_name: str, seed: int = 0):
     """Point each scene at an official eval layout before ``reset``.
 

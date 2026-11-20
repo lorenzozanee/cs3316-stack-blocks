@@ -6,9 +6,31 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from starter.envs.isaac_batch import bind_eval_layouts
+from starter.envs.isaac_batch import bind_eval_layouts, install_room_fixture_cleanup
 from starter.envs.stack_blocks import ParallelAdapter
 from tests.test_env_data import _BatchFake
+
+
+class RoomFixtureCleanupTest(unittest.TestCase):
+    def test_cleanup_matches_room_spawn_root_for_each_scene(self):
+        first = "/World/envs/env_0/Rooms"
+        second = "/World/envs/env_1/Rooms"
+        existing = {first, second}
+        other_deletions = []
+        manager = SimpleNamespace(
+            env_roots=["/World/envs/env_0", "/World/envs/env_1"],
+            delete_fixture_prims=lambda index, name: other_deletions.append((index, name)),
+        )
+        prims = SimpleNamespace(is_prim_path_valid=existing.__contains__, delete_prim=existing.remove)
+        with patch.dict(sys.modules, {"isaacsim.core.utils.prims": prims}):
+            install_room_fixture_cleanup(manager)
+        manager.delete_fixture_prims(0, "Room")
+        manager.delete_fixture_prims(0, "Room")
+        self.assertEqual(existing, {second})
+        manager.delete_fixture_prims(1, "Room")
+        self.assertEqual(existing, set())
+        manager.delete_fixture_prims(0, "Table")
+        self.assertEqual(other_deletions, [(0, "Table")])
 
 
 class SavedLayoutResetTest(unittest.TestCase):
