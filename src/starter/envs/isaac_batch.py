@@ -7,8 +7,6 @@ end-effector control and camera read to a plain task object.
 
 from __future__ import annotations
 
-from copy import deepcopy
-
 
 def install_parallel_control(task, observation_cfg: dict, task_name: str) -> None:
     """Add ``get_obs_batch`` and ``take_action_batch`` to ``task``."""
@@ -30,6 +28,8 @@ def install_parallel_control(task, observation_cfg: dict, task_name: str) -> Non
     obs.initialize(task)
     task.online_obs = obs
     _install_capture_lifecycle(task.capture_manager)
+    batch_ik = _build_batch_ik_solvers(task, num_envs)
+    task._batch_ik_solvers = batch_ik
 
     def get_obs_batch(env_idx_list=None):
         if env_idx_list is None:
@@ -41,12 +41,10 @@ def install_parallel_control(task, observation_cfg: dict, task_name: str) -> Non
     def take_action_batch(actions_list, env_idx_list=None):
         if env_idx_list is None:
             env_idx_list = list(range(num_envs))
-        env_idx_list = list(env_idx_list)
-        sequences = []
-        for action, env_idx in zip(actions_list, env_idx_list):
-            sequences.append(_control_sequence(task, action, int(env_idx), np))
-        if not sequences:
+        env_idx_list = [int(idx) for idx in env_idx_list]
+        if not env_idx_list:
             return
+        sequences = _control_sequences_batch(task, actions_list, env_idx_list, np, batch_ik, num_envs)
         task.robot_manager.control_manager.push(env_idx_list, sequences)
         while _controls_remain(task, env_idx_list):
             meta = task.robot_manager.control_manager.pop(env_idx_list)
@@ -209,69 +207,205 @@ def _controls_remain(task, env_idx_list) -> bool:
     return len(empty) == 0
 
 
-def _control_sequence(task, action: dict, env_idx: int, np):
+def _build_batch_ik_solvers(task, num_envs: int) -> dict:
+    if num_envs <= 1:
+        return {}
+    ik_map = getattr(getattr(task, "robot_manager", None), "ik_solver", None)
+    if not isinstance(ik_map, dict) or not ik_map:
+        return {}
+    planners = {
+        name: planner for name, planner in ik_map.items()
+        if getattr(planner, "ik_solver", None) is not None
+        and hasattr(planner, "robot_cfg")
+        and hasattr(planner, "scene_model")
+    }
+    if not planners:
+        return {}
+    from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
+    from curobo.types import GoalToolPose, JointState
+
+    solvers = {}
+    for name, planner in planners.items():
+        cfg = InverseKinematicsCfg.create(
+            robot=planner.robot_cfg,
+            scene_model=planner.scene_model,
+            device_cfg=planner.device_cfg,
+            num_seeds=32,
+            seed_solver_num_seeds=32,
+            position_tolerance=0.001,
+            orientation_tolerance=0.02,
+            self_collision_check=True,
+            use_cuda_graph=bool(getattr(planner, "use_cuda_graph", True)),
+            max_batch_size=num_envs,
+            multi_env=False,
+            max_goalset=1,
+        )
+        solver = InverseKinematics(cfg)
+        retract = solver.default_joint_state.clone()
+        retract_pos = retract.position.view(1, -1).repeat(num_envs, 1)
+        retract_js = JointState.from_position(retract_pos, joint_names=list(solver.joint_names))
+        kin = solver.compute_kinematics(retract_js)
+        goal = GoalToolPose.from_poses(
+            kin.tool_poses.to_dict(),
+            ordered_tool_frames=list(solver.tool_frames),
+            num_goalset=1,
+        )
+        solver.solve_pose(goal_tool_poses=goal, current_state=retract_js, return_seeds=1)
+        solvers[name] = (planner, solver)
+    print(f"[env] batched cuRobo IK ready: robots={sorted(solvers)} batch={num_envs}", flush=True)
+    return solvers
+
+
+def _extract_active_ik_batch(planner, js_solution, batch_size: int, np):
+    arr = np.asarray(js_solution.position.detach().cpu())
+    while arr.ndim > 2:
+        arr = arr[:, 0]
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[0] < batch_size:
+        raise ValueError(f"Batched IK returned {arr.shape[0]} rows for batch_size {batch_size}.")
+    dof = arr.shape[-1]
+    n_active = len(planner.active_joints_name)
+    n_cspace = len(planner.cspace_joint_names)
+    js_names = list(getattr(js_solution, "joint_names", None) or [])
+    if len(js_names) == dof:
+        indices = [js_names.index(joint) for joint in planner.active_joints_name]
+        return arr[:, indices]
+    if dof == n_cspace:
+        return arr[:, planner._active_to_cspace_idx]
+    if dof == n_active:
+        return arr
+    raise ValueError(
+        f"Unexpected batched IK DOF {dof}: expected {n_active} active or {n_cspace} cspace joints."
+    )
+
+
+def _solve_ik_batch(planner, solver, batch_size: int, robot, target_poses, current_joints, np) -> list[dict]:
+    import torch
+    from curobo.types import GoalToolPose, JointState, Pose
+    from utils.transformer import calculate_target_pose
+
+    actual = len(target_poses)
+    if actual == 0:
+        return []
+    if actual > batch_size:
+        raise ValueError(f"Got {actual} IK targets for max_batch_size {batch_size}.")
+    world_base_pose = np.asarray(planner.robot_origin_pose, dtype=np.float32)
+    frame_bias = np.asarray(planner.frame_bias, dtype=np.float32)
+    positions = []
+    quaternions = []
+    cspaces = []
+    for target_pose, curr_qpos in zip(target_poses, current_joints):
+        transformed = calculate_target_pose(robot.entity_origin_pose, planner.robot_origin_pose, list(target_pose))
+        pose_p, pose_q = planner._trans_from_world_to_base(world_base_pose, np.asarray(transformed, dtype=np.float32))
+        positions.append(np.asarray(pose_p, dtype=np.float32) + frame_bias)
+        quaternions.append(np.asarray(pose_q, dtype=np.float32))
+        cspaces.append(planner._build_cspace_joint_values(curr_qpos))
+    # Pad active subsets to the captured CUDA-graph batch size so cuRobo never resets graphs mid-wave.
+    while len(positions) < batch_size:
+        positions.append(positions[0])
+        quaternions.append(quaternions[0])
+        cspaces.append(cspaces[0])
+
+    device = planner.device_cfg.device
+    pos_tensor = torch.as_tensor(np.asarray(positions, dtype=np.float32), dtype=torch.float32, device=device)
+    quat_tensor = torch.as_tensor(np.asarray(quaternions, dtype=np.float32), dtype=torch.float32, device=device)
+    goal = GoalToolPose.from_poses(
+        {planner.ee_link: Pose(position=pos_tensor, quaternion=quat_tensor)},
+        ordered_tool_frames=planner.tool_frames,
+        num_goalset=1,
+    )
+    q_tensor = torch.as_tensor(np.asarray(cspaces, dtype=np.float32), dtype=torch.float32, device=device)
+    current_state = JointState.from_position(q_tensor, joint_names=planner.cspace_joint_names)
+    ik_result = solver.solve_pose(goal_tool_poses=goal, current_state=current_state, return_seeds=1)
+    success = planner._success_to_bool_array(ik_result.success, batch_size)[:actual]
+    solutions = _extract_active_ik_batch(planner, ik_result.js_solution, batch_size, np) if bool(success.any()) else None
+    return [
+        {"status": "Success", "joint_value": solutions[index]} if success[index] else {"status": "Fail"}
+        for index in range(actual)
+    ]
+
+
+def _control_sequences_batch(task, actions_list, env_idx_list: list[int], np, batch_ik: dict, batch_size: int):
     interval = int(task.online_obs.collect_interval)
-    control = {}
+    frame_count = interval if interval > 0 else 1
+    interp_count = int(np.floor(interval * 0.8)) if interval > 0 else 0
+    sequences = [[{} for _ in range(frame_count)] for _ in env_idx_list]
+
     for robot in task.robot_manager.robot_list:
         if robot.type != "target":
             continue
         name = robot.arm_name.split("_")[0]
         pose_key = f"{name}_ee_pose"
-        target_pose = action[pose_key]
-        ik_result = task.robot_manager.solve_ik(target_pose=target_pose, env_idx=env_idx, robot=robot)
-        obs_name = task.robot_manager.process_name(robot.arm_name)
-        if ik_result["status"] == "Success":
-            control[obs_name] = {"position": ik_result["joint_value"]}
-        gripper_key = task.robot_manager.process_name(robot.gripper_name)
-        if robot.ee_type == "gripper":
-            val = float(np.clip(action[gripper_key][0], 0, 1))
-            if robot.gripper_move["sign"] == 1:
-                val = val * (robot.gripper_scale[1] - robot.gripper_scale[0]) + robot.gripper_scale[0]
-            else:
-                val = (1 - val) * (robot.gripper_scale[1] - robot.gripper_scale[0]) + robot.gripper_scale[0]
-            control[gripper_key] = {
-                "position": [
-                    val,
-                    val * robot.gripper_move["mimic"][1] + robot.gripper_move["mimic"][2],
-                ]
-            }
-    if interval <= 0:
-        return [deepcopy(control)]
-    frames = [deepcopy(control) for _ in range(interval)]
-    _interpolate(task, control, frames, env_idx, interval, np)
-    return frames
-
-
-def _interpolate(task, control, frames, env_idx: int, interval: int, np) -> None:
-    interp_count = int(np.floor(interval * 0.8))
-    for robot in task.robot_manager.robot_list:
-        if robot.type != "target":
-            continue
         arm_key = task.robot_manager.process_name(robot.arm_name)
-        if arm_key in control:
-            current = task.robot_manager.get_joint(robot, env_idx_list=[env_idx])[env_idx]
-            target = np.array(control[arm_key]["position"])
-            if current is not None:
-                current_arr = np.array(current)
-                for frame in range(interp_count):
-                    alpha = (frame + 1) / (interp_count + 1)
-                    frames[frame][arm_key]["position"] = ((1 - alpha) * current_arr + alpha * target).tolist()
-                for frame in range(interp_count, interval):
-                    frames[frame][arm_key]["position"] = target.tolist()
         gripper_key = task.robot_manager.process_name(robot.gripper_name)
-        if gripper_key in control and robot.ee_type == "gripper":
-            target_pos = control[gripper_key]["position"][0]
-            current = task.robot_manager.get_end_effector_real_val(robot, env_idx_list=[env_idx])[env_idx][0]
-            scale = robot.gripper_scale
-            if current is not None:
-                for frame in range(interp_count):
-                    alpha = (frame + 1) / (interp_count + 1)
-                    interp_pos = float(np.clip((1 - alpha) * current + alpha * target_pos, scale[0], scale[1]))
-                    frames[frame][gripper_key]["position"] = [
-                        interp_pos,
-                        interp_pos * robot.gripper_move["mimic"][1] + robot.gripper_move["mimic"][2],
-                    ]
-                held = float(np.clip(target_pos, scale[0], scale[1]))
-                held_vals = [held, held * robot.gripper_move["mimic"][1] + robot.gripper_move["mimic"][2]]
-                for frame in range(interp_count, interval):
-                    frames[frame][gripper_key]["position"] = list(held_vals)
+        joints_map = task.robot_manager.get_joint(robot, env_idx_list=env_idx_list)
+        target_poses = [action[pose_key] for action in actions_list]
+
+        robot_name = getattr(robot, "robot_name", None)
+        if robot_name in batch_ik:
+            planner, solver = batch_ik[robot_name]
+            ik_results = _solve_ik_batch(
+                planner,
+                solver,
+                batch_size,
+                robot,
+                target_poses,
+                [joints_map[env_idx] for env_idx in env_idx_list],
+                np,
+            )
+        else:
+            ik_results = [
+                task.robot_manager.solve_ik(target_pose=pose, env_idx=env_idx, robot=robot)
+                for pose, env_idx in zip(target_poses, env_idx_list)
+            ]
+
+        gripper_map = (
+            task.robot_manager.get_end_effector_real_val(robot, env_idx_list=env_idx_list)
+            if robot.ee_type == "gripper"
+            else None
+        )
+
+        for seq_idx, (action, env_idx, ik_result) in enumerate(zip(actions_list, env_idx_list, ik_results)):
+            frames = sequences[seq_idx]
+            if ik_result["status"] == "Success":
+                target = np.asarray(ik_result["joint_value"])
+                target_list = target.tolist()
+                current = joints_map[env_idx]
+                if interval > 0 and current is not None:
+                    current_arr = np.asarray(current)
+                    for frame in range(interp_count):
+                        alpha = (frame + 1) / (interp_count + 1)
+                        frames[frame][arm_key] = {"position": ((1 - alpha) * current_arr + alpha * target).tolist()}
+                    for frame in range(interp_count, frame_count):
+                        frames[frame][arm_key] = {"position": list(target_list)}
+                else:
+                    for frame in range(frame_count):
+                        frames[frame][arm_key] = {"position": list(target_list)}
+
+            if robot.ee_type == "gripper":
+                val = float(np.clip(action[gripper_key][0], 0, 1))
+                scale = robot.gripper_scale
+                if robot.gripper_move["sign"] == 1:
+                    val = val * (scale[1] - scale[0]) + scale[0]
+                else:
+                    val = (1 - val) * (scale[1] - scale[0]) + scale[0]
+                mimic_a = robot.gripper_move["mimic"][1]
+                mimic_b = robot.gripper_move["mimic"][2]
+                current_g = gripper_map[env_idx]
+                if interval > 0 and current_g is not None:
+                    current_pos = current_g[0]
+                    for frame in range(interp_count):
+                        alpha = (frame + 1) / (interp_count + 1)
+                        interp_pos = float(np.clip((1 - alpha) * current_pos + alpha * val, scale[0], scale[1]))
+                        frames[frame][gripper_key] = {"position": [interp_pos, interp_pos * mimic_a + mimic_b]}
+                    held = float(np.clip(val, scale[0], scale[1]))
+                    held_vals = [held, held * mimic_a + mimic_b]
+                    for frame in range(interp_count, frame_count):
+                        frames[frame][gripper_key] = {"position": list(held_vals)}
+                else:
+                    raw_vals = [val, val * mimic_a + mimic_b]
+                    for frame in range(frame_count):
+                        frames[frame][gripper_key] = {"position": list(raw_vals)}
+
+    return sequences

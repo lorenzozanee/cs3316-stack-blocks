@@ -334,12 +334,15 @@ class ParallelAdapter:
         # run_reward/get_score register checks for ALL scenes, as in the
         # pinned RoboDojo EvalEnv.run_eval. Register once per batch reset.
         self._slots[0]._arm_reward_checks()
+        raws = self._raw_batch(list(range(self.num_envs)))
+        if len(raws) != self.num_envs:
+            raise RuntimeError(f"Expected {self.num_envs} observations from get_obs_batch, got {len(raws)}.")
         observations = []
         infos = []
-        for index, seed in enumerate(seeds):
+        for index, (raw, seed) in enumerate(zip(raws, seeds)):
             slot = self._slots[index]
             slot._steps = 0
-            observations.append(slot.policy_observation(self._raw(index)))
+            observations.append(slot.policy_observation(raw))
             infos.append({"env_name": type(self.task).__name__, "seed": seed, "env_index": index})
         return observations, infos
 
@@ -363,6 +366,8 @@ class ParallelAdapter:
         raws = self._raw_batch(active)
         if not active:
             return []
+        if len(raws) != len(active):
+            raise RuntimeError(f"Expected {len(active)} observations from get_obs_batch, got {len(raws)}.")
         manager = self.task.reward_manager
         rewards = manager.get_reward(final_check=False)
         scores = manager.get_score(reward_lst=rewards)
@@ -434,13 +439,6 @@ class ParallelAdapter:
         finally:
             if original is not None:
                 self.task.is_episode_end = original
-
-    def _raw(self, index: int) -> Mapping:
-        if hasattr(self.task, "get_obs_batch"):
-            return self.task.get_obs_batch([index])[0]
-        if index != 0:
-            raise RuntimeError("get_obs only covers environment 0.")
-        return self._slots[0]._raw_obs()
 
     def _raw_batch(self, active) -> list[Mapping]:
         if hasattr(self.task, "get_obs_batch"):

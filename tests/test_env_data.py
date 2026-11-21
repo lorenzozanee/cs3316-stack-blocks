@@ -380,10 +380,19 @@ class ObservationContractTest(unittest.TestCase):
     def test_parallel_reset_registers_global_reward_checks_once(self):
         task = _BatchFake()
         registrations = []
+        obs_batches = []
         task.run_reward = lambda: registrations.append("reward")
         task.get_score = lambda: registrations.append("score")
+        orig_get_obs_batch = task.get_obs_batch
+
+        def tracked_obs_batch(env_idx_list=None):
+            obs_batches.append(list(env_idx_list))
+            return orig_get_obs_batch(env_idx_list)
+
+        task.get_obs_batch = tracked_obs_batch
         ParallelAdapter(task).reset_batch([14, 15])
         self.assertEqual(registrations, ["reward", "score"])
+        self.assertEqual(obs_batches, [[0, 1]])
 
     def test_parallel_step_runs_every_active_scene(self):
         task = _BatchFake()
@@ -534,13 +543,63 @@ class PolicySlotTest(unittest.TestCase):
 
 class RemoteImageParityTest(unittest.TestCase):
     def test_camera_transport_preserves_every_rgb_pixel(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
         import numpy as np
-        from starter.envs.remote import _pack_image, _unpack_image
+        from starter.envs.remote import (
+            RemoteEnv,
+            _BlobCollector,
+            _pack_image,
+            _unpack_image,
+            serve,
+        )
 
         # Fine colour boundaries expose JPEG chroma subsampling; frozen ACT
-        # must see the same pixels as the official lossless websocket path.
-        image = np.random.default_rng(7).integers(0, 256, (48, 64, 3), dtype=np.uint8)
-        np.testing.assert_array_equal(_unpack_image(_pack_image(image)), image)
+        # must see the exact same uint8 pixels as the official websocket path.
+        rng = np.random.default_rng(7)
+        image_a = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        image_b = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        blobs = _BlobCollector()
+        desc_a = _pack_image(image_a, blobs)
+        desc_b = _pack_image(np.moveaxis(image_b, -1, 0), blobs)
+        joined = memoryview(b"".join(blobs.chunks))
+        np.testing.assert_array_equal(_unpack_image(desc_a, joined), image_a)
+        np.testing.assert_array_equal(_unpack_image(desc_b, joined), image_b)
+
+        # Full socket round-trip for reset_batch and step_batch with multi-image payloads.
+        server_sock, client_sock = socket.socketpair()
+        listener = Mock()
+        listener.accept.return_value = (server_sock, None)
+        fake_env = SimpleNamespace(
+            num_envs=2,
+            reset_batch=Mock(return_value=(
+                [{"image": image_a, "proprio": [0.1] * 16}, {"image": image_b, "proprio": [0.2] * 16}],
+                [{"seed": 14}, {"seed": 15}],
+            )),
+            step_batch=Mock(return_value=[
+                ({"image": image_b, "proprio": [0.3] * 16}, 0.0, False, False, {"step_id": 1}),
+                ({"image": image_a, "proprio": [0.4] * 16}, 15.0, False, True, {"step_id": 1}),
+            ]),
+            privileged_batch=Mock(side_effect=lambda active: [{"env": idx} for idx in active]),
+        )
+        remote = RemoteEnv("127.0.0.1", 9, reset_timeout=5)
+        thread = threading.Thread(target=serve, args=(fake_env, "127.0.0.1", 9))
+        with (patch("starter.envs.remote.socket.socket", return_value=listener),
+              patch("starter.envs.remote.socket.create_connection", return_value=client_sock)):
+            thread.start()
+            try:
+                obs, _ = remote.reset_batch([14, 15])
+                np.testing.assert_array_equal(obs[0]["image"], image_a)
+                np.testing.assert_array_equal(obs[1]["image"], image_b)
+                stepped = remote.step_batch([[0.0] * 16, [0.0] * 16], [0, 1])
+                np.testing.assert_array_equal(stepped[0][0]["image"], image_b)
+                np.testing.assert_array_equal(stepped[1][0]["image"], image_a)
+                self.assertEqual(stepped[1][1], 15.0)
+            finally:
+                remote.close()
+                client_sock.close()
+                thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
 
 
 class RemoteResetTimeoutTest(unittest.TestCase):
@@ -645,18 +704,16 @@ class RemoteResetTimeoutTest(unittest.TestCase):
         listener.close.assert_called_once()
 
     def test_reset_waits_past_the_step_timeout(self):
-        from starter.envs.remote import RemoteEnv
+        from starter.envs.remote import RemoteEnv, _read, _write
 
         server, client = socket.socketpair()
         env = RemoteEnv("127.0.0.1", 9, timeout=0.05, reset_timeout=1.0)
         env._socket = client
 
         def respond() -> None:
-            incoming = b""
-            while b"\n" not in incoming:
-                incoming += server.recv(4096)
+            _read(server)
             time.sleep(0.2)
-            server.sendall(b'{"observations":[{}],"infos":[{}],"privileged":[{}]}\n')
+            _write(server, {"observations": [{}], "infos": [{}], "privileged": [{}]})
 
         thread = threading.Thread(target=respond)
         thread.start()

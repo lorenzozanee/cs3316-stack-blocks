@@ -1,23 +1,28 @@
 """TCP environment used by the online fine-tunes.
 
 The Isaac process is the server. The learner, running in the ``dp`` or ``act``
-conda environment, is the client. Frames are newline-delimited JSON. Camera
-frames use lossless PNG so ACT receives the same RGB pixels as official eval.
+conda environment, is the client. Messages use a binary-framed header (JSON
+metadata plus raw contiguous uint8 RGB payloads) so ACT receives the exact same
+lossless RGB pixels as official eval without PNG/base64 overhead on localhost.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import socket
+import struct
 import time
 from collections.abc import Callable
 from typing import Any
 
+_FRAME_HEADER = struct.Struct("!QQ")
 
-class _Buffer:
-    def __init__(self) -> None:
-        self._buffer = b""
+
+def _enable_nodelay(sock: socket.socket) -> None:
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
 
 
 def serve(
@@ -39,14 +44,15 @@ def serve(
     width = int(getattr(env, "num_envs", 1))
     print(f"[env] listening on {host}:{port} num_envs {width}", flush=True)
     connection, _address = listener.accept()
+    _enable_nodelay(connection)
     print("[env] learner connected", flush=True)
-    incoming = _Buffer()
     finished = finished_at_reset = 0
     try:
         while True:
-            message = _read(connection, incoming)
-            if message is None:
+            frame = _read(connection)
+            if frame is None:
                 break
+            message, _blob = frame
             op = message.get("op")
             if op == "ping":
                 _write(connection, {"ok": True, "num_envs": width})
@@ -61,14 +67,16 @@ def serve(
                 observations, infos = env.reset_batch(seeds)
                 finished_at_reset = finished
                 privileged = env.privileged_batch(list(range(width)))
+                blobs = _BlobCollector()
                 _write(
                     connection,
                     {
-                        "observations": [_pack_observation(item) for item in observations],
+                        "observations": [_pack_observation(item, blobs) for item in observations],
                         "privileged": [_pack(item) for item in privileged],
                         "infos": [_pack(item) for item in infos],
                         "num_envs": width,
                     },
+                    blobs.chunks,
                 )
             elif op == "step":
                 active = [int(index) for index in message["active"]]
@@ -76,22 +84,27 @@ def serve(
                 privileged = env.privileged_batch(active)
                 terminated = [bool(item[2]) for item in results]
                 truncated = [bool(item[3]) for item in results]
+                blobs = _BlobCollector()
                 _write(
                     connection,
                     {
-                        "observations": [_pack_observation(item[0]) for item in results],
+                        "observations": [_pack_observation(item[0], blobs) for item in results],
                         "privileged": [_pack(item) for item in privileged],
                         "scores": [float(item[1]) for item in results],
                         "terminated": terminated,
                         "truncated": truncated,
                         "infos": [_pack(item[4]) for item in results],
                     },
+                    blobs.chunks,
                 )
                 finished += sum(1 for done_flag, cut in zip(terminated, truncated) if done_flag or cut)
                 if once and finished >= width:
                     break
             elif op == "close":
-                _write(connection, {"ok": True})
+                try:
+                    _write(connection, {"ok": True})
+                except OSError:
+                    pass
                 break
             else:
                 _write(connection, {"error": f"unknown op {op}"})
@@ -129,7 +142,7 @@ class RemoteEnv:
         # per-step socket timeout when the policy and Isaac share one GPU.
         self.reset_timeout = float(reset_timeout)
         self._socket: socket.socket | None = None
-        self._buffer = b""
+        self._blob: memoryview = memoryview(b"")
         self._privileged: list[dict] = []
 
     def connect(self) -> None:
@@ -164,7 +177,7 @@ class RemoteEnv:
                 self.close()
                 time.sleep(min(2.0, max(deadline - time.monotonic(), 0.0)))
                 continue
-            observations = [_unpack_observation(item) for item in reply["observations"]]
+            observations = [_unpack_observation(item, self._blob) for item in reply["observations"]]
             return observations, reply.get("infos") or [{} for _ in observations]
 
     def step_batch(self, actions, active):
@@ -180,7 +193,7 @@ class RemoteEnv:
         for index, observation in enumerate(reply["observations"]):
             results.append(
                 (
-                    _unpack_observation(observation),
+                    _unpack_observation(observation, self._blob),
                     float(reply["scores"][index]),
                     bool(reply["terminated"][index]),
                     bool(reply["truncated"][index]),
@@ -203,7 +216,7 @@ class RemoteEnv:
             pass
         self._socket.close()
         self._socket = None
-        self._buffer = b""
+        self._blob = memoryview(b"")
 
     def _ensure(self, timeout: float | None = None) -> None:
         if self._socket is not None:
@@ -219,9 +232,10 @@ class RemoteEnv:
                 last_error = exc
                 time.sleep(min(2.0, max(deadline - time.monotonic(), 0.0)))
                 continue
+            _enable_nodelay(sock)
             sock.settimeout(self.timeout)
             self._socket = sock
-            self._buffer = b""
+            self._blob = memoryview(b"")
             self._privileged = []
             return
         raise TimeoutError(
@@ -233,60 +247,91 @@ class RemoteEnv:
             raise RuntimeError("Remote env is not connected.")
         self._socket.settimeout(self.timeout if timeout is None else float(timeout))
         _write(self._socket, message)
-        reply = _read(self._socket, self)
-        if reply is None:
+        frame = _read(self._socket)
+        if frame is None:
             self.close()
             raise ConnectionError("Isaac env server closed the connection.")
+        reply, blob = frame
         if "error" in reply:
             raise RuntimeError(reply["error"])
+        self._blob = blob
         if "privileged" in reply:
             self._privileged = list(reply["privileged"])
         return reply
 
-def _read(connection: socket.socket, holder: Any) -> dict | None:
-    buffer = b"" if holder is None else holder._buffer
-    while b"\n" not in buffer:
-        chunk = connection.recv(1024 * 1024)
-        if not chunk:
-            if holder is not None:
-                holder._buffer = buffer
+
+class _BlobCollector:
+    def __init__(self) -> None:
+        self.chunks: list[bytes] = []
+        self._offset = 0
+
+    def append(self, raw: bytes) -> tuple[int, int]:
+        offset = self._offset
+        size = len(raw)
+        self.chunks.append(raw)
+        self._offset += size
+        return offset, size
+
+
+def _recv_exact(connection: socket.socket, size: int) -> bytearray | None:
+    if size == 0:
+        return bytearray()
+    buf = bytearray(size)
+    view = memoryview(buf)
+    got = 0
+    while got < size:
+        received = connection.recv_into(view[got:])
+        if received == 0:
             return None
-        buffer += chunk
-    line, _, rest = buffer.partition(b"\n")
-    if holder is not None:
-        holder._buffer = rest
-    if not line:
+        got += received
+    return buf
+
+
+def _read(connection: socket.socket) -> tuple[dict, memoryview] | None:
+    prefix = _recv_exact(connection, _FRAME_HEADER.size)
+    if prefix is None:
         return None
-    return json.loads(line.decode("utf-8"))
+    header_len, blob_len = _FRAME_HEADER.unpack(prefix)
+    header_bytes = _recv_exact(connection, header_len)
+    if header_bytes is None:
+        return None
+    blob_bytes = _recv_exact(connection, blob_len)
+    if blob_bytes is None:
+        return None
+    return json.loads(bytes(header_bytes).decode("utf-8")), memoryview(blob_bytes)
 
 
-def _write(connection: socket.socket, message: dict) -> None:
-    payload = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
-    connection.sendall(payload)
+def _write(connection: socket.socket, message: dict, blobs: list[bytes] | tuple[bytes, ...] = ()) -> None:
+    header = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    blob_len = sum(len(chunk) for chunk in blobs)
+    connection.sendall(_FRAME_HEADER.pack(len(header), blob_len))
+    connection.sendall(header)
+    for chunk in blobs:
+        if chunk:
+            connection.sendall(chunk)
 
 
-def _pack_observation(observation: dict) -> dict:
+def _pack_observation(observation: dict, blobs: _BlobCollector) -> dict:
     packed = {}
     for key, value in observation.items():
         if key == "image":
-            packed[key] = _pack_image(value)
+            packed[key] = _pack_image(value, blobs)
         else:
             packed[key] = _pack(value)
     return packed
 
 
-def _unpack_observation(payload: dict) -> dict:
+def _unpack_observation(payload: dict, blob: memoryview) -> dict:
     observation = {}
     for key, value in payload.items():
         if key == "image":
-            observation[key] = _unpack_image(value)
+            observation[key] = _unpack_image(value, blob)
         else:
             observation[key] = value
     return observation
 
 
-def _pack_image(value) -> dict:
-    import cv2
+def _pack_image(value, blobs: _BlobCollector) -> dict:
     import numpy as np
 
     array = np.asarray(value)
@@ -294,26 +339,25 @@ def _pack_image(value) -> dict:
         array = np.clip(array, 0, 255).astype(np.uint8)
     if array.ndim == 3 and array.shape[0] in (1, 3) and array.shape[-1] not in (1, 3):
         array = np.moveaxis(array, 0, -1)
-    # Official XPolicyLab eval transports ndarray pixels without loss. JPEG
-    # chroma subsampling changed the frozen ACT input during online training.
-    ok, encoded = cv2.imencode(".png", cv2.cvtColor(array, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
-    if not ok:
-        raise RuntimeError("Failed to encode the camera frame.")
+    raw = np.ascontiguousarray(array).tobytes()
+    offset, nbytes = blobs.append(raw)
     return {
-        "png": base64.b64encode(encoded.tobytes()).decode("ascii"),
+        "offset": offset,
+        "nbytes": nbytes,
         "shape": list(array.shape),
     }
 
 
-def _unpack_image(payload: dict):
-    import cv2
+def _unpack_image(payload: dict, blob: memoryview):
     import numpy as np
 
-    raw = base64.b64decode(payload["png"])
-    array = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if array is None:
-        raise RuntimeError("Failed to decode the camera frame.")
-    return cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+    offset = int(payload["offset"])
+    nbytes = int(payload["nbytes"])
+    shape = tuple(int(dim) for dim in payload["shape"])
+    expected = int(np.prod(shape))
+    if nbytes != expected or offset < 0 or offset + nbytes > len(blob):
+        raise RuntimeError(f"Corrupt raw RGB frame header: shape={shape} offset={offset} nbytes={nbytes}.")
+    return np.frombuffer(blob[offset : offset + nbytes], dtype=np.uint8).reshape(shape).copy()
 
 
 def _pack(value):
