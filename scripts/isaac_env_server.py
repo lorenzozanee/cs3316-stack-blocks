@@ -93,10 +93,17 @@ def main() -> None:
     task = task_class(env_cfg, simulation_app)
     install_room_fixture_cleanup(task.scene_manager)
     install_parallel_control(task, eval_cfg.get("observation", {}), task_name)
-    layout_count = bind_eval_layouts(task, task_name, args.env_cfg, seed=0)
+
+    def physics_clock() -> float:
+        physics = task.sim
+        return physics.sim.current_time_step_index * physics.physics_dt
+
+    adapter = ParallelAdapter(task, physics_clock=physics_clock)
+    layout_count = bind_eval_layouts(task, task_name, args.env_cfg, seed=0,
+                                    sample_reset_motion=adapter.sample_reset_motion)
     print(f"[env] task {task_name} ready num_envs {width} layouts {layout_count}", flush=True)
     recycled = serve(
-        ParallelAdapter(task), args.host, args.port, once=args.once,
+        adapter, args.host, args.port, once=args.once,
         should_recycle=_vram_below_reset_headroom if args.min_reset_free_vram_mib else None,
     )
     if recycled:

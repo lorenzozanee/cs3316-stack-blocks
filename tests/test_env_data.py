@@ -146,6 +146,70 @@ class _BatchFake(FakeTask):
 
 
 class ObservationContractTest(unittest.TestCase):
+    def test_control_motion_uses_each_slots_clock_and_resets_its_history(self):
+        from unittest.mock import patch
+
+        task = _BatchFake()
+        time = 1.0
+        angle = 0.0
+        warmup_displacement = 0.002
+        pose_reads = []
+
+        def poses(label):
+            pose_reads.append(label)
+            return ([[0.0, 0.0, 0.0], [angle, 0.0, 0.1]],
+                    [[-1.0 if time > 1.0 else 1.0, 0.0, 0.0, 0.0],
+                     [np.cos(angle / 2), 0.0, 0.0, np.sin(angle / 2)]])
+
+        task.reward_manager.func_parser.get_label_pose = poses
+        env = ParallelAdapter(task, physics_clock=lambda: time)
+        reset = task.reset
+
+        def reset_with_warmup(**kwargs):
+            nonlocal angle, time
+            reset(**kwargs)
+            angle = 0.0
+            env.sample_reset_motion()
+            time += 0.04
+            angle = warmup_displacement
+
+        task.reset = reset_with_warmup
+        observations, _ = env.reset_batch([14, 15])
+        scene0, scene1 = env.privileged_batch([0, 1])
+        self.assertEqual(scene0["settle_speeds"]["block_0"], [0, 0])
+        np.testing.assert_allclose(scene1["settle_speeds"]["block_0"], [0.05, 0.05])
+        self.assertEqual(pose_reads, list(BLOCK_LABELS) * 2)
+        actions = [observation["proprio"] for observation in observations]
+        interval = 0.04
+
+        def advance(actions, indices):
+            nonlocal time, angle
+            time += interval
+            angle += 0.005
+
+        task.take_action_batch = advance
+        with patch.object(task.reward_manager, "get_reward", wraps=task.reward_manager.get_reward) as scorer:
+            result = env.step_batch(actions, [0, 1])
+            scorer.assert_called_once_with(final_check=False)
+        self.assertEqual([row[1] for row in result], [0.0, 15.0])
+        scene1, scene0 = env.privileged_batch([1, 0])
+        self.assertEqual(scene0["settle_speeds"]["block_0"], [0.0, 0.0])
+        np.testing.assert_allclose(scene1["settle_speeds"]["block_0"], [0.125, 0.125])
+        self.assertEqual(env.privileged_batch([1])[0]["settle_speeds"], scene1["settle_speeds"])
+        self.assertEqual(scene1["block_velocities"]["block_0"]["linear"][0], 1.0)
+
+        interval = 0.02
+        env.step_batch([actions[0]], [0])
+        self.assertEqual(env.privileged_batch([0])[0]["settle_speeds"]["block_0"], [0, 0])
+        self.assertEqual(env.privileged_batch([1])[0]["settle_speeds"], scene1["settle_speeds"])
+        env.step_batch([actions[1]], [1])
+        np.testing.assert_allclose(env.privileged_batch([1])[0]["settle_speeds"]["block_0"], [0.25, 0.25])
+        time = 0.0
+        warmup_displacement = 0.0
+        env.reset_batch([16, 17])
+        for state in env.privileged_batch([0, 1]):
+            self.assertEqual(state["settle_speeds"]["block_0"], [0, 0])
+
     def test_reset_marks_plain_task_scenes_active(self):
         from starter.envs.stack_blocks import _seed_gripper_state
 
@@ -331,6 +395,25 @@ class ObservationContractTest(unittest.TestCase):
         results = adapter.step_batch([action, action], [0, 1])
         self.assertEqual(results[1][1], 15.0)
         self.assertEqual(task.batch_calls, [([0, 1], 2)])
+
+    def test_block_pose_rejects_zero_or_nonfinite_quaternions(self):
+        from starter.envs.stack_blocks import _block_pose
+
+        bad_zero = {label: {"pos": [0.0, 0.0, 0.8], "rot": [0.0, 0.0, 0.0, 0.0]} for label in BLOCK_LABELS}
+        bad_nan = {label: {"pos": [0.0, 0.0, 0.8], "rot": [float("nan"), 0.0, 0.0, 1.0]} for label in BLOCK_LABELS}
+        with self.assertRaises(ValueError):
+            _block_pose(bad_zero)
+        with self.assertRaises(ValueError):
+            _block_pose(bad_nan)
+
+    def test_parallel_adapter_guards_missing_clock_and_motion_baseline(self):
+        task = _multi_env_task(1)
+        no_clock = ParallelAdapter(task)
+        no_clock.sample_reset_motion()
+
+        clock_adapter = ParallelAdapter(task, physics_clock=lambda: 0.04)
+        with self.assertRaisesRegex(RuntimeError, "Missing motion baseline"):
+            clock_adapter.privileged_batch([0])
 
     def test_step_limit_truncates_without_success(self):
         task = FakeTask(step_lim=2, score=15.0)

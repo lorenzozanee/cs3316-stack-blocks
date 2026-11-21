@@ -191,6 +191,140 @@ class _ScriptedEnv:
         return results
 
 
+class PostGraspReplayTest(unittest.TestCase):
+    class Env(_ScriptedEnv):
+        def __init__(self, scores=(0, 0, 0, 15, 15)):
+            super().__init__({0: {"length": 5, "terminated": False},
+                              1: {"length": 4, "terminated": False}}, {0: scores, 1: [0]*4})
+            self.actions = []
+
+        def step_batch(self, actions, active):
+            self.actions.append(dict(zip(active, copy.deepcopy(actions))))
+            results = super().step_batch(actions, active)
+            state = _state_with_block_lift(0.02)
+            config = _reward_cfg()
+            measured = ((BLOCK_SIDE - config['gripper_aperture_zero']) / 2
+                        - config['gripper_scale_low']) / (config['gripper_scale_high']
+                                                          - config['gripper_scale_low'])
+            if 0 in active:
+                idx = active.index(0)
+                state["gripper_open_measured"][0] = measured
+                self._privileged[idx] = state
+                wrist = results[idx][0]["proprio"]
+                wrist[:3] = state["blocks"]["block_0"]["pos"]
+                wrist[0] -= config['grasp_offset']
+                wrist[7] = measured
+            return results
+
+    def _run(self, env, reward_cfg=None, **kwargs):
+        runner, actor = _ScriptedRunner(), _RecordingActor()
+        batch, episodes = collect_wave(env, runner, actor, [14, 15], gamma=0.9,
+                                       gae_lambda=0.95, residual_scale=0.2,
+                                       reward_cfg=reward_cfg or _reward_cfg(), **kwargs)
+        return batch, {ep['layout_id']: ep for ep in episodes}, runner, actor
+
+    def test_capture_and_replay_preserves_history_and_excludes_forced_samples(self):
+        entries = []
+        plain, original, _, _ = self._run(self.Env(), capture_prefix=entries.append)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0]['layout_id'], entries[0]['scene'], entries[0]['arm'],
+                          entries[0]['carried'], len(entries[0]['actions'])),
+                         (14, 0, 0, 'block_0', 3))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'prefixes.jsonl'
+            path.write_text(json.dumps(entries[0]) + '\n')
+            entry = act_online.load_prefixes(path, 2, [14, 15], _reward_cfg())[14, 0]
+            with self.assertRaisesRegex(ValueError, 'metadata'):
+                act_online.load_prefixes(path, 4, [14, 15], _reward_cfg())
+            with self.assertRaisesRegex(ValueError, 'different reward configuration'):
+                act_online.load_prefixes(path, 2, [14, 15],
+                                         {**_reward_cfg(), 'milestone_grasp': 9.9})
+        requested_action = copy.deepcopy(entry['actions'][0])
+        requested_action[0] += 0.01
+        entry['actions'][0] = requested_action
+        env = self.Env()
+        replay, records, runner, actor = self._run(env, prefixes={0: entry})
+        self.assertEqual(env.actions[0][0], requested_action)
+        self.assertEqual(records[14]['prefix_steps'], 3)
+        self.assertEqual(records[14]['length'], 2)
+        self.assertEqual(records[15]['prefix_steps'], 0)
+        self.assertEqual(records[14]['final_score'], 15)
+        self.assertAlmostEqual(original[14]['milestone_return'] - records[14]['milestone_return'], 1.2)
+        torch.testing.assert_close(replay.returns, plain.returns[3:])
+        self.assertEqual(runner.calls[:4], [[0, 1]]*4)
+        sampled = [c['features'][:, :2].tolist() for c in actor.calls if not c['deterministic']]
+        self.assertEqual(sampled, [[[1, 0]], [[1, 1]], [[1, 2]], [[0, 3], [1, 3]], [[0, 4]]])
+
+    def test_dense_prefix_recomputes_progress_and_checks_discrete_events(self):
+        class ApproachEnv(self.Env):
+            def __init__(self, offset=0.0):
+                super().__init__()
+                self.offset = offset
+
+            def step_batch(self, actions, active):
+                results = super().step_batch(actions, active)
+                if 0 in active and self._steps[0] == 1:
+                    index = active.index(0)
+                    right = results[index][0]["proprio"][8:11]
+                    right[:] = START_POSITIONS["block_1"]
+                    right[0] -= _reward_cfg()["grasp_offset"]
+                    right[1] -= 0.1 + self.offset
+                return results
+
+        config = _reward_cfg(dense_transport_reward=True)
+        entries = []
+        original, episodes, _, _ = self._run(ApproachEnv(), config, capture_prefix=entries.append)
+        entry = entries[0]
+        self.assertGreater(episodes[14]["dense_approach_return"], 0.0)
+        self.assertEqual(entry["frames"][1]["bonus"], 0.0)
+        self.assertAlmostEqual(entry["frames"][3]["bonus"], 1.2)
+        replay, records, _, _ = self._run(ApproachEnv(0.001), config, prefixes={0: entry})
+        self.assertEqual(records[14]["prefix_steps"], 3)
+        torch.testing.assert_close(replay.returns, original.returns[3:])
+        wrong_event = copy.deepcopy(entry)
+        wrong_event["frames"][3]["bonus"] = 0.0
+        with self.assertRaisesRegex(RuntimeError, "diverged"):
+            self._run(ApproachEnv(), config, prefixes={0: wrong_event})
+
+    def test_divergent_or_scoring_prefix_is_rejected(self):
+        entries = []
+        self._run(self.Env(), capture_prefix=entries.append)
+        entry = entries[0]
+        with self.assertRaisesRegex(RuntimeError, 'crossed a task score'):
+            self._run(self.Env((0, 15, 15, 15, 15)), prefixes={0: entry})
+        different_position = copy.deepcopy(entry)
+        different_position['frames'][-1]['blocks']['block_0']['pos'][0] += 0.05
+        different_speed = copy.deepcopy(entry)
+        different_speed['frames'][-1]['velocities']['block_0']['linear'][0] += 0.05
+        for altered in (different_position, different_speed):
+            with self.assertRaisesRegex(RuntimeError, 'replay diverged.*layout 14'):
+                self._run(self.Env(), prefixes={0: altered})
+
+    def test_intermediate_divergence_or_event_mismatch_is_rejected(self):
+        entries = []
+        self._run(self.Env(), capture_prefix=entries.append)
+        self.assertEqual(len(entries[0]['frames']), len(entries[0]['actions']) + 1)
+        mid_position = copy.deepcopy(entries[0])
+        mid_position['frames'][1]['blocks']['block_1']['pos'][1] += 0.05
+        bonus = copy.deepcopy(entries[0])
+        bonus['frames'][1]['bonus'] += 1.0
+        for altered, metric in ((mid_position, 'block_1.position_m'), (bonus, 'event_bonus')):
+            with self.assertRaisesRegex(RuntimeError, rf'replay diverged.*layout 14, scene 0, step 1: {metric} delta='):
+                self._run(self.Env(), prefixes={0: altered})
+        other_support = copy.deepcopy(entries[0])
+        other_support['target_lower'] = 'block_2'
+        if entries[0]['target_lower'] != 'block_2':
+            with self.assertRaisesRegex(RuntimeError, 'latched a different support'):
+                self._run(self.Env(), prefixes={0: other_support})
+        missing = copy.deepcopy(entries[0])
+        missing['frames'] = missing['frames'][:-1]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'prefixes.jsonl'
+            path.write_text(json.dumps(missing) + '\n')
+            with self.assertRaisesRegex(ValueError, 'physical snapshot'):
+                act_online.load_prefixes(path, 2, [14, 15], _reward_cfg())
+
+
 class CollectWaveTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -273,33 +407,6 @@ class CollectWaveTest(unittest.TestCase):
                                0.05 / (4 * ACTION_DIM))
         self.assertAlmostEqual(diagnostics["advantage_std"],
                                float(batch.advantages.std(unbiased=False)))
-
-    def test_centered_potential_preserves_terminal_and_timeout_telescoping(self):
-        gamma, length = 0.9, 2
-        baseline = _reward_cfg(potential_offset_fraction=0.0)
-        centered = _reward_cfg(potential_offset_fraction=1.0)
-        offset = sum(baseline[key] * count for key, count in (
-            ("reach_weight", 1), ("manipulation_weight", len(BLOCK_LABELS)),
-            ("base_weight", 1), ("pair_weight", 2),
-        ))
-
-        for terminated in (False, True):
-            with self.subTest(terminated=terminated):
-                def run(config):
-                    env = _ScriptedEnv({0: {"length": length, "terminated": terminated}},
-                                       {0: [0.0, 0.0]})
-                    _, episodes = collect_wave(env, _ScriptedRunner(), _RecordingActor(), [14],
-                                               gamma=gamma, gae_lambda=0.8,
-                                               residual_scale=0.05, reward_cfg=config)
-                    return episodes[0]
-
-                old, new = run(baseline), run(centered)
-                self.assertAlmostEqual(new["phi_initial"] - old["phi_initial"], offset)
-                final_offset = 0.0 if terminated else gamma ** length * offset
-                self.assertAlmostEqual(new["discounted_return"] - old["discounted_return"],
-                                       final_offset - offset)
-                self.assertEqual(new["milestone_steps"], old["milestone_steps"])
-                self.assertEqual(new["waypoint_counts"], old["waypoint_counts"])
 
     def test_episode_diagnostics_log_potential_components_and_tower_state(self):
         # Static fixture: three resting cubes, identity-quat proprio, open
@@ -425,7 +532,8 @@ class PBRSCollectorTest(unittest.TestCase):
     def _collect(self, terminated: bool, after_state: dict, score: float):
         env = _ScriptedEnv({0: {"length": 1, "terminated": terminated}}, {0: [score]})
         # Milestone weights zero: isolate the potential-based shaping term.
-        cfg = _reward_cfg(milestone_grasp=0.0, milestone_base=0.0,
+        cfg = _reward_cfg(reach_weight=2.0, manipulation_weight=1.0, base_weight=1.0,
+                          milestone_grasp=0.0, milestone_base=0.0,
                           milestone_pair2=0.0, milestone_pair3=0.0)
         with mock.patch.object(sys.modules[__name__], "_privileged_state",
                                side_effect=[_privileged_state(), after_state]):
@@ -498,7 +606,7 @@ class MilestoneBonusTest(unittest.TestCase):
         return episodes[0]
 
     def test_bonus_paid_once_and_accounted_separately_from_shaping(self):
-        cfg = _reward_cfg(milestone_dwell_steps=2)
+        cfg = _reward_cfg(reach_weight=2.0, base_weight=1.0, milestone_dwell_steps=2)
         ep = self._collect_static(cfg, length=4)
         self.assertEqual(ep["final_score"], 0.0)
         # The base predicate holds from step 2 onward; the bonus latches once.
@@ -539,9 +647,13 @@ class _OnlineFakeEnv:
         self.reset_calls = []
         self.step_calls = []
         self.scores_seen = []
+        self.connected = False
         self.closed = False
         self._state = {}
         self._privileged = []
+
+    def connect(self):
+        self.connected = True
 
     def reset_batch(self, seeds):
         self.reset_calls.append([int(seed) for seed in seeds])
@@ -843,7 +955,16 @@ class TrainOnlineTest(unittest.TestCase):
                                        episode["final_score"] + episode["shaping_return"]
                                        + episode["milestone_return"])
                 self.assertEqual(episode["milestone_return"], 0.0)
-                self.assertAlmostEqual(float(row["discounted_return"]), episode["discounted_return"])
+                self.assertAlmostEqual(float(row["episode_return"]), episode["episode_return"])
+                self.assertEqual(list(row), [
+                    "episode", "absolute_update", "seed", "layout_id", "length", "prefix_steps",
+                    "final_score", "peak_score", "episode_return", "first_partial_step",
+                    "arrivals", "grasps", "carries", "aligned", "opened", "settled",
+                ])
+                for field, counter in (("arrivals", "arrivals"), ("grasps", "confirmed")):
+                    self.assertEqual(int(row[field]), sum(
+                        counts[counter] for counts in episode["grasp_attempts"].values()))
+                self.assertIn("discounted_return", episode)
                 self.assertGreaterEqual(episode["position_residual_mean_m"], 0.0)
             self.assertEqual(episode_records[-1]["first_partial_step"], 2)
             self.assertEqual(episode_rows[-1]["first_partial_step"], "2")
@@ -900,6 +1021,14 @@ class TrainOnlineTest(unittest.TestCase):
             self.assertEqual(tuple(log_probs.shape), (1,))
             self.assertEqual(tuple(values.shape), (1,))
 
+    def test_remaining_seconds_uses_the_earliest_stop(self):
+        self.assertAlmostEqual(act_online._remaining_seconds(120.0, 2, 10, 3600.0), 480.0)
+        self.assertAlmostEqual(act_online._remaining_seconds(120.0, 2, 10, 300.0), 180.0)
+        self.assertAlmostEqual(act_online._remaining_seconds(120.0, 2, sys.maxsize, 3600.0),
+                               3480.0)
+        self.assertAlmostEqual(act_online._remaining_seconds(3600.0, 3, sys.maxsize, 3600.0),
+                               0.0)
+
     def test_budget_stops_at_complete_wave_and_keeps_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -908,8 +1037,16 @@ class TrainOnlineTest(unittest.TestCase):
             env = _OnlineFakeEnv()
             config = _online_config(checkpoint)
             console = io.StringIO()
+            connected_at = []
+            connect = env.connect
+
+            def record_connection():
+                connect()
+                connected_at.append(act_online.time.monotonic())
+
+            env.connect = record_connection
             with mock.patch.object(act_online, "_budget_exhausted",
-                                   side_effect=[False, True]), \
+                                   side_effect=[False, True]) as budget, \
                     mock.patch.object(act_online, "RemoteEnv", return_value=env), \
                     mock.patch.object(act_online, "online_output_dir", return_value=output), \
                     mock.patch("sys.stdout", console):
@@ -917,6 +1054,8 @@ class TrainOnlineTest(unittest.TestCase):
 
             self.assertEqual(last, output / "policy_last.ckpt")
             self.assertTrue(env.closed)
+            self.assertEqual(len(connected_at), 1)
+            self.assertGreaterEqual(budget.call_args_list[0].args[0], connected_at[0])
             # The second wave was never started; the single complete wave was
             # optimized exactly once and then the bounded loop stopped.
             self.assertEqual(env.reset_calls, [[0, 0]])

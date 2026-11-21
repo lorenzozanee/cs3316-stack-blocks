@@ -130,7 +130,7 @@ def install_room_fixture_cleanup(scene_manager) -> None:
     scene_manager.delete_fixture_prims = delete_fixture_prims
 
 
-def bind_eval_layouts(task, task_name: str, config_name: str, seed: int = 0):
+def bind_eval_layouts(task, task_name: str, config_name: str, seed: int = 0, *, sample_reset_motion=None):
     """Point each scene at an official eval layout before ``reset``.
 
     Training seeds are layout indices modulo the number of saved layouts.
@@ -187,7 +187,13 @@ def bind_eval_layouts(task, task_name: str, config_name: str, seed: int = 0):
         # before ACT sees its first frame or rewards capture their initial state.
         for _ in range(10):
             task.render()
-        for step in range(200):
+        warmup_steps = 200
+        if sample_reset_motion is not None:
+            interval = max(1, int(task.online_obs.collect_interval))
+            warmup_steps = max(warmup_steps, interval)
+        for step in range(warmup_steps):
+            if sample_reset_motion is not None and step == warmup_steps - interval:
+                sample_reset_motion()
             task.sim_step()
             if step % 5 == 0:
                 task.online_obs.render_for_capture()

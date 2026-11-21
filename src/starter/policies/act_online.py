@@ -15,6 +15,7 @@ import csv
 import json
 import math
 import pickle
+import sys
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -35,8 +36,17 @@ from starter.policies.act_inference import (
     compose_residual_action,
 )
 from starter.policies.act_model import ACTPolicy
+from starter.policies.post_grasp_prefix import (
+    capture_frame, check_frame, check_grasp, load_prefixes, reward_digest)
 from starter.policies.residual_ppo import PPOBatch, ResidualActorCritic, compute_gae, ppo_update
 from starter.policies.stacking_reward import REWARD_KEYS, StackingReward, validate_reward_config
+
+
+_EPISODE_CSV_FIELDS = (
+    "episode", "absolute_update", "seed", "layout_id", "length", "prefix_steps",
+    "final_score", "peak_score", "episode_return", "first_partial_step",
+    "arrivals", "grasps", "carries", "aligned", "opened", "settled",
+)
 
 
 def online_output_dir(config: dict) -> Path:
@@ -45,6 +55,14 @@ def online_output_dir(config: dict) -> Path:
 
 def _budget_exhausted(started: float, max_seconds: float) -> bool:
     return time.monotonic() - started >= max_seconds
+
+
+def _remaining_seconds(elapsed: float, local_update: int, updates: int,
+                       max_seconds: float) -> float:
+    budget_left = max(0.0, max_seconds - elapsed)
+    if updates == sys.maxsize:
+        return budget_left
+    return min(budget_left, elapsed / local_update * (updates - local_update))
 
 
 def _numpy_rng_payload() -> dict:
@@ -94,7 +112,7 @@ def _block_positions(privileged) -> dict:
 
 @torch.no_grad()
 def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale,
-                 reward_cfg):
+                 reward_cfg, prefixes=None, capture_prefix=None):
     """Finish every scene before resetting; never fabricate inactive transitions.
 
     Features and the raw sampled residual are cached before the environment
@@ -103,9 +121,13 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
     approach and carry waypoints, and dwell-gated grasp and placement bonuses.
     Milestones intentionally add a target-region preference beyond the official
     task; their hidden episode history is not part of actor/critic inputs.
-    Object poses condition only the
-    residual actor/critic, never the frozen ACT forward.
+    Object poses condition only the residual actor/critic, never frozen ACT.
+    Replayed actions warm ACT and reward history, but never become PPO samples.
     """
+    prefixes = prefixes or {}
+    if any(not 0 <= i < len(seeds) or entry["scene"] != i or entry["width"] != len(seeds)
+           or entry["layout_id"] != seeds[i] for i, entry in prefixes.items()):
+        raise ValueError("Post-grasp replay must match layout and scene slot.")
     observations, _ = env.reset_batch(seeds)
     if len(observations) != len(seeds):
         raise ValueError("Environment reset width does not match num_envs.")
@@ -114,9 +136,15 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         raise ValueError("Dense shaping requires privileged states in reset scene order.")
     initial_heights = {}
     initial_terms = {}
+    initial_grasps = {}
     potentials = {}
     rewards = {}
+    recordings = {}
     for scene, (observation, privileged) in enumerate(zip(observations, reset_privileged)):
+        if scene in prefixes:
+            check_frame(prefixes[scene], 0, observation, privileged, 0.0)
+        elif capture_prefix:
+            recordings[scene] = {"actions": [], "frames": [capture_frame(observation, privileged)]}
         positions = _block_positions(privileged)
         initial_heights[scene] = {label: float(position[2])
                                   for label, position in positions.items()}
@@ -130,6 +158,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                     for obs, state in zip(observations, reset_privileged)]
     chunks, features = runner.predict_base(residual_obs, active, with_features=True)
     current = {i: (chunks[pos][0], features[pos]) for pos, i in enumerate(active)}
+    prefix_steps = {i: len(prefixes[i]["actions"]) if i in prefixes else 0 for i in active}
     trajectories = {i: [] for i in active}
     previous_scores = {i: 0.0 for i in active}
     peak_scores = dict(previous_scores)
@@ -156,16 +185,25 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         for i in active
     }
     episodes = []
-    for _ in range(STEP_LIMIT):
-        inputs = torch.stack([current[i][1] for i in active])
-        raw_actions, log_probs, values = actor.act(inputs)
-        base = np.stack([current[i][0] for i in active])
-        physical = compose_residual_action(base, raw_actions, runner.stats["action_std"], residual_scale)
-        # Mean Euclidean target-position correction across the two arms, in metres.
-        position_residuals = np.linalg.norm(
-            (physical - base)[:, [0, 1, 2, 8, 9, 10]].reshape(-1, 2, 3), axis=-1,
-        ).mean(axis=-1)
-        results = env.step_batch(physical.tolist(), active)
+    for control_step in range(1, STEP_LIMIT + 1):
+        learning = [i for i in active if control_step > prefix_steps[i]]
+        sample_positions = {i: pos for pos, i in enumerate(learning)}
+        physical = {}
+        if learning:
+            inputs = torch.stack([current[i][1] for i in learning])
+            raw_actions, log_probs, values = actor.act(inputs)
+            inputs, raw_actions, log_probs, values = (item.cpu() for item in (inputs, raw_actions, log_probs, values))
+            base = np.stack([current[i][0] for i in learning])
+            actions = compose_residual_action(base, raw_actions, runner.stats["action_std"], residual_scale)
+            # Mean Euclidean target-position correction across both arms, in metres.
+            position_residuals = np.linalg.norm(
+                (actions - base)[:, [0, 1, 2, 8, 9, 10]].reshape(-1, 2, 3), axis=-1,
+            ).mean(axis=-1)
+            physical.update(zip(learning, actions.tolist()))
+        for i in active:
+            if i not in physical:
+                physical[i] = prefixes[i]["actions"][control_step - 1]
+        results = env.step_batch([physical[i] for i in active], active)
         if len(results) != len(active):
             raise ValueError("Environment step results must follow active scene order.")
         # Include truncated terminal frames for bootstrapping, exclude true terminals.
@@ -182,7 +220,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             _, _, bootstrap_values = actor.act(next_features, deterministic=True)
             next_current = {i: (next_chunks[pos][0], next_features[pos])
                             for pos, i in enumerate(bootstrap_ids)}
-            next_values = {i: bootstrap_values[pos] for pos, i in enumerate(bootstrap_ids)}
+            next_values = dict(zip(bootstrap_ids, bootstrap_values.cpu().tolist()))
         remaining = []
         for pos, (i, result) in enumerate(zip(active, results)):
             observation, score, terminated, truncated, _ = result
@@ -195,6 +233,35 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             step_positions = _block_positions(privileged_after[pos])
             terms, bonus = rewards[i].step(observation["proprio"], privileged_after[pos])
             next_potential = terms["phi"]
+            event_bonus = terms.get("event_bonus", bonus)
+            if i not in sample_positions:
+                if score != 0 or ended:
+                    raise RuntimeError(f"Post-grasp prefix crossed a task score or episode end in layout {seeds[i]}.")
+                check_frame(prefixes[i], control_step, observation, privileged_after[pos], event_bonus)
+                potentials[i] = next_potential
+                if control_step == prefix_steps[i]:
+                    check_grasp(prefixes[i], rewards[i])
+                    initial_terms[i] = terms
+                    initial_grasps[i] = {key: dict(counts)
+                                         for key, counts in rewards[i].grasp_attempts.items()}
+                    extrema[i]["max_manipulation_progress"] = terms["manipulation_progress"]
+                remaining.append(i)
+                continue
+            if i in recordings:
+                if score != 0 or ended:
+                    del recordings[i]
+                else:
+                    recording = recordings[i]
+                    recording["actions"].append(physical[i])
+                    recording["frames"].append(capture_frame(observation, privileged_after[pos], event_bonus))
+                    for grasp in rewards[i].transport_attempts:
+                        if grasp["grasp_step"] == control_step:
+                            capture_prefix(dict(recordings.pop(i), layout_id=int(seeds[i]), scene=i,
+                                                width=len(seeds), arm=grasp["arm"], carried=grasp["carried"],
+                                                target_lower=grasp["target_lower"],
+                                                reward_digest=reward_digest(reward_cfg)))
+                            break
+            sample = sample_positions[i]
             # A true terminal is absorbing with zero potential. Time-limit
             # truncations keep phi(next), matching their retained value bootstrap.
             shaping = gamma * (0.0 if terminated else next_potential) - potentials[i]
@@ -207,7 +274,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             discounted_returns[i] += gamma ** (step - 1) * reward
             nonzero_rewards[i] += int(reward != 0)
             negative_rewards[i] += int(reward < 0)
-            position_residual_sums[i] += float(position_residuals[pos])
+            position_residual_sums[i] += float(position_residuals[sample])
             if score >= PARTIAL_SCORE and first_partial_steps[i] is None:
                 first_partial_steps[i] = step
             previous_scores[i] = score
@@ -234,9 +301,9 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                 ex["first_both_open_step"] = step
             if ex["first_settled_step"] is None and terms["settled_pair"] > 0.0:
                 ex["first_settled_step"] = step
-            trajectories[i].append((inputs[pos].cpu(), raw_actions[pos].cpu(),
-                                    log_probs[pos].cpu(), values[pos].cpu(), reward,
-                                    0.0 if terminated else float(next_values[i]),
+            trajectories[i].append((inputs[sample], raw_actions[sample],
+                                    log_probs[sample], values[sample], reward,
+                                    0.0 if terminated else next_values[i],
                                     bool(terminated), ended))
             if ended:
                 # Diagnostics only: measured final-state potential (terminal
@@ -252,17 +319,27 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                         pair_dz.append(float(pb[2] - pa[2]))
                 proprio_final = np.asarray(observation["proprio"], dtype=np.float64)
                 episodes.append({"layout_id": int(seeds[i]), "length": len(trajectories[i]),
+                                 "prefix_steps": prefix_steps[i],
                                  "final_score": score, "peak_score": peak_scores[i],
                                  "success": bool(terminated and score == SUCCESS_SCORE),
                                  "terminated": bool(terminated), "truncated": bool(truncated),
                                  "episode_return": episode_returns[i],
                                  "shaping_return": shaping_returns[i],
-                                 "milestone_return": rewards[i].milestone_return,
+                                 "milestone_return": terms["milestone_return"] - terms0["milestone_return"],
                                  "milestone_steps": dict(rewards[i].milestone_steps),
+                                 **({"dense_approach_return": terms["dense_approach_return"]
+                                     - terms0["dense_approach_return"],
+                                     "dense_transport_return": terms["dense_transport_return"]
+                                     - terms0["dense_transport_return"],
+                                     "release_steps": dict(rewards[i].release_steps)}
+                                    if "dense_transport_return" in terms else {}),
                                  "grasp_steps_by_block": dict(rewards[i].grasp_steps_by_block),
                                  "grasp_attempts": rewards[i].grasp_attempts,
-                                 "waypoint_return": terms["waypoint_return"],
-                                 "waypoint_counts": terms["waypoint_counts"],
+                                 "grasp_attempts_prefix": initial_grasps.get(i, {}),
+                                 "transport_attempts": rewards[i].transport_attempts,
+                                 "waypoint_return": terms["waypoint_return"] - terms0["waypoint_return"],
+                                 "waypoint_counts": {key: count - terms0["waypoint_counts"][key]
+                                                     for key, count in terms["waypoint_counts"].items()},
                                  "phi_base_final": terms["phi_base"],
                                  "base_score_final": terms["base_score"],
                                  "stable_tower_levels_final": terms["stable_tower_levels"],
@@ -335,10 +412,16 @@ def concatenate_batches(batches):
                       for field in PPOBatch.__dataclass_fields__))
 
 
+def _suffix_grasp_attempts(episode: dict) -> list[dict]:
+    prefix = episode["grasp_attempts_prefix"]
+    return [{name: value - prefix.get(key, {}).get(name, 0) for name, value in counts.items()}
+            for key, counts in episode["grasp_attempts"].items()]
+
+
 def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: float) -> dict:
     """Summarize genuine rollout samples before PPO normalizes advantages."""
     actions = batch.actions
-    attempts = [counts for ep in episodes for counts in ep["grasp_attempts"].values()]
+    attempts = [counts for episode in episodes for counts in _suffix_grasp_attempts(episode)]
     arrivals = sum(counts["arrivals"] for counts in attempts)
     confirmed = sum(counts["confirmed"] for counts in attempts)
     return {
@@ -349,6 +432,7 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
             sum(counts["steps_to_grasp"] for counts in attempts) / confirmed
             if confirmed else None),
         "rollout_steps": len(batch.features),
+        "replayed_prefix_steps": sum(ep.get("prefix_steps", 0) for ep in episodes),
         "episodes_this_update": len(episodes),
         "success_count": sum(ep["success"] for ep in episodes),
         "success_rate": float(np.mean([ep["success"] for ep in episodes])),
@@ -364,7 +448,7 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
         "mean_phi_base": float(np.mean([ep["phi_base_final"] for ep in episodes])),
         "mean_base_score": float(np.mean([ep["base_score_final"] for ep in episodes])),
         "mean_stable_tower_levels": float(np.mean([ep["stable_tower_levels_final"] for ep in episodes])),
-        **{f"episodes_with_milestone_{name}": sum(ep["milestone_steps"][name] is not None
+        **{f"episodes_with_milestone_{name}": sum((ep["milestone_steps"][name] or 0) > ep.get("prefix_steps", 0)
                                                 for ep in episodes)
            for name in ("grasp", "base", "pair2", "pair3")},
         "mean_discounted_return": float(np.mean([ep["discounted_return"] for ep in episodes])),
@@ -429,6 +513,13 @@ def _mean_policy_metrics(actor, features, action_std, residual_scale):
     }
 
 
+def _reward_config(config):
+    return {**{key: require(config, key) for key in REWARD_KEYS},
+            "transport_to_support": config.get("transport_to_support", False),
+            **({"dense_transport_reward": config["dense_transport_reward"]}
+               if config.get("dense_transport_reward", False) is not False else {})}
+
+
 def _validate_config(config):
     _validate_task(config)
     updates, episodes, width = parallel_plan(config)
@@ -446,7 +537,10 @@ def _validate_config(config):
         value = float(require(config, key))
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{key} must be positive and finite.")
-    validate_reward_config({key: require(config, key) for key in REWARD_KEYS})
+    validate_reward_config(_reward_config(config))
+    if "post_grasp_prefix_file" in config and (not isinstance(config["post_grasp_prefix_file"], str)
+                                               or not config["post_grasp_prefix_file"].strip()):
+        raise ValueError("post_grasp_prefix_file must be a path to a nonempty replay archive.")
     if not isinstance(require(config, "learn_std"), bool):
         raise ValueError("learn_std must be a boolean.")
     if not 0 <= float(require(config, "entropy_coef")) < math.inf:
@@ -480,6 +574,17 @@ def train_online(config: dict) -> Path:
     resume = policy_type == "act_residual_ppo"
     seed = int(require(config, "seed"))
     layout_ids = list(require(config, "rollout_layout_ids"))
+    reward_cfg = _reward_config(config)
+    replay_cycle = math.lcm(len(layout_ids), width)
+    prefix_archive = {}
+    if "post_grasp_prefix_file" in config:
+        archive = Path(config["post_grasp_prefix_file"]).expanduser()
+        if not archive.is_absolute():
+            archive = REPO_ROOT / archive
+        prefix_archive = load_prefixes(archive, width, layout_ids, reward_cfg)
+        slots = {(layout_ids[i % len(layout_ids)], i % width) for i in range(replay_cycle)}
+        if not prefix_archive.keys() <= slots:
+            raise ValueError("Replay layout/scene does not match the rollout schedule.")
     learning_rate = float(require(config, "lr"))
     critic_learning_rate = float(require(config, "critic_lr"))
 
@@ -567,14 +672,16 @@ def train_online(config: dict) -> Path:
         "baseline_pins": (REPO_ROOT / "third_party/pins.lock").read_text(encoding="utf-8"),
         "metrics_scope": "stochastic training rollouts; not held-out evaluation",
         "reward": "Public-score deltas + physical-state PBRS gamma*phi(next)-phi(current) "
-                  "+ ordered approach and carry waypoints + grasp and placement milestones. "
+                  + ("+ dense approach and carry progress + grasp, release and settling events. "
+                     if reward_cfg.get("dense_transport_reward") else
+                     "+ ordered approach and carry waypoints + grasp and placement milestones. ") +
                   "True terminals force phi=0; time truncations retain phi and bootstrap. "
                   "Grasp and placement use measured jaw aperture, lift, support geometry, "
                   "release and low velocity as proxies. "
                   "The configured target region and trajectory events add internal preferences. "
                   "The policy does not receive route, latch or dwell history. "
                   "Official scores use the 0/15/100 task logic.",
-        "reward_config": {key: config[key] for key in REWARD_KEYS},
+        "reward_config": dict(reward_cfg),
         "exploration_std": "fixed-std resume applies the configured initial_std to log_std; "
                            "learn_std=true resumes keep the learned log_std and its moments",
         "episode_diagnostics": "phi_initial/final/mean are measured potentials (phi_final is the "
@@ -616,8 +723,6 @@ def train_online(config: dict) -> Path:
     from starter.policies.act_online_metrics import metric_row, plot_online_training
 
     env = RemoteEnv(str(require(config, "env_host")), int(require(config, "env_port")))
-    # Simulator startup and checkpoint loading are outside the training budget.
-    started = time.monotonic()
     episode_count = completed_updates = 0
     stop_reason = "completed"
     expected_waves = episodes_per_update // width
@@ -625,11 +730,17 @@ def train_online(config: dict) -> Path:
           f"rollout_layout_ids={layout_ids}; budget={max_train_seconds:.0f}s; "
           f"output={output}", flush=True)
     try:
+        env.connect()
+        started = time.monotonic()
+        print("[train] simulator connected; training budget started", flush=True)
         with ((output / "metrics.jsonl").open("x", encoding="utf-8") as metrics,
               (output / "metrics.csv").open("x", encoding="utf-8", newline="") as table,
               (output / "episodes.jsonl").open("x", encoding="utf-8") as episode_log,
               (output / "episodes.csv").open("x", encoding="utf-8", newline="") as episode_table):
-            writer = episode_writer = None
+            writer = None
+            episode_writer = csv.DictWriter(episode_table, fieldnames=_EPISODE_CSV_FIELDS,
+                                            extrasaction="ignore")
+            episode_writer.writeheader()
             for local_update in range(1, updates + 1):
                 absolute_update = start_update + local_update
                 update_started = time.monotonic()
@@ -646,11 +757,15 @@ def train_online(config: dict) -> Path:
                     # Cycle through the selected curriculum layouts; persist the
                     # cursor so short rounds and resumed runs keep equal coverage.
                     seeds = [layout_ids[(layout_cursor + i) % len(layout_ids)] for i in range(width)]
+                    # Alternate complete slot/layout cycles so original starts stay represented.
+                    prefixes = ({i: prefix_archive[layout, i] for i, layout in enumerate(seeds)
+                                 if (layout, i) in prefix_archive}
+                                if (layout_cursor // replay_cycle) % 2 else {})
                     wave_started = time.monotonic()
                     batch, wave_episodes = collect_wave(
                         env, runner, residual, seeds, gamma=float(config["gamma"]),
                         gae_lambda=float(config["gae_lambda"]), residual_scale=residual_scale,
-                        reward_cfg={key: config[key] for key in REWARD_KEYS},
+                        reward_cfg=reward_cfg, prefixes=prefixes,
                     )
                     layout_cursor += width
                     waves.append(batch)
@@ -662,10 +777,17 @@ def train_online(config: dict) -> Path:
                                           "episode": episode_count, "seed": seed,
                                           **episode}
                         episode_log.write(json.dumps(episode_record, allow_nan=False) + "\n")
-                        if episode_writer is None:
-                            episode_writer = csv.DictWriter(episode_table, fieldnames=list(episode_record))
-                            episode_writer.writeheader()
-                        episode_writer.writerow(episode_record)
+                        prefix_steps = episode["prefix_steps"]
+                        attempts = episode["transport_attempts"]
+                        grasp_counts = _suffix_grasp_attempts(episode)
+                        episode_writer.writerow({
+                            **episode_record,
+                            "arrivals": sum(counts["arrivals"] for counts in grasp_counts),
+                            "grasps": sum(counts["confirmed"] for counts in grasp_counts),
+                            "carries": sum((row["grasp_step"] or 0) > prefix_steps for row in attempts),
+                            **{name: sum((row[f"{name}_step"] or 0) > prefix_steps for row in attempts)
+                               for name in ("aligned", "opened", "settled")},
+                        })
                     episode_log.flush()
                     episode_table.flush()
                     print(f"[rollout] layouts={seeds} episodes={episode_count} "
@@ -700,7 +822,8 @@ def train_online(config: dict) -> Path:
                 now = time.monotonic()
                 elapsed = now - started
                 update_seconds = now - update_started
-                remaining = elapsed / local_update * (updates - local_update)
+                remaining = _remaining_seconds(elapsed, local_update, updates, max_train_seconds)
+                total = "budget" if updates == sys.maxsize else updates
                 vram = _vram_stats(device)
                 budget_limited = len(waves) < expected_waves
                 record = {"update": local_update, "absolute_update": absolute_update,
@@ -729,7 +852,7 @@ def train_online(config: dict) -> Path:
                               f"reserved={vram['reserved_gib']:.2f}GiB "
                               f"peak={vram['peak_allocated_gib']:.2f}GiB "
                               f"total={vram['total_gib']:.2f}GiB (learner PyTorch)")
-                print(f"update {local_update}/{updates} (absolute {absolute_update}): steps={global_step} "
+                print(f"update {local_update}/{total} (absolute {absolute_update}): steps={global_step} "
                       f"waves={len(waves)}/{expected_waves} "
                       f"success={record['success_count']}/{len(episodes)} ({record['success_rate']:.1%}) "
                       f"partial={record['partial_rate']:.1%} score={record['mean_final_score']:.2f} | "

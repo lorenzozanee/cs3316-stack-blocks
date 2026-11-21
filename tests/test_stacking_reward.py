@@ -533,6 +533,23 @@ class SupportRejectionTests(unittest.TestCase):
         fast_angular["block_1"] = [0.0, 0.0, 0.2]
         self.assertFalse(self._terms(positions, angular=fast_angular)["pair2_ok"])
 
+    def test_control_motion_drives_settling_with_raw_velocities_preserved(self):
+        positions = self._base_positions()
+        angular = {label: [0.0, 0.0, 0.213] for label in BLOCK_LABELS}
+        state = _state(positions, angular=angular)
+        state["settle_speeds"] = {label: [0.0, 0.0] for label in BLOCK_LABELS}
+        action = _proprio()
+        reward = StackingReward(state, action, _cfg())
+        first = reward.terms(action, state)
+        after, bonus = reward.step(action, state)
+        self.assertTrue(first["pair2_ok"])
+        self.assertEqual(first["phi"], after["phi"])
+        self.assertEqual(bonus, 0.0)
+        self.assertEqual(state["block_velocities"]["block_1"]["angular"], angular["block_1"])
+        for speed in ([0.011, 0.0], [0.0, 0.101]):
+            state["settle_speeds"]["block_1"] = speed
+            self.assertFalse(reward.terms(action, state)["pair2_ok"])
+
     def test_hard_speed_threshold_is_not_a_soft_product(self):
         positions = self._base_positions()
         at_limit = {label: [0.0, 0.0, 0.0] for label in BLOCK_LABELS}
@@ -1192,6 +1209,641 @@ class WaypointRewardTests(unittest.TestCase):
         terms = self._hold(reward, positions, label, start + 0.8 * (goal - start))
         self.assertEqual(terms["waypoint_counts"]["carry:block_1"], 0)
         self.assertIsNone(reward.milestone_steps["pair2"])
+
+
+class SupportTransportTests(unittest.TestCase):
+    carried, lower, spare = BLOCK_LABELS
+    route = f"carry:{carried}"
+
+    def setUp(self):
+        self.positions = {
+            self.carried: np.array([-0.28, 0.16, TOP + HALF + 0.12]),
+            self.lower: np.array([0.04, 0.16, TOP + HALF]),
+            self.spare: np.array([-0.28, -0.36, TOP + HALF]),
+        }
+        self.start = self.positions[self.carried].copy()
+        self.goal = self.positions[self.lower] + [0, 0, SIZE]
+
+    def _step(self, reward, point, *, opening=REAL_GRIP_30, arm=0,
+              other_opening=1.0, other_point=None, **physical):
+        positions = {**self.positions, self.carried: point}
+        wrists = {("left", "right")[arm]: WaypointRewardTests._wrist(point)}
+        if other_point is not None:
+            wrists[("right", "left")[arm]] = WaypointRewardTests._wrist(other_point)
+        measured = (opening, other_opening) if arm == 0 else (other_opening, opening)
+        return reward.step(_proprio(**wrists), _state(positions=positions, measured=measured, **physical))
+
+    def _confirm(self, reward, arm=0, **physical):
+        for _ in range(3):
+            terms, _ = self._step(reward, self.start, arm=arm, **physical)
+        return terms
+
+    def test_transport_flag_is_strictly_boolean(self):
+        for value in (0, 1, None, "false"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "transport_to_support"):
+                _reward(transport_to_support=value)
+
+    def test_post_confirmation_potential_and_waypoints_use_same_off_target_top(self):
+        sizes = _extents({label: [side] * 3 for label, side in zip(BLOCK_LABELS, (SIZE, 0.04, SIZE))})
+        self.positions[self.lower][2] = TOP + 0.02
+        self.goal = self.positions[self.lower] + [0, 0, 0.02 + HALF]
+        control = _reward(extents=sizes)
+        enabled = _reward(extents=sizes, transport_to_support=True)
+        for _ in range(2):
+            observed, _ = self._step(enabled, self.start, extents=sizes)
+            baseline, _ = self._step(control, self.start, extents=sizes)
+            self.assertEqual(observed, baseline)
+            self.assertEqual(enabled.transport_attempts, [])
+        observed, _ = self._step(enabled, self.start, extents=sizes)
+        baseline, _ = self._step(control, self.start, extents=sizes)
+        self.assertGreater(observed["phi_manipulation"], baseline["phi_manipulation"])
+        self.assertEqual(enabled.transport_attempts[0]["target_lower"], self.lower)
+        self.assertIsNone(control.transport_attempts[0]["target_lower"])
+        self.assertEqual(enabled.transport_attempts[0]["grasp_step"], 3)
+        np.testing.assert_allclose(enabled._carry[self.carried][1].target, self.goal)
+
+        self.positions[self.lower][0] += 0.001
+        self.goal[0] += 0.001
+        observed, _ = self._step(enabled, self.start, extents=sizes)
+        self.assertEqual(observed["waypoint_counts"][self.route], 0)
+        np.testing.assert_allclose(enabled._carry[self.carried][1].target, self.goal)
+        point = self.start + 0.80 * (self.goal - self.start)
+        observed, _ = self._step(enabled, point, extents=sizes)
+        baseline, _ = self._step(control, point, extents=sizes)
+        self.assertEqual(observed["waypoint_counts"][self.route], 3)
+        self.assertEqual(baseline["waypoint_counts"][self.route], 0)
+        self.assertGreater(observed["phi_manipulation"], baseline["phi_manipulation"])
+        self.assertFalse(observed["base_ok"])
+        self.assertEqual(observed["stable_tower_levels"], 0)
+
+    def test_target_motion_cannot_cross_a_waypoint_for_stationary_carried_block(self):
+        reward = _reward(transport_to_support=True)
+        self._confirm(reward)
+        point = self.start + 0.249 * (self.goal - self.start)
+        terms, _ = self._step(reward, point)
+        self.assertEqual(terms["waypoint_counts"][self.route], 0)
+        self.positions[self.lower][0] -= 0.004
+        terms, _ = self._step(reward, point)
+        path = reward._carry[self.carried][1]
+        self.assertGreater((point - path.start) @ path.axis, path.spacing)
+        self.assertEqual(terms["waypoint_counts"][self.route], 0)
+        self._step(reward, self.start)
+        terms, _ = self._step(reward, point)
+        self.assertEqual(terms["waypoint_counts"][self.route], 1)
+
+    def test_invalidation_cannot_hop_or_resume_until_fresh_same_arm_confirmation(self):
+        reward = _reward(transport_to_support=True)
+        self._confirm(reward)
+        # Another released tabletop block becomes closer without disturbing the chosen one.
+        self.positions[self.spare] = self.start * [1, 1, 0] + [0.0, -0.04, TOP + HALF]
+        self._step(reward, self.start)
+        np.testing.assert_allclose(reward._carry[self.carried][1].target, self.goal)
+
+        point = self.start + 0.80 * (self.goal - self.start)
+        fast = {label: [0.0, 0.0, 0.0] for label in BLOCK_LABELS}
+        fast[self.lower] = [0.02, 0.0, 0.0]
+        invalid, _ = self._step(reward, point, linear=fast)
+        self.assertEqual(invalid["waypoint_counts"][self.route], 0)
+        self.assertNotIn(self.carried, reward._carry)
+        recovered, _ = self._step(reward, point)
+        self.assertEqual(recovered["waypoint_counts"][self.route], 0)
+        self.assertEqual(recovered["phi_manipulation"], invalid["phi_manipulation"])
+        self.assertEqual(len(reward.transport_attempts), 1)
+        self.assertEqual(reward.transport_attempts[0]["target_lower"], self.lower)
+
+        # A new attempt starts only after the original hold is lost and the new arm dwells.
+        self._step(reward, self.start, opening=1.0)
+        for _ in range(2):
+            self._step(reward, self.start, arm=1)
+            self.assertEqual(len(reward.transport_attempts), 1)
+        self._step(reward, self.start, arm=1)
+        self.assertEqual([row["arm"] for row in reward.transport_attempts], [0, 1])
+        self.assertEqual(reward.transport_attempts[-1]["target_lower"], self.spare)
+        np.testing.assert_allclose(reward._carry[self.carried][1].target,
+                                   self.positions[self.spare] + [0, 0, SIZE])
+        self.assertAlmostEqual(reward.milestone_return, M_GRASP)
+
+    def test_initial_fixed_table_fallback_stays_fixed_when_support_becomes_eligible(self):
+        reward = _reward(transport_to_support=True)
+        # One is hovering above the hard table-gap tolerance; one is closed in the other arm.
+        self.positions[self.lower][2] += 0.001
+        self._confirm(reward, other_opening=REAL_GRIP_30, other_point=self.positions[self.spare])
+        first = reward.transport_attempts[0]
+        self.assertIsNone(first["target_lower"])
+        fixed = np.array([0.0, -0.2, TOP + HALF])
+        np.testing.assert_allclose(reward._carry[self.carried][1].target, fixed)
+        self.positions[self.lower][2] -= 0.001
+        terms, _ = self._step(reward, self.start + 0.80 * (fixed - self.start))
+        self.assertEqual(terms["waypoint_counts"][self.route], 3)
+        self.assertIsNone(first["target_lower"])
+
+    def test_off_target_timeline_requires_alignment_open_and_quiet_same_id_dwell(self):
+        for enabled in (False, True):
+            with self.subTest(transport_to_support=enabled):
+                reward = _reward(transport_to_support=enabled)
+                self._confirm(reward)
+                hover = self.goal + [0, 0, 0.005]
+                held, _ = self._step(reward, hover)
+                self.assertEqual(held["settled_pair"], 0.0)
+                row = reward.transport_attempts[0]
+                self.assertEqual(row["aligned_step"], 4)
+                self.assertEqual(row["lower"], self.lower)
+                self.assertIsNone(row["opened_step"])
+
+                # Hovering while open does not count as settled, even if it is quiet for many steps.
+                for _ in range(4):
+                    self._step(reward, hover, opening=1.0, other_opening=EMPTY_CLOSED)
+                self.assertEqual(row["opened_step"], 5)
+                self.assertIsNone(row["settled_step"])
+                noisy = {label: [0.0, 0.0, 0.0] for label in BLOCK_LABELS}
+                noisy[self.carried] = [0, 0, 0.02]
+                self._step(reward, self.goal, opening=1.0)
+                self._step(reward, self.goal, opening=1.0, linear=noisy)
+                self._step(reward, self.goal, opening=1.0)
+                self._step(reward, self.goal, opening=1.0)
+                for _ in range(3):
+                    reward.terms(_proprio(), _state(positions={**self.positions, self.carried: self.goal}))
+                self.assertIsNone(row["settled_step"])
+                terms, _ = self._step(reward, self.goal, opening=1.0)
+                self.assertEqual(row["settled_step"], 13)
+                self.assertFalse(terms["pair2_ok"])
+                self.assertIsNone(reward.milestone_steps["pair2"])
+                terminal_row = dict(row)
+                for _ in range(3):
+                    self._step(reward, hover, opening=1.0)
+                self.assertEqual(reward.transport_attempts, [terminal_row])
+                self.assertEqual(_reward(transport_to_support=enabled).transport_attempts, [])
+
+    def test_timeline_preserves_alignment_through_partial_jaw_opening(self):
+        for enabled in (False, True):
+            with self.subTest(transport_to_support=enabled):
+                reward = _reward(transport_to_support=enabled)
+                self._confirm(reward)
+                self._step(reward, self.goal)
+                partial = self._step(reward, self.goal, opening=0.65)[0]
+                self.assertFalse(partial["grasp_ok"])
+                row = reward.transport_attempts[0]
+                self.assertEqual(row["aligned_step"], 4)
+                self.assertIsNone(row["opened_step"])
+                for _ in range(3):
+                    self._step(reward, self.goal, opening=0.8)
+                self.assertEqual(row["opened_step"], 6)
+                self.assertEqual(row["settled_step"], 8)
+
+    def test_timeline_never_switches_aligned_lower_or_counts_wrong_arm_open(self):
+        reward = _reward(transport_to_support=True)
+        self._confirm(reward)
+        self._step(reward, self.goal)
+        row = reward.transport_attempts[0]
+        self.assertEqual(row["lower"], self.lower)
+        other_goal = self.positions[self.spare] + [0, 0, SIZE]
+        self._step(reward, other_goal)
+        for _ in range(3):
+            self._step(reward, other_goal, opening=1.0)
+        self.assertIsNone(row["opened_step"])
+        self.assertIsNone(row["settled_step"])
+
+        self._confirm(reward)
+        self._step(reward, self.goal)
+        row = reward.transport_attempts[-1]
+        for _ in range(3):
+            # The grasping arm closes without a cube; the other hand is open.
+            self._step(reward, self.goal, opening=EMPTY_CLOSED)
+        self.assertEqual(row["lower"], self.lower)
+        self.assertIsNone(row["opened_step"])
+        self.assertIsNone(row["settled_step"])
+
+    def test_two_layer_tabletop_tower_is_a_carry_destination(self):
+        reward = _reward(transport_to_support=True)
+        self.positions[self.spare] = np.array([-0.28, -0.36, TOP + HALF])
+        self.positions[self.lower] = self.positions[self.spare] + [0, 0, SIZE]
+        self._confirm(reward)
+        row = reward.transport_attempts[0]
+        self.assertEqual(row["target_lower"], self.lower)
+        self.assertEqual(reward._carry_destinations[self.carried].anchor,
+                         (self.spare, self.lower))
+        np.testing.assert_allclose(reward._carry[self.carried][1].target,
+                                   self.positions[self.lower] + [0, 0, SIZE])
+
+    def test_blocking_neighbor_body_removes_the_target_slot(self):
+        tilt = np.pi / 4
+        half = 0.5 * SIZE * (abs(np.sin(tilt)) + abs(np.cos(tilt)))
+        rotations = {label: [1.0, 0.0, 0.0, 0.0] for label in BLOCK_LABELS}
+        rotations[self.spare] = [float(np.cos(tilt)), 0.0, float(np.sin(tilt)), 0.0]
+        reward = _reward(transport_to_support=True)
+        # A tilted neighbour on the table is not itself a released destination,
+        # but its projected body fills the slot above the lower block.
+        self.positions[self.spare] = np.array(
+            [self.positions[self.lower][0] + 0.024, self.positions[self.lower][1],
+             TOP + half])
+        self._confirm(reward, rotations=rotations)
+        row = reward.transport_attempts[0]
+        self.assertIsNone(row["target_lower"])
+        self.assertEqual(reward._carry_destinations[self.carried].anchor, ())
+
+    def test_wrong_arm_takeover_cannot_open_or_settle_the_old_attempt(self):
+        for enabled in (False, True):
+            with self.subTest(transport_to_support=enabled):
+                reward = _reward(transport_to_support=enabled)
+                self._confirm(reward)
+                self._step(reward, self.goal)
+                row = reward.transport_attempts[0]
+                self.assertEqual(row["aligned_step"], 4)
+                self.assertIsNone(row["opened_step"])
+                # The grasping arm leaves for another block while the carried block
+                # rests on the lower one; a vacuum release must not credit it.
+                carried = {**self.positions, self.carried: self.goal}
+                elsewhere = WaypointRewardTests._wrist(self.positions[self.spare] + [0, 0, 0.1])
+                for opening in (0.65, 0.65, 0.8, 0.8):
+                    reward.step(_proprio(left=elsewhere),
+                                _state(positions=carried, measured=(opening, EMPTY_CLOSED)))
+                self.assertIsNone(row["opened_step"])
+                self.assertIsNone(row["settled_step"])
+
+    def test_reclosing_after_a_lost_hold_needs_a_fresh_confirmed_grasp(self):
+        for enabled in (False, True):
+            with self.subTest(transport_to_support=enabled):
+                reward = _reward(transport_to_support=enabled)
+                self._confirm(reward)
+                self._step(reward, self.goal)
+                row = reward.transport_attempts[0]
+                self.assertEqual(row["lower"], self.lower)
+                self._step(reward, self.goal, opening=0.65)
+                self._step(reward, self.goal, opening=REAL_GRIP_30)
+                for _ in range(3):
+                    self._step(reward, self.goal, opening=0.8)
+                self.assertIsNone(row["opened_step"])
+                self.assertIsNone(row["settled_step"])
+
+    def test_hard_tower_disturbance_invalidates_then_fresh_attempt_uses_tabletop_support(self):
+        reward = _reward(transport_to_support=True)
+        self.positions[self.lower] = np.array([0, -0.2, TOP + HALF])
+        for _ in range(3):
+            reward.step(_proprio(), _state(positions=self.positions))
+        self._confirm(reward)
+        self.assertEqual(reward.transport_attempts[0]["target_lower"], self.lower)
+        self.positions[self.lower][2] += 0.02
+        terms, _ = self._step(reward, self.start + 0.8 * (np.array([0, -0.2, TOP + 3 * HALF]) - self.start))
+        self.assertEqual(terms["waypoint_counts"][self.route], 0)
+        self.assertNotIn(self.carried, reward._carry)
+        self._step(reward, self.start, opening=1.0)
+        self._confirm(reward)
+        self.assertEqual(reward.transport_attempts[-1]["target_lower"], self.spare)
+        goal = self.positions[self.spare] + [0, 0, SIZE]
+        terms, _ = self._step(reward, self.start + 0.8 * (goal - self.start))
+        self.assertEqual(terms["waypoint_counts"][self.route], 3)
+        self.assertEqual(reward.milestone_steps["base"], 3)
+        self.assertIsNone(reward.milestone_steps["pair2"])
+
+    def test_established_hard_tower_top_and_hard_milestones_are_preserved(self):
+        reward = _reward(transport_to_support=True)
+        tower = _tower_positions()
+        # The tracked carried block will be placed on the existing two-block tower.
+        self.positions[self.lower] = np.array(tower[self.carried])
+        self.positions[self.spare] = np.array(tower[self.lower])
+        for _ in range(3):
+            reward.step(_proprio(), _state(positions=self.positions))
+        self.assertEqual(reward.milestone_steps, dict(grasp=None, base=3, pair2=3, pair3=None))
+        self._confirm(reward)
+        self.assertEqual(reward.transport_attempts[0]["target_lower"], self.spare)
+        goal = np.array(tower[self.spare])
+        np.testing.assert_allclose(reward._carry[self.carried][1].target, goal)
+        self._step(reward, goal)
+        for _ in range(3):
+            terms, _ = self._step(reward, goal, opening=1.0)
+        self.assertTrue(terms["pair3_ok"])
+        self.assertEqual(reward.milestone_steps["pair3"], 10)
+        self.assertEqual(reward.transport_attempts[0]["settled_step"], 10)
+        self.assertAlmostEqual(reward.milestone_return, M_LEVEL + M_GRASP)
+
+
+class DenseRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.reset = _reset()
+        self.positions = WaypointRewardTests._positions(self.reset)
+        self.reward = _reward(dense_transport_reward=True)
+        self.base_goal = np.array([0.0, -0.2, TOP + HALF])
+
+    def step_at(self, label, point, opening=REAL_GRIP_30, *, arm=0, linear=None):
+        self.positions[label] = np.array(point)
+        wrist = WaypointRewardTests._wrist(point)
+        proprio = _proprio(**{("left", "right")[arm]: wrist})
+        measured = (opening, 1.0) if arm == 0 else (1.0, opening)
+        return self.reward.step(proprio, _state(self.positions, measured=measured, linear=linear))
+
+    def lift(self, label, start, *, arm=0):
+        for _ in range(3):
+            self.step_at(label, start, arm=arm)
+
+    def test_approach_rewards_small_steps_without_repaying_motion_or_moving_target(self):
+        label = BLOCK_LABELS[0]
+        point = self.positions[label].copy()
+        start = point + [0.0, -0.19, 0.0]
+        wrist = lambda offset: _proprio(left=WaypointRewardTests._wrist(start + [0.0, offset, 0.0]))
+        self.reward = StackingReward(self.reset, wrist(0.0), _cfg(dense_transport_reward=True))
+        for offset in (0.005, 0.010, 0.015):
+            terms, bonus = self.reward.step(wrist(offset), self.reset)
+            self.assertGreater(bonus, 0.0)
+            self.assertEqual(terms["dense_transport_return"], 0.0)
+            self.assertFalse(any(terms["waypoint_counts"].values()))
+        for offset in (0.005, 0.015, 0.015):
+            self.assertEqual(self.reward.step(wrist(offset), self.reset)[1], 0.0)
+        self.positions[label] = point + [0.0, -0.01, 0.0]
+        self.assertEqual(self.reward.step(wrist(0.015), _state(self.positions))[1], 0.0)
+
+    def test_displaced_base_can_earn_unused_approach_progress(self):
+        label = BLOCK_LABELS[0]
+        self.positions[label] = self.base_goal.copy()
+        point = self.base_goal + [0.06, 0.0, 0.0]
+        far = _proprio(left=WaypointRewardTests._wrist(point + [0.0, -0.10, 0.0]))
+        near = _proprio(left=WaypointRewardTests._wrist(point + [0.0, -0.02, 0.0]))
+        for _ in range(3):
+            self.reward.step(far, _state(self.positions))
+        self.assertIsNotNone(self.reward.milestone_steps["base"])
+        key = ("approach", label)
+        before = self.reward._progress_credit.get(key, 0.0)
+        self.positions[label] = point
+        self.reward.step(far, _state(self.positions))
+        self.assertEqual(self.reward._progress_credit.get(key, 0.0), before)
+        self.reward.step(near, _state(self.positions))
+        paid = self.reward._progress_credit[key]
+        self.assertGreater(paid, before)
+        for action in (far, near):
+            self.reward.step(action, _state(self.positions))
+        self.assertEqual(self.reward._progress_credit[key], paid)
+
+    def test_carried_progress_starts_after_confirmation_and_survives_retry(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0, 0, 0.07]
+        delta = self.base_goal - start
+        for factor in (0.00, 0.01, 0.02):
+            terms, _ = self.step_at(label, start + factor * delta)
+            self.assertEqual(terms["dense_transport_return"], 0.0)
+        last = 0.0
+        for factor in (0.03, 0.04, 0.05):
+            terms, _ = self.step_at(label, start + factor * delta)
+            self.assertGreater(terms["dense_transport_return"], last)
+            last = terms["dense_transport_return"]
+        for factor in (0.04, 0.05, 0.05):
+            terms, _ = self.step_at(label, start + factor * delta)
+            self.assertEqual(terms["dense_transport_return"], last)
+        self.step_at(label, start, opening=1.0)
+        self.lift(label, start)
+        terms, _ = self.step_at(label, start + 0.05 * delta)
+        self.assertEqual(terms["dense_transport_return"], last)
+        terms, _ = self.step_at(label, start + 0.06 * delta)
+        self.assertGreater(terms["dense_transport_return"], last)
+
+    def test_long_carry_pays_equal_credit_for_equal_new_progress(self):
+        label = BLOCK_LABELS[0]
+        start = self.base_goal + [0, -0.45, 0.07]
+        self.lift(label, start)
+        distance = np.linalg.norm(start - self.base_goal)
+        for fraction in (0.01, 0.02, 0.03):
+            terms, _ = self.step_at(label, start + fraction * (self.base_goal - start))
+            self.assertAlmostEqual(terms["dense_transport_return"], 0.45 * fraction)
+        terms, _ = self.step_at(label, self.base_goal)
+        self.assertAlmostEqual(terms["dense_transport_return"], 0.45)
+        self.assertGreater(distance, self.reward.cfg["placement_soft_scale"])
+
+    def test_release_and_dwell_are_separate_and_target_tracks_the_actual_tower(self):
+        before = self.reward.milestone_return
+        xy = self.base_goal[:2] + [0.005, 0.0]
+        for level, (label, placement, total) in enumerate(zip(
+                BLOCK_LABELS, ("base", "pair2", "pair3"), (M_BASE, M_PAIR2, M_PAIR3))):
+            goal = np.array([*xy, TOP + (2 * level + 1) * HALF])
+            start = self.positions[label] + [0.0, 0.0, 0.07]
+            self.lift(label, start)
+            before += M_GRASP
+            self.assertEqual(self.reward.transport_attempts[-1]["target_lower"],
+                             BLOCK_LABELS[level - 1] if level else None)
+            if level == 1:
+                initial, _ = self.step_at(label, start)
+                xy += [0.001, 0.0]
+                self.positions[BLOCK_LABELS[0]][:2] = xy
+                stationary, _ = self.step_at(label, start)
+                self.assertEqual(stationary["dense_transport_return"], initial["dense_transport_return"])
+                goal[:2] = xy
+            self.step_at(label, goal)
+            self.step_at(label, goal, opening=0.65)
+            self.assertIsNone(self.reward.release_steps[placement])
+            self.step_at(label, goal, opening=0.8)
+            self.assertIsNotNone(self.reward.release_steps[placement])
+            self.assertIsNone(self.reward.milestone_steps[placement])
+            self.assertAlmostEqual(self.reward.milestone_return, before + 0.6 * total)
+            fast = dict.fromkeys(BLOCK_LABELS, [0.0, 0.0, 0.0])
+            fast[label] = [0.02, 0.0, 0.0]
+            self.step_at(label, goal, opening=1.0, linear=fast)
+            for _ in range(2):
+                self.step_at(label, goal, opening=1.0)
+            self.assertIsNone(self.reward.milestone_steps[placement])
+            self.step_at(label, goal, opening=1.0)
+            self.assertIsNotNone(self.reward.milestone_steps[placement])
+            before += total
+            for _ in range(3):
+                terms, _ = self.step_at(label, goal, opening=1.0)
+            self.assertAlmostEqual(self.reward.milestone_return, before)
+        self.assertLessEqual(terms["dense_transport_return"], 3 * 0.45)
+        self.assertLessEqual(terms["dense_approach_return"], 3 * 0.45)
+
+    def test_temporary_support_motion_pauses_progress_without_losing_placed_identity(self):
+        base, upper, _ = BLOCK_LABELS
+        self.lift(base, self.positions[base] + [0, 0, 0.07])
+        self.step_at(base, self.base_goal)
+        for _ in range(3):
+            self.step_at(base, self.base_goal, opening=1.0)
+        start = self.positions[upper] + [0, 0, 0.07]
+        self.lift(upper, start)
+        before, _ = self.step_at(upper, start)
+        fast = dict.fromkeys(BLOCK_LABELS, [0.0, 0.0, 0.0])
+        fast[base] = [0.02, 0.0, 0.0]
+        goal = self.base_goal + [0, 0, SIZE]
+        middle = (start + goal) / 2
+        moving, _ = self.step_at(upper, middle, linear=fast)
+        recovered, _ = self.step_at(upper, middle)
+        self.assertEqual(moving["dense_transport_return"], before["dense_transport_return"])
+        self.assertEqual(recovered["dense_transport_return"], before["dense_transport_return"])
+        final, _ = self.step_at(upper, goal)
+        self.assertGreater(final["dense_transport_return"], before["dense_transport_return"])
+        for _ in range(3):
+            self.step_at(upper, goal, opening=1.0)
+        self.assertIsNotNone(self.reward.milestone_steps["pair2"])
+        self.assertEqual(len(self.reward.transport_attempts), 2)
+
+    def test_wrong_arm_and_off_goal_opening_do_not_pay_release_bonus(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0, 0, 0.07]
+        self.lift(label, start)
+        self.step_at(label, self.base_goal)
+        wrist = WaypointRewardTests._wrist(self.base_goal)
+        for _ in range(5):
+            # Arm 1 opens at the goal while arm 0 still holds the block.
+            self.reward.step(_proprio(left=wrist, right=wrist),
+                             _state(self.positions, measured=(REAL_GRIP_30, 1.0)))
+        self.assertIsNone(self.reward.release_steps["base"])
+        self.assertIsNone(self.reward.milestone_steps["base"])
+        self.lift(label, start)
+        before = self.reward.milestone_return
+        off_goal = self.base_goal + [0.05, 0.0, 0.04]
+        self.step_at(label, off_goal, opening=1.0)
+        for _ in range(5):
+            self.step_at(label, off_goal, opening=1.0)
+        self.assertIsNone(self.reward.release_steps["base"])
+        self.assertIsNone(self.reward.milestone_steps["base"])
+        self.assertAlmostEqual(self.reward.milestone_return, before)
+
+    def test_arrive_and_open_same_step_pays_release_and_settle(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0, 0, 0.07]
+        self.lift(label, start)
+        self.step_at(label, self.base_goal + [0, 0, 0.02])
+        self.step_at(label, self.base_goal, opening=0.8)
+        self.assertIsNotNone(self.reward.release_steps["base"])
+        for _ in range(2):
+            self.step_at(label, self.base_goal, opening=1.0)
+        self.assertIsNotNone(self.reward.milestone_steps["base"])
+        self.assertAlmostEqual(self.reward.milestone_return, M_GRASP + M_BASE)
+
+    def test_release_pays_when_the_same_arm_opens_at_the_goal_after_hold_loss(self):
+        for one_hold_frame in (False, True):
+            with self.subTest(one_hold_frame=one_hold_frame):
+                self.setUp()
+                label = BLOCK_LABELS[0]
+                near_goal = self.base_goal + [0, 0, 0.005]
+                self.lift(label, self.positions[label] + [0, 0, 0.07])
+                self.step_at(label, near_goal)
+                self.step_at(label, near_goal, opening=EMPTY_CLOSED)
+                if one_hold_frame:
+                    self.step_at(label, near_goal)
+                self.step_at(label, self.base_goal, opening=0.8)
+                self.assertIsNotNone(self.reward.release_steps["base"])
+                row = self.reward.transport_attempts[0]
+                self.assertIsNotNone(row["opened_step"])
+                self.assertEqual(row["end_reason"], "released")
+
+    def test_dropping_off_goal_ends_attempt_restores_approach_and_starts_fresh_attempt(self):
+        label = BLOCK_LABELS[0]
+        drop = self.positions[label] + [0.0, 0.0, 0.05]
+        self.lift(label, drop)
+        self.assertEqual(len(self.reward.transport_attempts), 1)
+        # Drop the block so it falls away from the gripper and off the goal.
+        landed = drop + [0.10, 0.0, -0.05]
+        self.positions[label] = landed.copy()
+        far = _proprio(left=WaypointRewardTests._wrist(landed + [0.0, -0.15, 0.0]))
+        near = _proprio(left=WaypointRewardTests._wrist(landed + [0.0, -0.02, 0.0]))
+        self.reward.step(far, _state(self.positions, measured=(1.0, 1.0)))
+        self.assertEqual(self.reward.transport_attempts[0]["end_reason"], "dropped")
+        self.assertNotIn(label, self.reward._carry_destinations)
+        before_approach = self.reward._dense_approach_return
+        self.reward.step(near, _state(self.positions, measured=(1.0, 1.0)))
+        self.assertGreater(self.reward._dense_approach_return, before_approach)
+        # Re-grasping creates a fresh transport attempt rather than reusing the dropped one.
+        self.lift(label, landed + [0.0, 0.0, 0.05])
+        self.assertEqual(len(self.reward.transport_attempts), 2)
+        self.assertGreater(self.reward.transport_attempts[1]["grasp_step"],
+                           self.reward.transport_attempts[0]["grasp_step"])
+
+    def test_external_move_to_goal_while_attempt_arm_is_far_does_not_pay_release(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0.0, 0.0, 0.07]
+        self.lift(label, start)
+        self.positions[label] = self.base_goal.copy()
+        self.reward.step(_proprio(), _state(self.positions, measured=(1.0, 1.0)))
+        self.assertEqual(self.reward.transport_attempts[0]["end_reason"], "dropped")
+        self.assertIsNone(self.reward.release_steps["base"])
+        self.assertIsNone(self.reward.transport_attempts[0]["opened_step"])
+
+    def test_slow_opening_after_settle_still_pays_release_unless_arm_moves_to_other_block(self):
+        label = BLOCK_LABELS[0]
+        self.lift(label, self.positions[label] + [0.0, 0.0, 0.07])
+        self.step_at(label, self.base_goal)
+        for opening in (0.60, 0.70, 0.78):
+            self.reward.step(_proprio(), _state(self.positions, measured=(opening, 1.0)))
+        self.assertIsNotNone(self.reward.milestone_steps["base"])
+        self.assertIsNone(self.reward.release_steps["base"])
+        self.assertAlmostEqual(self.reward.milestone_return, M_GRASP + 0.4 * M_BASE)
+        self.reward.step(_proprio(), _state(self.positions, measured=(0.82, 1.0)))
+        self.assertIsNotNone(self.reward.release_steps["base"])
+        row = self.reward.transport_attempts[0]
+        self.assertEqual(row["end_reason"], "released")
+        self.assertEqual(row["settled_step"], self.reward.milestone_steps["base"])
+        self.assertAlmostEqual(self.reward.milestone_return, M_GRASP + M_BASE)
+
+        # If the arm moves to another block before opening, no release bonus is paid.
+        self.setUp()
+        other = BLOCK_LABELS[1]
+        self.lift(label, self.positions[label] + [0.0, 0.0, 0.07])
+        self.step_at(label, self.base_goal)
+        at_other = _proprio(left=WaypointRewardTests._wrist(self.positions[other]))
+        self.reward.step(at_other, _state(self.positions, measured=(EMPTY_CLOSED, 1.0)))
+        self.assertEqual(self.reward.transport_attempts[0]["end_reason"], "other_block")
+        self.reward.step(at_other, _state(self.positions, measured=(1.0, 1.0)))
+        self.assertIsNone(self.reward.release_steps["base"])
+
+    def test_opening_can_complete_while_the_same_arm_withdraws(self):
+        label = BLOCK_LABELS[0]
+        self.lift(label, self.positions[label] + [0, 0, 0.07])
+        self.step_at(label, self.base_goal)
+        self.step_at(label, self.base_goal, opening=0.65)
+        self.reward.step(_proprio(), _state(self.positions, measured=(0.8, 1.0)))
+        row = self.reward.transport_attempts[0]
+        self.assertEqual(row["opened_step"], 6)
+        self.assertIsNone(row["settled_step"])
+        for _ in range(2):
+            self.reward.step(_proprio(), _state(self.positions))
+        self.assertEqual(row["settled_step"], 8)
+        self.assertAlmostEqual(self.reward.milestone_return, M_GRASP + M_BASE)
+
+    def test_another_block_cannot_collect_the_released_blocks_settle_bonus(self):
+        carried, other, _ = BLOCK_LABELS
+        self.lift(carried, self.positions[carried] + [0, 0, 0.07])
+        self.step_at(carried, self.base_goal + [0, 0, 0.005])
+        self.step_at(carried, self.base_goal + [0, 0, 0.005], opening=0.8)
+        self.assertIsNotNone(self.reward.release_steps["base"])
+        self.positions[carried] = self.base_goal + [0.05, 0, 0]
+        self.positions[other] = self.base_goal.copy()
+        for _ in range(4):
+            self.reward.step(_proprio(), _state(self.positions))
+        self.assertIsNone(self.reward.milestone_steps["base"])
+        self.assertIsNone(self.reward.transport_attempts[0]["settled_step"])
+        self.assertAlmostEqual(self.reward.milestone_return, M_GRASP + 0.6 * M_BASE)
+
+    def test_geometric_tower_without_carry_attempt_pays_settle_fallback(self):
+        for level, (label, name) in enumerate(zip(BLOCK_LABELS, ("base", "pair2", "pair3"))):
+            self.positions[label] = self.base_goal + [0, 0, level * SIZE]
+        for _ in range(3):
+            terms, _ = self.step_at(BLOCK_LABELS[0], self.positions[BLOCK_LABELS[0]],
+                                    opening=1.0, arm=0)
+        # The full stack must end with zero potential so the true terminal
+        # branch cannot pay a spurious negative shaping reward.
+        self.assertAlmostEqual(terms["phi"], 0.0, places=9)
+        self.assertIsNone(self.reward.release_steps["base"])
+        self.assertIsNotNone(self.reward.milestone_steps["base"])
+        self.assertIsNotNone(self.reward.milestone_steps["pair2"])
+        self.assertIsNotNone(self.reward.milestone_steps["pair3"])
+        self.assertAlmostEqual(self.reward.milestone_return, 0.4 * (M_BASE + M_PAIR2 + M_PAIR3))
+
+    def test_brief_hold_dropout_and_concurrent_tower_growth_preserve_dense_carry(self):
+        base, upper, _ = BLOCK_LABELS
+        start_upper = self.positions[upper] + [0, 0, 0.07]
+        self.lift(upper, start_upper, arm=1)
+        # Brief 1-step hold dropout without opening (measured=0.0 < REAL_GRIP_30) pauses, does not drop attempt.
+        mid = (start_upper + self.base_goal) / 2
+        self.step_at(upper, mid, opening=0.0, arm=1)
+        # While upper is held by arm 1, base settles on the table so anchor grows to (base,).
+        self.positions[base] = self.base_goal.copy()
+        for _ in range(3):
+            terms, _ = self.step_at(upper, mid, opening=REAL_GRIP_30, arm=1)
+        self.assertIsNotNone(self.reward.milestone_steps["base"])
+        before = terms["dense_transport_return"]
+        goal = self.base_goal + [0, 0, SIZE]
+        terms, _ = self.step_at(upper, goal, opening=REAL_GRIP_30, arm=1)
+        self.assertGreater(terms["dense_transport_return"], before)
+        self.step_at(upper, goal, opening=0.8, arm=1)
+        self.assertIsNotNone(self.reward.release_steps["pair2"])
+        for _ in range(2):
+            self.step_at(upper, goal, opening=1.0, arm=1)
+        self.assertIsNotNone(self.reward.milestone_steps["pair2"])
 
 
 if __name__ == "__main__":

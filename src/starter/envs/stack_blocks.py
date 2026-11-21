@@ -199,7 +199,7 @@ class StackBlocksAdapter:
         }
         return self.policy_observation(raw), float(score), terminated, truncated, info
 
-    def get_privileged_state(self) -> dict:
+    def get_privileged_state(self, pose_batches: Mapping | None = None) -> dict:
         """Scene-relative poses/table geometry, scaled extents and measured motion.
 
         ``gripper_open_measured`` reads the measured gripper joints, not the
@@ -215,7 +215,8 @@ class StackBlocksAdapter:
         parser = self.task.reward_manager.func_parser
         poses = {}
         for label in BLOCK_LABELS:
-            pos_list, rot_list = parser.get_label_pose(label)
+            pos_list, rot_list = (parser.get_label_pose(label) if pose_batches is None
+                                  else pose_batches[label])
             poses[label] = {
                 "pos": _index(pos_list, self.env_index),
                 "rot": _index(rot_list, self.env_index),
@@ -287,6 +288,28 @@ def _index(values, index: int):
     return values
 
 
+def _block_pose(blocks):
+    positions = np.array([blocks[label]["pos"] for label in BLOCK_LABELS], dtype=np.float64)
+    rotations = np.array([blocks[label]["rot"] for label in BLOCK_LABELS], dtype=np.float64)
+    norms = np.linalg.norm(rotations, axis=1, keepdims=True)
+    if not np.isfinite(positions).all() or not np.isfinite(norms).all() or (norms == 0).any():
+        raise ValueError("Settling observations require finite positions and nonzero finite quaternions.")
+    return positions, rotations / norms
+
+
+def _pose_speeds(before, after, elapsed: float) -> dict:
+    if not np.isfinite(elapsed) or elapsed <= 0:
+        raise RuntimeError("Physics clock must advance between control observations.")
+    p0, q0 = before
+    p1, q1 = after
+    similarity = np.sum(q0 * q1, axis=1, keepdims=True)
+    q1 = np.where(similarity < 0.0, -q1, q1)
+    linear = np.linalg.norm(p1 - p0, axis=1) / elapsed
+    angular = (4.0 / elapsed) * np.arctan2(
+        np.linalg.norm(q1 - q0, axis=1), np.linalg.norm(q1 + q0, axis=1))
+    return {label: [float(v), float(w)] for label, v, w in zip(BLOCK_LABELS, linear, angular)}
+
+
 class ParallelAdapter:
     """Several scenes that share one physics step.
 
@@ -294,15 +317,18 @@ class ParallelAdapter:
     task can keep the single-environment ``take_action`` / ``get_obs`` pair.
     """
 
-    def __init__(self, task: Any):
+    def __init__(self, task: Any, *, physics_clock=None):
         self.task = task
         self.num_envs = int(getattr(task, "num_envs", 1))
         self._slots = [StackBlocksAdapter(task, env_index=index) for index in range(self.num_envs)]
+        self._physics_clock = physics_clock
+        self._motion_samples = {}
 
     def reset_batch(self, seeds) -> tuple[list[dict], list[dict]]:
         seeds = [None if seed is None else int(seed) for seed in seeds]
         if len(seeds) != self.num_envs:
             raise ValueError(f"Expected {self.num_envs} seeds, got {len(seeds)}.")
+        self._motion_samples.clear()
         self.task.reset(seed=seeds if self.num_envs > 1 else seeds[0])
         _seed_gripper_state(self.task)
         # run_reward/get_score register checks for ALL scenes, as in the
@@ -322,6 +348,12 @@ class ParallelAdapter:
         if len(actions) != len(active):
             raise ValueError(f"Got {len(actions)} actions for {len(active)} environments.")
         action_dicts = [unpack_ee_action(action) for action in actions]
+        if self._physics_clock is not None:
+            time = float(self._physics_clock())
+            stale = [index for index in active
+                     if self._motion_samples.get(index, ())[:2] != (self._slots[index]._steps, time)]
+            if stale:
+                self._sample_motion(stale, time)
         if hasattr(self.task, "take_action_batch"):
             self._call_batch(action_dicts, active)
         elif self.num_envs == 1 and active == [0]:
@@ -329,11 +361,16 @@ class ParallelAdapter:
         else:
             raise RuntimeError("The task has no take_action_batch, so it cannot step several environments.")
         raws = self._raw_batch(active)
+        if not active:
+            return []
+        manager = self.task.reward_manager
+        rewards = manager.get_reward(final_check=False)
+        scores = manager.get_score(reward_lst=rewards)
         results = []
         for raw, index in zip(raws, active):
             slot = self._slots[index]
             slot._steps += 1
-            score, success_reward = slot._external_signals()
+            score, success_reward = float(scores[index]), float(rewards[index])
             # EvalEnv ends only on run_reward success or time limit, never on
             # the partial/full public process score.
             terminated = float(success_reward) >= 1.0 - 1e-3
@@ -349,8 +386,44 @@ class ParallelAdapter:
             results.append((slot.policy_observation(raw), float(score), terminated, truncated, info))
         return results
 
+    def _block_pose_batches(self) -> dict:
+        parser = self.task.reward_manager.func_parser
+        return {label: parser.get_label_pose(label) for label in BLOCK_LABELS}
+
+    def _sample_motion(self, indices, time: float, *, during_reset: bool = False) -> None:
+        pose_batches = self._block_pose_batches()
+        for index in indices:
+            blocks = {label: {"pos": _index(pos, index), "rot": _index(rot, index)}
+                      for label, (pos, rot) in pose_batches.items()}
+            step = -1 if during_reset else self._slots[index]._steps
+            self._motion_samples[index] = step, time, _block_pose(blocks), None
+
+    def sample_reset_motion(self) -> None:
+        if self._physics_clock is None:
+            return
+        self._sample_motion(range(self.num_envs), float(self._physics_clock()), during_reset=True)
+
     def privileged_batch(self, active) -> list[dict]:
-        return [self._slots[int(index)].get_privileged_state() for index in active]
+        slots = [self._slots[int(index)] for index in active]
+        if not slots:
+            return []
+        pose_batches = self._block_pose_batches()
+        states = [slot.get_privileged_state(pose_batches) for slot in slots]
+        if self._physics_clock is None:
+            return states
+        time = float(self._physics_clock())
+        for slot, state in zip(slots, states):
+            previous = self._motion_samples.get(slot.env_index)
+            if previous is None:
+                raise RuntimeError("Missing motion baseline; reset and step through the configured adapter.")
+            if previous[0] == slot._steps:
+                speeds = previous[3]
+            else:
+                pose = _block_pose(state["blocks"])
+                speeds = _pose_speeds(previous[2], pose, time - previous[1])
+                self._motion_samples[slot.env_index] = slot._steps, time, pose, speeds
+            state["settle_speeds"] = speeds
+        return states
 
     def _call_batch(self, action_dicts, active) -> None:
         original = getattr(self.task, "is_episode_end", None)

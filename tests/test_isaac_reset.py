@@ -74,6 +74,7 @@ class SavedLayoutResetTest(unittest.TestCase):
             apply_saved_poses=restore,
         )
         task.online_obs = SimpleNamespace(
+            collect_interval=10,
             reset=lambda: self.events.append("obs_reset"),
             render_for_capture=lambda: self.events.append("capture"),
             get_obs=lambda: self.events.append("warmup_observation"),
@@ -91,7 +92,10 @@ class SavedLayoutResetTest(unittest.TestCase):
         )
         seed_module = SimpleNamespace(SeedManager=lambda config: manager)
         with patch.dict(sys.modules, {"env.seed_manager.seed_manager": seed_module}):
-            self.assertEqual(bind_eval_layouts(task, "stack_blocks", "arx_x5"), 2)
+            self.assertEqual(bind_eval_layouts(
+                task, "stack_blocks", "arx_x5",
+                sample_reset_motion=lambda: self.events.append("sample_motion"),
+            ), 2)
         self.adapter = ParallelAdapter(task)
 
     def test_every_reset_restores_selected_objects_before_reward_initialization(self):
@@ -102,6 +106,8 @@ class SavedLayoutResetTest(unittest.TestCase):
             self.assertEqual(len(observations), 2)
         sequence = ["reload", "obs_reset", "restore", "stability"] + ["render"] * 10
         for step in range(200):
+            if step == 190:
+                sequence.append("sample_motion")
             sequence.append("physics")
             if step % 5 == 0:
                 sequence.extend(["capture", "warmup_observation"])

@@ -132,6 +132,9 @@ class RemoteEnv:
         self._buffer = b""
         self._privileged: list[dict] = []
 
+    def connect(self) -> None:
+        self._ensure(timeout=self.reset_timeout)
+
     def reset_batch(self, seeds):
         # The simulator process is restarted until it stays up. A reset that
         # dies with the process should wait for the next one. A live reset

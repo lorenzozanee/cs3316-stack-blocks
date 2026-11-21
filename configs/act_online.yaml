@@ -22,24 +22,15 @@ rollout_layout_ids:
   - 21
   - 22
   - 23
-# Seven-step internal reward: physical-state PBRS plus one-time milestones.
-# The target uses demo release-command grasp points (100 demos/300 opening
-# upcrossings at 0.5, max radial deviation 6.706 mm; not block/contact ground
-# truth). It is an INTERNAL preference; official scoring
-# has no target-region criterion. Block sizes/table top come from scene data.
-# Reach/lift/transport adapt robosuite/IsaacLab principles, not their reward
-# formula. Geometric support, low velocities and 3 consecutive observations
-# are proxies; no contact-force or static-equilibrium claim is made.
-reach_weight: 2.0
+# Use task score, dense progress and phase events without overlapping PBRS.
+reach_weight: 0.0
 reach_scale: 0.25
-# One bounded progress unit per placed layer; no standalone height reward.
-manipulation_weight: 1.0
+manipulation_weight: 0.0
 grasp_closure_weight: 0.25
-# Fraction of the constant reach, manipulation, base and pair deficits removed.
-potential_offset_fraction: 0.0
-base_weight: 1.0
-pair_weight: 1.5
-release_weight: 0.5
+dense_transport_reward: true
+base_weight: 0.0
+pair_weight: 0.0
+release_weight: 0.0
 # One grasp milestone per block and one placement milestone per level.
 # Waypoints and milestones use episode history, which the policy does not observe.
 # The combined event bonus is capped below 15 points.
