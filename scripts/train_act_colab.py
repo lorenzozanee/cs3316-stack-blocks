@@ -140,6 +140,8 @@ def write_configs(args, run_stamp: str) -> tuple[Path, Path, Path]:
         max_train_seconds=budget,
         run_stamp=run_stamp,
     )
+    if args.act_inference_batch_size is not None:
+        online["act_inference_batch_size"] = args.act_inference_batch_size
     env_config, online_config = (args.logs / name for name in ("env.yaml", "act_online.yaml"))
     for path, data in ((env_config, env), (online_config, online)):
         # The repo's simple YAML reader requires indentation before list items.
@@ -197,6 +199,7 @@ def main() -> int:
     parser.add_argument("--min-reset-free-vram-mib", required=True, type=int)
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--finetune-episodes", type=int)
+    parser.add_argument("--act-inference-batch-size", type=int)
     parser.add_argument("--max-train-seconds", type=int)
     parser.add_argument("--drive-credentials-file", type=Path)
     parser.add_argument("--measure-updates", type=int)
@@ -206,6 +209,8 @@ def main() -> int:
             or (args.finetune_episodes is not None and args.finetune_episodes < 1)
             or (args.max_train_seconds is not None and args.max_train_seconds < 1)):
         parser.error("Require round >= 25 and positive scene, episode, budget and headroom counts.")
+    if args.act_inference_batch_size is not None and args.act_inference_batch_size < 1:
+        parser.error("--act-inference-batch-size must be positive.")
     if not args.measure_updates:
         if args.max_train_seconds is not None:
             parser.error("Formal training uses the round budget; --max-train-seconds is for probes.")

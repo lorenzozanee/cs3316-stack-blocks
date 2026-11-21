@@ -98,7 +98,14 @@ class FrozenACTRunner:
         device,
         temporal_agg: bool = True,
         capture_features: bool = False,
+        *,
+        inference_batch_size: int | None = None,
     ):
+        if inference_batch_size is not None and (
+            type(inference_batch_size) is not int or inference_batch_size < 1
+        ):
+            raise ValueError("ACT inference batch size must be a positive integer.")
+        self.inference_batch_size = inference_batch_size
         self.device = torch.device(device)
         self.policy = policy.to(self.device).eval()
         self.policy.requires_grad_(False)
@@ -149,6 +156,32 @@ class FrozenACTRunner:
         qpos = (proprio - self.stats["qpos_mean"]) / self.stats["qpos_std"]
         return qpos.astype(np.float32), image
 
+    def _forward_batch(self, observations, with_features):
+        states, images = zip(*(self._preprocess(obs) for obs in observations))
+        qpos = torch.from_numpy(np.stack(states)).to(self.device)
+        image = torch.from_numpy(np.stack(images)[:, None]).to(self.device)
+        self._visual_features = None
+        # Captured features must remain usable as inputs to a trainable head.
+        with torch.no_grad():
+            predictions = self.policy(qpos, image)
+        if not isinstance(predictions, torch.Tensor) or predictions.ndim != 3:
+            raise ValueError("ACT policy must return a [batch, chunk, action] tensor.")
+        if predictions.shape[0] != len(observations) or predictions.shape[2] != ACTION_DIM:
+            raise ValueError(
+                f"ACT policy returned action shape {tuple(predictions.shape)} for "
+                f"{len(observations)} observations."
+            )
+        predictions = predictions.detach().cpu().numpy()
+        if not np.isfinite(predictions).all():
+            raise ValueError("ACT produced a non-finite action.")
+        visual = self._visual_features if with_features else None
+        if with_features:
+            if visual is None or visual.shape != (len(observations), 512):
+                raise ValueError("ACT backbone did not produce one 512-channel feature per observation.")
+            if not torch.isfinite(visual).all():
+                raise ValueError("ACT backbone produced a non-finite feature.")
+        return predictions, qpos, visual
+
     def predict_base(
         self, obs_list, env_ids, with_features: bool = False
     ) -> tuple[list[np.ndarray], torch.Tensor | None]:
@@ -168,26 +201,10 @@ class FrozenACTRunner:
         if not obs_list:
             raise ValueError("Predict at least one observation.")
 
-        prepared = [self._preprocess(obs) for obs in obs_list]
-        states, images = zip(*prepared)
-        qpos = torch.from_numpy(np.stack(states)).to(self.device)
-        image = torch.from_numpy(np.stack(images)[:, None]).to(self.device)
-
-        self._visual_features = None
-        # no_grad keeps captured features usable as inputs to a trainable head;
-        # inference_mode tensors cannot be consumed by autograd.
-        with torch.no_grad():
-            predictions = self.policy(qpos, image)
-        if not isinstance(predictions, torch.Tensor) or predictions.ndim != 3:
-            raise ValueError("ACT policy must return a [batch, chunk, action] tensor.")
-        if predictions.shape[0] != len(obs_list) or predictions.shape[2] != ACTION_DIM:
-            raise ValueError(
-                f"ACT policy returned action shape {tuple(predictions.shape)} for "
-                f"{len(obs_list)} observations."
-            )
-        predictions = predictions.detach().cpu().numpy()
-        if not np.isfinite(predictions).all():
-            raise ValueError("ACT produced a non-finite action.")
+        batch_size = self.inference_batch_size or len(obs_list)
+        batches = [self._forward_batch(obs_list[start:start + batch_size], with_features)
+                   for start in range(0, len(obs_list), batch_size)]
+        predictions = (row for batch, _, _ in batches for row in batch)
 
         chunks: list[np.ndarray] = []
         normalized_actions: list[np.ndarray] = []
@@ -211,11 +228,9 @@ class FrozenACTRunner:
 
         features = None
         if with_features:
-            visual = self._visual_features
-            if visual is None or visual.shape != (len(obs_list), 512):
-                raise ValueError("ACT backbone did not produce one 512-channel feature per observation.")
-            if not torch.isfinite(visual).all():
-                raise ValueError("ACT backbone produced a non-finite feature.")
+            _, states, visual_features = zip(*batches)
+            qpos = torch.cat(states)
+            visual = torch.cat(visual_features)
             normalized = torch.from_numpy(np.stack(normalized_actions)).to(self.device)
             try:
                 object_state = np.stack([block_pose_features(obs["blocks"]) for obs in obs_list])

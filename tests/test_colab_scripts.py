@@ -54,6 +54,7 @@ class ColabScriptsTests(unittest.TestCase):
                 round=25,
                 measure_updates=None,
                 finetune_episodes=None,
+                act_inference_batch_size=None,
                 max_train_seconds=None,
                 logs=logs,
             )
@@ -69,10 +70,13 @@ class ColabScriptsTests(unittest.TestCase):
             self.assertEqual(train_data["finetune_updates"], sys.maxsize)
             self.assertEqual(output.name, "2026.11.21-10.00.00")
 
+            self.assertNotIn("act_inference_batch_size", train_data)
             args.round = 26
+            args.act_inference_batch_size = 8
             _, train_cfg2, _ = mod.write_configs(args, "2026.11.21-12.00.00")
             train_data2 = load_config(train_cfg2)
             self.assertEqual(train_data2["max_train_seconds"], 7200)
+            self.assertEqual(train_data2["act_inference_batch_size"], 8)
 
             args.num_envs = 12
             _, train_cfg3, _ = mod.write_configs(args, "2026.11.21-13.00.00")

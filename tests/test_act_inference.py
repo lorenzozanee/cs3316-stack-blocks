@@ -152,6 +152,44 @@ class FrozenRunnerTest(unittest.TestCase):
         self.assertFalse(self.policy.training)
         self.assertTrue(all(not parameter.requires_grad for parameter in self.policy.parameters()))
 
+    def test_chunking_preserves_features_and_histories_when_active_ids_change(self):
+        class ImageBackbone(CountingBackbone):
+            def __init__(self):
+                super().__init__()
+                self.batch_sizes = []
+
+            def forward(self, image):
+                self.batch_sizes.append(len(image))
+                features, positions = super().forward(image)
+                return features + image.mean(dim=(1, 2, 3))[:, None, None, None], positions
+
+        def make_runner(batch_size):
+            policy = FeaturePolicy()
+            backbone = ImageBackbone()
+            policy.model.backbones[0] = backbone
+            return FrozenACTRunner(policy, STATS, "cpu", capture_features=True,
+                                   inference_batch_size=batch_size), backbone
+
+        reference, reference_backbone = make_runner(None)
+        chunked, backbone = make_runner(2)
+
+        for step, ids in enumerate(([7, 3, 1, 8, 9], [1, 7, 9], [7]), 1):
+            observations = [flat_observation(i * step, 10 * i + step) for i in ids]
+            expected_actions, expected_features = reference.predict_base(observations, ids, with_features=True)
+            actions, features = chunked.predict_base(observations, ids, with_features=True)
+            np.testing.assert_array_equal(actions, expected_actions)
+            torch.testing.assert_close(features, expected_features, atol=0, rtol=0)
+            self.assertFalse(features.requires_grad)
+
+        self.assertEqual(reference_backbone.batch_sizes, [5, 3, 1])
+        self.assertEqual(backbone.batch_sizes, [2, 2, 1, 2, 1, 1])
+        torch.nn.Linear(FEATURE_DIM, 1)(features).sum().backward()
+
+    def test_invalid_inference_batch_sizes_fail(self):
+        for size in (0, -1, 2.5, True, "2"):
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "positive integer"):
+                FrozenACTRunner(FeaturePolicy(), STATS, "cpu", inference_batch_size=size)
+
     def test_object_poses_change_residual_features_but_not_base_actions(self):
         first = flat_observation()
         second = flat_observation()

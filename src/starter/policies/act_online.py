@@ -575,6 +575,7 @@ def train_online(config: dict) -> Path:
     seed = int(require(config, "seed"))
     layout_ids = list(require(config, "rollout_layout_ids"))
     reward_cfg = _reward_config(config)
+    inference_batch_size = config.get("act_inference_batch_size")
     replay_cycle = math.lcm(len(layout_ids), width)
     prefix_archive = {}
     if "post_grasp_prefix_file" in config:
@@ -609,8 +610,8 @@ def train_online(config: dict) -> Path:
         base = ACTPolicy(base_config, pretrained_backbone=False)
         base.load_state_dict(payload["base_state_dict"], strict=True)
         frozen_state = {key: value.detach().cpu().clone() for key, value in base.state_dict().items()}
-        runner = FrozenACTRunner(base, payload["stats"], device,
-                                 temporal_agg=True, capture_features=True)
+        runner = FrozenACTRunner(base, payload["stats"], device, capture_features=True,
+                                 inference_batch_size=inference_batch_size)
         residual_config = dict(payload["residual_config"])
         if int(residual_config.get("feature_dim", -1)) != FEATURE_DIM:
             raise ValueError(f"Residual feature_dim must be {FEATURE_DIM}.")
@@ -646,7 +647,8 @@ def train_online(config: dict) -> Path:
         frozen_state = {key: value.detach().cpu().clone() for key, value in base.state_dict().items()}
         with (checkpoint.parent / "dataset_stats.pkl").open("rb") as stream:
             stats = pickle.load(stream)
-        runner = FrozenACTRunner(base, stats, device, temporal_agg=True, capture_features=True)
+        runner = FrozenACTRunner(base, stats, device, capture_features=True,
+                                 inference_batch_size=inference_batch_size)
         residual_config = {"feature_dim": FEATURE_DIM, "hidden_dim": int(config["hidden_dim"]),
                            "initial_std": float(config["initial_std"]),
                            "learn_std": bool(config["learn_std"])}
