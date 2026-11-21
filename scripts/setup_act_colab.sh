@@ -76,7 +76,7 @@ fi
 
 mkdir -p "${ENV_DIR}/debs" "${ENV_DIR}/system"
 pushd "${ENV_DIR}/debs" >/dev/null
-apt-get download libglu1-mesa libxt6 cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cudart-12-8 \
+apt-get download libglu1-mesa libxt6t64 cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cudart-12-8 \
   cuda-nvvm-12-8 cuda-crt-12-8 cuda-cccl-12-8 cuda-driver-dev-12-8
 for package in ./*.deb; do
   dpkg-deb -x "$package" "${ENV_DIR}/system"
