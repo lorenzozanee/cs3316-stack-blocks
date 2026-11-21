@@ -740,5 +740,250 @@ class RemoteResetTimeoutTest(unittest.TestCase):
         self.assertIn("did not complete reset within", str(caught.exception))
 
 
+class ShardedRemoteEnvTest(unittest.TestCase):
+    @staticmethod
+    def _free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    @staticmethod
+    def _make_fake_task(
+        width: int,
+        tag: str,
+        *,
+        fail_step_on: int | None = None,
+        fail_reset: bool = False,
+        step_delay: float = 0.0,
+        reset_delay: float = 0.0,
+    ):
+        class _Task:
+            def __init__(self):
+                self.num_envs = width
+                self.reset_calls = []
+                self.step_calls = []
+                self._seeds = [0] * width
+                self._steps = [0] * width
+
+            def reset_batch(self, seeds):
+                self.reset_calls.append(list(seeds))
+                if reset_delay > 0:
+                    time.sleep(reset_delay)
+                if fail_reset:
+                    raise RuntimeError(f"reset boom in {tag}")
+                self._seeds = list(seeds)
+                self._steps = [0] * width
+                obs = [{"proprio": [float(s)] * 16} for s in seeds]
+                infos = [{"env_index": i, "seed": s, "tag": tag} for i, s in enumerate(seeds)]
+                return obs, infos
+
+            def step_batch(self, actions, active):
+                self.step_calls.append((list(active), [list(a) for a in actions]))
+                if step_delay > 0:
+                    time.sleep(step_delay)
+                if fail_step_on is not None and fail_step_on in active:
+                    raise RuntimeError(f"boom in {tag} local {fail_step_on}")
+                results = []
+                for idx, act in zip(active, actions):
+                    self._steps[idx] += 1
+                    done = self._steps[idx] >= 2
+                    obs = {"proprio": [float(self._seeds[idx] + act[0])] * 16}
+                    info = {"env_index": idx, "step_id": self._steps[idx], "tag": tag}
+                    results.append((obs, float(self._seeds[idx]), done, False, info))
+                return results
+
+            def privileged_batch(self, indices):
+                return [{"seed": self._seeds[i], "step": self._steps[i], "tag": tag} for i in indices]
+
+        return _Task()
+
+    def test_sharded_reset_partial_reordered_step_and_empty_worker_skip(self):
+        from starter.envs.remote import ShardedRemoteEnv, serve
+
+        p0, p1 = self._free_port(), self._free_port()
+        while p1 == p0:
+            p1 = self._free_port()
+        t0 = self._make_fake_task(2, "w0")
+        t1 = self._make_fake_task(2, "w1")
+        th0 = threading.Thread(target=serve, args=(t0, "127.0.0.1", p0), kwargs={"coordinated_recycle": True})
+        th1 = threading.Thread(target=serve, args=(t1, "127.0.0.1", p1), kwargs={"coordinated_recycle": True})
+        th0.start()
+        th1.start()
+        env = ShardedRemoteEnv("127.0.0.1", [p0, p1], num_envs=4, timeout=5.0, reset_timeout=5.0)
+        try:
+            env.connect()
+            with self.assertRaises(ValueError):
+                env.reset_batch([1, 2, 3])
+            self.assertEqual(t0.reset_calls, [])
+            self.assertEqual(t1.reset_calls, [])
+
+            obs, infos = env.reset_batch([10, 20, 30, 40])
+            self.assertEqual([o["proprio"][0] for o in obs], [10.0, 20.0, 30.0, 40.0])
+            self.assertEqual([info["env_index"] for info in infos], [0, 1, 2, 3])
+            self.assertEqual([env.privileged(i)["seed"] for i in range(4)], [10, 20, 30, 40])
+
+            # Reordered active spanning both workers.
+            res = env.step_batch([[1.0], [2.0], [3.0]], [3, 0, 2])
+            self.assertEqual([r[1] for r in res], [40.0, 10.0, 30.0])
+            self.assertEqual([r[0]["proprio"][0] for r in res], [41.0, 12.0, 33.0])
+            self.assertEqual([r[4]["env_index"] for r in res], [3, 0, 2])
+            self.assertEqual([env.privileged(i)["seed"] for i in range(3)], [40, 10, 30])
+            self.assertEqual(t0.step_calls, [([0], [[2.0]])])
+            self.assertEqual(t1.step_calls, [([1, 0], [[1.0], [3.0]])])
+
+            # Only worker 1 active -> worker 0 gets zero RPCs.
+            res2 = env.step_batch([[5.0]], [2])
+            self.assertEqual(len(t0.step_calls), 1)
+            self.assertEqual(len(t1.step_calls), 2)
+            self.assertEqual(res2[0][4]["env_index"], 2)
+            self.assertTrue(res2[0][2])
+
+            # Empty active -> zero RPCs.
+            self.assertEqual(env.step_batch([], []), [])
+            self.assertEqual(env._privileged, [])
+            self.assertEqual(len(t0.step_calls), 1)
+            self.assertEqual(len(t1.step_calls), 2)
+        finally:
+            env.close()
+            th0.join(timeout=2)
+            th1.join(timeout=2)
+
+    def test_coordinated_recycle_restarts_all_workers_at_wave_boundary(self):
+        from starter.envs.remote import ShardedRemoteEnv, serve
+
+        p0, p1 = self._free_port(), self._free_port()
+        while p1 == p0:
+            p1 = self._free_port()
+        recycled_flags = [[], []]
+        free_values = [1000, 9000]
+
+        def run_supervised(idx: int, port: int):
+            for gen in range(2):
+                task = self._make_fake_task(1, f"w{idx}_g{gen}")
+                rec = serve(
+                    task,
+                    "127.0.0.1",
+                    port,
+                    coordinated_recycle=True,
+                    free_vram_mib=lambda g=gen: free_values[g],
+                )
+                recycled_flags[idx].append(rec)
+                if not rec:
+                    break
+
+        th0 = threading.Thread(target=run_supervised, args=(0, p0))
+        th1 = threading.Thread(target=run_supervised, args=(1, p1))
+        th0.start()
+        th1.start()
+        env = ShardedRemoteEnv(
+            "127.0.0.1", [p0, p1], num_envs=2, min_reset_free_vram_mib=2560, timeout=5.0, reset_timeout=5.0
+        )
+        try:
+            env.connect()
+            _, infos0 = env.reset_batch([7, 8])
+            self.assertEqual([i["tag"] for i in infos0], ["w0_g0", "w1_g0"])
+            # Finish complete wave (2 steps per scene).
+            env.step_batch([[0.0], [0.0]], [0, 1])
+            res = env.step_batch([[0.0], [0.0]], [0, 1])
+            self.assertTrue(all(r[2] for r in res))
+            # Next reset sees free_mib=1000 < 2560 -> recycles BOTH workers and reconnects to gen 1.
+            _, infos1 = env.reset_batch([9, 10])
+            self.assertEqual([i["tag"] for i in infos1], ["w0_g1", "w1_g1"])
+        finally:
+            env.close()
+            th0.join(timeout=3)
+            th1.join(timeout=3)
+        self.assertEqual(recycled_flags, [[True, False], [True, False]])
+
+    def test_worker_failure_aborts_siblings_and_closes_env(self):
+        from starter.envs.remote import ShardedRemoteEnv, serve
+
+        p0, p1 = self._free_port(), self._free_port()
+        while p1 == p0:
+            p1 = self._free_port()
+        t0 = self._make_fake_task(1, "w0", step_delay=0.5)
+        t1 = self._make_fake_task(1, "w1", fail_step_on=0)
+        th0 = threading.Thread(target=serve, args=(t0, "127.0.0.1", p0))
+        th1 = threading.Thread(target=serve, args=(t1, "127.0.0.1", p1))
+        th0.start()
+        th1.start()
+        env = ShardedRemoteEnv("127.0.0.1", [p0, p1], num_envs=2, timeout=5.0, reset_timeout=5.0)
+        try:
+            env.connect()
+            env.reset_batch([1, 2])
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "boom in w1"):
+                env.step_batch([[0.0], [0.0]], [0, 1])
+            self.assertLess(time.monotonic() - started, 0.35)
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                env.reset_batch([3, 4])
+        finally:
+            env.close()
+            th0.join(timeout=2)
+            th1.join(timeout=2)
+
+    def test_reset_and_connect_failure_aborts_sibling_without_waiting_for_reset_timeout(self):
+        from starter.envs.remote import ShardedRemoteEnv, serve
+
+        # Reset failure on w1 must abort slow sibling w0 immediately (not wait reset_timeout=10s)
+        # and propagate w1's triggering error rather than w0's abort error.
+        p0, p1 = self._free_port(), self._free_port()
+        while p1 == p0:
+            p1 = self._free_port()
+        t0 = self._make_fake_task(1, "w0", reset_delay=0.8)
+        t1 = self._make_fake_task(1, "w1", fail_reset=True)
+        th0 = threading.Thread(target=serve, args=(t0, "127.0.0.1", p0))
+        th1 = threading.Thread(target=serve, args=(t1, "127.0.0.1", p1))
+        th0.start()
+        th1.start()
+        env = ShardedRemoteEnv("127.0.0.1", [p0, p1], num_envs=2, timeout=5.0, reset_timeout=10.0)
+        try:
+            env.connect()
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "reset boom in w1"):
+                env.reset_batch([1, 2])
+            self.assertLess(time.monotonic() - started, 0.4)
+        finally:
+            env.close()
+            th0.join(timeout=2)
+            th1.join(timeout=2)
+
+        # Connect failure (wrong worker width on w1) must abort w0 retrying an unbound port immediately.
+        dead_port, bad_port = self._free_port(), self._free_port()
+        while bad_port == dead_port:
+            bad_port = self._free_port()
+        bad_task = self._make_fake_task(2, "bad_w1")
+        th_bad = threading.Thread(target=serve, args=(bad_task, "127.0.0.1", bad_port))
+        th_bad.start()
+        env2 = ShardedRemoteEnv("127.0.0.1", [dead_port, bad_port], num_envs=2, timeout=5.0, reset_timeout=10.0)
+        try:
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "reported num_envs=2, expected 1"):
+                env2.connect()
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            env2.close()
+            th_bad.join(timeout=2)
+
+    def test_coordinated_recycle_rejects_incomplete_wave(self):
+        from starter.envs.remote import RemoteEnv, serve
+
+        port = self._free_port()
+        task = self._make_fake_task(2, "w0")
+        thread = threading.Thread(target=serve, args=(task, "127.0.0.1", port), kwargs={"coordinated_recycle": True})
+        thread.start()
+        client = RemoteEnv("127.0.0.1", port, timeout=5.0, reset_timeout=5.0)
+        try:
+            client.connect()
+            client.reset_batch([1, 2])
+            # Only 1 step taken; episodes finish at step 2 -> incomplete wave.
+            client.step_batch([[0.0], [0.0]], [0, 1])
+            with self.assertRaisesRegex(RuntimeError, "incomplete wave"):
+                client.recycle()
+        finally:
+            client.close()
+            thread.join(timeout=2)
+
+
 if __name__ == "__main__":
     unittest.main()

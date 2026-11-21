@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from typing import Any
 
 _FRAME_HEADER = struct.Struct("!QQ")
@@ -28,6 +30,8 @@ def _enable_nodelay(sock: socket.socket) -> None:
 def serve(
     env, host: str, port: int, once: bool = False, *,
     should_recycle: Callable[[], bool] | None = None,
+    coordinated_recycle: bool = False,
+    free_vram_mib: Callable[[], int] | None = None,
 ) -> bool:
     """Serve batched ``reset`` / ``step`` and return true for a planned recycle.
 
@@ -56,6 +60,9 @@ def serve(
             op = message.get("op")
             if op == "ping":
                 _write(connection, {"ok": True, "num_envs": width})
+            elif op == "headroom":
+                free = None if free_vram_mib is None else int(free_vram_mib())
+                _write(connection, {"ok": True, "free_vram_mib": free})
             elif op == "reset":
                 seeds = message.get("seeds")
                 if seeds is None:
@@ -100,6 +107,11 @@ def serve(
                 finished += sum(1 for done_flag, cut in zip(terminated, truncated) if done_flag or cut)
                 if once and finished >= width:
                     break
+            elif op == "recycle" and coordinated_recycle:
+                if finished - finished_at_reset != width:
+                    raise RuntimeError("Cannot recycle Isaac during an incomplete wave.")
+                _write(connection, {"ok": True})
+                return True
             elif op == "close":
                 try:
                     _write(connection, {"ok": True})
@@ -142,11 +154,48 @@ class RemoteEnv:
         # per-step socket timeout when the policy and Isaac share one GPU.
         self.reset_timeout = float(reset_timeout)
         self._socket: socket.socket | None = None
+        self._sock_lock = threading.Lock()
+        self._aborted = threading.Event()
         self._blob: memoryview = memoryview(b"")
         self._privileged: list[dict] = []
 
     def connect(self) -> None:
         self._ensure(timeout=self.reset_timeout)
+
+    def worker_width(self) -> int:
+        return int(self._request({"op": "ping"})["num_envs"])
+
+    def headroom_mib(self) -> int | None:
+        reply = self._request({"op": "headroom"})
+        free = reply.get("free_vram_mib")
+        return None if free is None else int(free)
+
+    def recycle(self) -> None:
+        try:
+            self._request({"op": "recycle"})
+            with self._sock_lock:
+                sock = self._socket
+            if sock is not None and sock.recv(1):
+                raise RuntimeError("Isaac did not close its connection after recycling.")
+        finally:
+            self.close()
+
+    def abort(self) -> None:
+        self._aborted.set()
+        with self._sock_lock:
+            sock = self._socket
+            self._socket = None
+            self._blob = memoryview(b"")
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def reset_batch(self, seeds):
         # The simulator process is restarted until it stays up. A reset that
@@ -156,6 +205,8 @@ class RemoteEnv:
         deadline = time.monotonic() + self.reset_timeout
         last_error: Exception | None = None
         while True:
+            if self._aborted.is_set():
+                raise RuntimeError("Remote env aborted.")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ConnectionError(
@@ -168,14 +219,21 @@ class RemoteEnv:
                     timeout=remaining,
                 )
             except TimeoutError as exc:
+                if self._aborted.is_set():
+                    raise RuntimeError("Remote env aborted.") from exc
                 self.close()
                 raise ConnectionError(
                     f"Isaac env server did not complete reset within {self.reset_timeout:.0f}s"
                 ) from exc
-            except ConnectionError as exc:
+            except (ConnectionError, OSError) as exc:
+                if self._aborted.is_set():
+                    raise RuntimeError("Remote env aborted.") from exc
+                if not isinstance(exc, ConnectionError):
+                    raise
                 last_error = exc
                 self.close()
-                time.sleep(min(2.0, max(deadline - time.monotonic(), 0.0)))
+                if self._aborted.wait(min(2.0, max(deadline - time.monotonic(), 0.0))):
+                    raise RuntimeError("Remote env aborted.") from exc
                 continue
             observations = [_unpack_observation(item, self._blob) for item in reply["observations"]]
             return observations, reply.get("infos") or [{} for _ in observations]
@@ -208,48 +266,72 @@ class RemoteEnv:
         return dict(self._privileged[index])
 
     def close(self) -> None:
-        if self._socket is None:
+        with self._sock_lock:
+            sock = self._socket
+            self._socket = None
+            self._blob = memoryview(b"")
+        if sock is None:
             return
         try:
-            _write(self._socket, {"op": "close"})
+            _write(sock, {"op": "close"})
         except OSError:
             pass
-        self._socket.close()
-        self._socket = None
-        self._blob = memoryview(b"")
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def _ensure(self, timeout: float | None = None) -> None:
-        if self._socket is not None:
-            return
+        with self._sock_lock:
+            if self._aborted.is_set():
+                raise RuntimeError("Remote env aborted.")
+            if self._socket is not None:
+                return
         limit = self.timeout if timeout is None else float(timeout)
         deadline = time.monotonic() + limit
         last_error: Exception | None = None
         while time.monotonic() < deadline:
-            connect_timeout = min(5.0, max(deadline - time.monotonic(), 0.1))
+            if self._aborted.is_set():
+                raise RuntimeError("Remote env aborted.")
+            connect_timeout = min(1.0, max(deadline - time.monotonic(), 0.1))
             try:
                 sock = socket.create_connection((self.host, self.port), timeout=connect_timeout)
             except OSError as exc:
                 last_error = exc
-                time.sleep(min(2.0, max(deadline - time.monotonic(), 0.0)))
+                if self._aborted.wait(min(2.0, max(deadline - time.monotonic(), 0.0))):
+                    raise RuntimeError("Remote env aborted.") from exc
                 continue
-            _enable_nodelay(sock)
-            sock.settimeout(self.timeout)
-            self._socket = sock
-            self._blob = memoryview(b"")
-            self._privileged = []
+            with self._sock_lock:
+                if self._aborted.is_set():
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    raise RuntimeError("Remote env aborted.")
+                _enable_nodelay(sock)
+                sock.settimeout(self.timeout)
+                self._socket = sock
+                self._blob = memoryview(b"")
+                self._privileged = []
             return
         raise TimeoutError(
             f"Isaac env server did not accept {self.host}:{self.port} within {limit:.0f}s"
         ) from last_error
 
     def _request(self, message: dict, timeout: float | None = None) -> dict:
-        if self._socket is None:
+        with self._sock_lock:
+            if self._aborted.is_set():
+                raise RuntimeError("Remote env aborted.")
+            sock = self._socket
+        if sock is None:
             raise RuntimeError("Remote env is not connected.")
-        self._socket.settimeout(self.timeout if timeout is None else float(timeout))
-        _write(self._socket, message)
-        frame = _read(self._socket)
+        sock.settimeout(self.timeout if timeout is None else float(timeout))
+        _write(sock, message)
+        frame = _read(sock)
         if frame is None:
             self.close()
+            if self._aborted.is_set():
+                raise RuntimeError("Remote env aborted.")
             raise ConnectionError("Isaac env server closed the connection.")
         reply, blob = frame
         if "error" in reply:
@@ -258,6 +340,200 @@ class RemoteEnv:
         if "privileged" in reply:
             self._privileged = list(reply["privileged"])
         return reply
+
+
+class ShardedRemoteEnv:
+    """Synchronous sharded client over equal-width ``RemoteEnv`` workers."""
+
+    def __init__(
+        self,
+        host: str,
+        ports: Sequence[int],
+        *,
+        num_envs: int,
+        min_reset_free_vram_mib: int = 0,
+        timeout: float = 2400.0,
+        reset_timeout: float = 10800.0,
+    ):
+        port_list = [int(port) for port in ports]
+        if not port_list or len(set(port_list)) != len(port_list):
+            raise ValueError("ShardedRemoteEnv requires nonempty unique ports.")
+        if any(port < 1 or port > 65535 for port in port_list):
+            raise ValueError("ShardedRemoteEnv ports must lie in 1..65535.")
+        if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < len(port_list):
+            raise ValueError("num_envs must be an integer at least the worker count.")
+        if num_envs % len(port_list) != 0:
+            raise ValueError(f"num_envs ({num_envs}) must be divisible by worker count ({len(port_list)}).")
+        if isinstance(min_reset_free_vram_mib, bool) or int(min_reset_free_vram_mib) < 0:
+            raise ValueError("min_reset_free_vram_mib must be nonnegative.")
+        self.host = str(host)
+        self.ports = tuple(port_list)
+        self.num_envs = int(num_envs)
+        self.worker_envs = self.num_envs // len(self.ports)
+        self.min_reset_free_vram_mib = int(min_reset_free_vram_mib)
+        self._workers = tuple(
+            RemoteEnv(self.host, port, timeout=timeout, reset_timeout=reset_timeout)
+            for port in self.ports
+        )
+        self._pool = ThreadPoolExecutor(max_workers=len(self._workers))
+        self._privileged: list[dict] = []
+        self._completed_waves = 0
+        self._in_wave = False
+        self._wave_finished = [False] * self.num_envs
+        self._closed = False
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("ShardedRemoteEnv is closed.")
+
+    def _run_workers(self, jobs: Sequence[tuple[int, Callable[[], Any]]]) -> dict[int, Any]:
+        futures = [(worker_index, self._pool.submit(fn)) for worker_index, fn in jobs]
+        pending = {future for _, future in futures}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_EXCEPTION)
+            trigger = next(
+                (future.exception() for _, future in futures if future in done and future.exception() is not None),
+                None,
+            )
+            if trigger is not None:
+                self._abort_workers()
+                if pending:
+                    wait(pending)
+                self.close()
+                raise trigger
+        return {worker_index: future.result() for worker_index, future in futures}
+
+    def _abort_workers(self) -> None:
+        for worker in self._workers:
+            worker.abort()
+
+    def connect(self) -> None:
+        self._require_open()
+
+        def _connect_worker(worker: RemoteEnv) -> None:
+            worker.connect()
+            width = worker.worker_width()
+            if width != self.worker_envs:
+                raise RuntimeError(
+                    f"Isaac worker on {worker.host}:{worker.port} reported num_envs={width}, "
+                    f"expected {self.worker_envs}."
+                )
+
+        self._run_workers([(i, lambda w=worker: _connect_worker(w)) for i, worker in enumerate(self._workers)])
+
+    def reset_batch(self, seeds):
+        self._require_open()
+        seed_list = [None if seed is None else int(seed) for seed in seeds]
+        if len(seed_list) != self.num_envs:
+            raise ValueError(f"Expected {self.num_envs} seeds, got {len(seed_list)}.")
+        if self._completed_waves > 0 and self.min_reset_free_vram_mib > 0:
+            try:
+                free_mib = self._workers[0].headroom_mib()
+            except Exception:
+                self._abort_workers()
+                self.close()
+                raise
+            if free_mib is not None and free_mib < self.min_reset_free_vram_mib:
+                print(
+                    f"[env] coordinated recycle before reset: free VRAM {free_mib} MiB "
+                    f"below {self.min_reset_free_vram_mib} MiB across {len(self._workers)} workers",
+                    flush=True,
+                )
+                self._run_workers([(i, worker.recycle) for i, worker in enumerate(self._workers)])
+        width = self.worker_envs
+        outputs = self._run_workers(
+            [
+                (i, lambda w=worker, s=seed_list[i * width : (i + 1) * width]: w.reset_batch(s))
+                for i, worker in enumerate(self._workers)
+            ]
+        )
+        observations: list[dict] = []
+        infos: list[dict] = []
+        privileged: list[dict] = []
+        for i, worker in enumerate(self._workers):
+            worker_obs, worker_infos = outputs[i]
+            if len(worker_obs) != width or len(worker_infos) != width or len(worker._privileged) != width:
+                self.close()
+                raise RuntimeError(
+                    f"Isaac worker {i} returned inconsistent reset width "
+                    f"({len(worker_obs)}, {len(worker_infos)}, {len(worker._privileged)}) != {width}."
+                )
+            base = i * width
+            for local_index in range(width):
+                observations.append(worker_obs[local_index])
+                info = dict(worker_infos[local_index])
+                if "env_index" in info:
+                    info["env_index"] = base + local_index
+                infos.append(info)
+                privileged.append(worker._privileged[local_index])
+        self._privileged = privileged
+        self._wave_finished = [False] * self.num_envs
+        self._in_wave = True
+        return observations, infos
+
+    def step_batch(self, actions, active):
+        self._require_open()
+        active_list = [int(index) for index in active]
+        if len(actions) != len(active_list):
+            raise ValueError(f"Got {len(actions)} actions for {len(active_list)} environments.")
+        if not active_list:
+            self._privileged = []
+            return []
+        width = self.worker_envs
+        grouped: dict[int, list[tuple[int, int, Any]]] = {}
+        for pos, (global_index, action) in enumerate(zip(active_list, actions)):
+            if global_index < 0 or global_index >= self.num_envs:
+                raise ValueError(f"Active environment index {global_index} out of range 0..{self.num_envs - 1}.")
+            worker_index, local_index = divmod(global_index, width)
+            grouped.setdefault(worker_index, []).append((pos, local_index, action))
+        jobs = []
+        for worker_index in sorted(grouped):
+            items = grouped[worker_index]
+            w_actions = [item[2] for item in items]
+            w_active = [item[1] for item in items]
+            worker = self._workers[worker_index]
+            jobs.append((worker_index, lambda w=worker, a=w_actions, idx=w_active: w.step_batch(a, idx)))
+        outputs = self._run_workers(jobs)
+        results: list[Any] = [None] * len(active_list)
+        privileged: list[Any] = [None] * len(active_list)
+        for worker_index in sorted(grouped):
+            items = grouped[worker_index]
+            worker = self._workers[worker_index]
+            worker_results = outputs[worker_index]
+            if len(worker_results) != len(items) or len(worker._privileged) != len(items):
+                self.close()
+                raise RuntimeError(
+                    f"Isaac worker {worker_index} returned {len(worker_results)} step results "
+                    f"for {len(items)} active environments."
+                )
+            for item_pos, (global_pos, _local_index, _action) in enumerate(items):
+                obs, score, terminated, truncated, info = worker_results[item_pos]
+                mapped_info = dict(info)
+                if "env_index" in mapped_info:
+                    mapped_info["env_index"] = active_list[global_pos]
+                results[global_pos] = (obs, score, terminated, truncated, mapped_info)
+                privileged[global_pos] = worker._privileged[item_pos]
+                if terminated or truncated:
+                    self._wave_finished[active_list[global_pos]] = True
+        if self._in_wave and all(self._wave_finished):
+            self._completed_waves += 1
+            self._in_wave = False
+        self._privileged = privileged
+        return results
+
+    def privileged(self, index: int) -> dict:
+        return dict(self._privileged[index])
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for worker in self._workers:
+            try:
+                worker.close()
+            except Exception:
+                pass
+        self._pool.shutdown(wait=True, cancel_futures=True)
 
 
 class _BlobCollector:

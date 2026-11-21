@@ -9,9 +9,22 @@ finetune_updates: 28
 max_train_seconds: 28800
 # Complete waves of num_envs; each scene keeps its own episode boundary.
 finetune_episodes: 16
-# Curriculum layout ids in the seed-0 layout set; cycle evenly across scenes.
-# Extend this list only after independent evaluations meet the stage criterion.
+# Cycle through all seed-0 layouts.
 rollout_layout_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
   - 14
   - 15
   - 16
@@ -22,6 +35,37 @@ rollout_layout_ids:
   - 21
   - 22
   - 23
+  - 24
+  - 25
+  - 26
+  - 27
+  - 28
+  - 29
+  - 30
+  - 31
+  - 32
+  - 33
+  - 34
+  - 35
+  - 36
+  - 37
+  - 38
+  - 39
+  - 40
+  - 41
+  - 42
+  - 43
+  - 44
+  - 45
+  - 46
+  - 47
+  - 48
+  - 49
+  - 50
+  - 51
+  - 52
+  - 53
+  - 54
 # Use task score, dense progress and phase events without overlapping PBRS.
 reach_weight: 0.0
 reach_scale: 0.25

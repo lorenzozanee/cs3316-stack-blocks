@@ -186,7 +186,8 @@ class _ScriptedEnv:
             terminated = bool(ended and script["terminated"])
             truncated = bool(ended and not script["terminated"])
             results.append(
-                (self._observation(scene, step), score, terminated, truncated, {})
+                (self._observation(scene, step), score, terminated, truncated,
+                 {"success_reward": float(terminated)})
             )
         return results
 
@@ -520,6 +521,7 @@ class CollectWaveTest(unittest.TestCase):
         )
         self.assertEqual([episode["layout_id"] for episode in episodes], [10, 11])
         self.assertEqual([episode["terminated"] for episode in episodes], [True, False])
+        self.assertEqual([episode["final_success_reward"] for episode in episodes], [1.0, 0.0])
 
 
 class PBRSCollectorTest(unittest.TestCase):
@@ -1132,7 +1134,7 @@ class TrainOnlineTest(unittest.TestCase):
             second_output = root / "second"
             second_config = _online_config(first_last)
             second_config["finetune_updates"] = 1
-            second_config["rollout_layout_ids"] = [14, 15, 16]
+            second_config["rollout_layout_ids"] = list(range(55))
             second_config["lr"] = 5e-3
             second_env = _OnlineFakeEnv()
             captured = {}
@@ -1156,7 +1158,7 @@ class TrainOnlineTest(unittest.TestCase):
                 second_last = act_online.train_online(second_config)
 
             self.assertTrue(second_env.closed)
-            self.assertEqual(second_env.reset_calls, [[15, 16], [14, 15]])
+            self.assertEqual(second_env.reset_calls, [[4, 5], [6, 7]])
             # Before the first new PPO step the residual, optimizer moments and
             # requested lr come from the saved online checkpoint.
             for key, value in first["residual_state_dict"].items():
@@ -1171,7 +1173,7 @@ class TrainOnlineTest(unittest.TestCase):
             second = torch.load(second_last, map_location="cpu", weights_only=True)
             self.assertEqual(second["update"], 2)
             self.assertEqual(second["layout_cursor"], 8)
-            self.assertEqual(second["global_step"], 16)
+            self.assertEqual(second["global_step"], 15)
             self.assertEqual(second["base_config"], base_config)
             for key, value in base_state.items():
                 torch.testing.assert_close(second["base_state_dict"][key], value, msg=key)
@@ -1187,12 +1189,12 @@ class TrainOnlineTest(unittest.TestCase):
             records = [json.loads(line) for line in
                        (second_output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual([(r["update"], r["absolute_update"], r["global_step"])
-                              for r in records], [(1, 2, 16)])
+                              for r in records], [(1, 2, 15)])
             metadata = json.loads((second_output / "metadata.json").read_text())
             self.assertEqual(metadata["start_update"], 1)
             self.assertEqual(metadata["completed_updates"], 1)
             self.assertEqual(metadata["final_update"], 2)
-            self.assertEqual(metadata["final_global_step"], 16)
+            self.assertEqual(metadata["final_global_step"], 15)
 
             runner, residual, residual_scale = load_act_runner(second_last, "cpu")
             self.assertAlmostEqual(residual_scale, first_config["residual_scale"])
@@ -1245,6 +1247,37 @@ class TrainOnlineTest(unittest.TestCase):
             self.assertEqual(second["residual_config"]["initial_std"], 0.25)
             self.assertEqual(second["update"], 2)
             self.assertEqual(second["layout_cursor"], first["layout_cursor"] + 4)
+
+    def test_env_workers_validation_and_sharded_wiring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint, _, _ = self._write_base(root)
+            for bad_workers in (0, -1, True, 1.5, 3):
+                cfg = _online_config(checkpoint)
+                cfg.update(num_envs=4, finetune_episodes=4, finetune_updates=1, env_workers=bad_workers)
+                with self.assertRaises(ValueError):
+                    act_online._validate_config(cfg)
+            overflow = _online_config(checkpoint)
+            overflow.update(num_envs=4, finetune_episodes=4, finetune_updates=1, env_workers=2, env_port=65535)
+            with self.assertRaises(ValueError):
+                act_online._validate_config(overflow)
+
+            cfg = _online_config(checkpoint)
+            cfg.update(
+                num_envs=4, finetune_episodes=4, finetune_updates=1,
+                env_workers=2, min_reset_free_vram_mib=2560,
+            )
+            fake_env = _OnlineFakeEnv()
+            out = root / "sharded_out"
+            with mock.patch.object(act_online, "ShardedRemoteEnv", return_value=fake_env) as sharded_cls, \
+                    mock.patch.object(act_online, "online_output_dir", return_value=out), \
+                    mock.patch("sys.stdout", io.StringIO()):
+                ckpt = act_online.train_online(cfg)
+            sharded_cls.assert_called_once_with(
+                "127.0.0.1", [5555, 5556], num_envs=4, min_reset_free_vram_mib=2560
+            )
+            meta = json.loads((ckpt.parent / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["env_workers"], 2)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ if not torch.cuda.is_available() or min(policy_gpu, env_gpu) < 0 or max(policy_g
 min_reset_free_vram_mib = cfg.get('min_reset_free_vram_mib', 0)
 if type(min_reset_free_vram_mib) is not int or min_reset_free_vram_mib < 0:
     raise ValueError('min_reset_free_vram_mib must be a nonnegative integer.')
+if int(cfg.get('env_workers', 1)) != 1:
+    raise ValueError('train_act_residual.sh supports env_workers=1; use scripts/train_act_colab.py for multi-worker training.')
 for key in ('policy_gpu', 'env_gpu', 'env_port', 'rollout_task', 'env_cfg', 'num_envs'):
     print(require(cfg, key))
 print(min_reset_free_vram_mib)

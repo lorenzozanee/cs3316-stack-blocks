@@ -25,7 +25,7 @@ import torch
 
 from starter.config import require
 from starter.envs.parallel import parallel_plan
-from starter.envs.remote import RemoteEnv
+from starter.envs.remote import RemoteEnv, ShardedRemoteEnv
 from starter.interfaces import ACTION_DIM, BLOCK_LABELS, PARTIAL_SCORE, STEP_LIMIT, SUCCESS_SCORE
 from starter.paths import OUTPUTS_ROOT, REPO_ROOT, run_name, run_stamp
 from starter.policies.act import _training_device, _validate_task, _vram_stats, load_offline_policy
@@ -223,7 +223,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             next_values = dict(zip(bootstrap_ids, bootstrap_values.cpu().tolist()))
         remaining = []
         for pos, (i, result) in enumerate(zip(active, results)):
-            observation, score, terminated, truncated, _ = result
+            observation, score, terminated, truncated, info = result
             score = float(score)
             if not math.isfinite(score):
                 raise ValueError("Environment returned a non-finite score.")
@@ -321,6 +321,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                 episodes.append({"layout_id": int(seeds[i]), "length": len(trajectories[i]),
                                  "prefix_steps": prefix_steps[i],
                                  "final_score": score, "peak_score": peak_scores[i],
+                                 "final_success_reward": info.get("success_reward"),
                                  "success": bool(terminated and score == SUCCESS_SCORE),
                                  "terminated": bool(terminated), "truncated": bool(truncated),
                                  "episode_return": episode_returns[i],
@@ -557,6 +558,14 @@ def _validate_config(config):
             or any(isinstance(i, bool) or not isinstance(i, int) or i < 0 for i in layout_ids)
             or len(set(layout_ids)) != len(layout_ids)):
         raise ValueError("rollout_layout_ids must be a nonempty list of unique nonnegative integers.")
+    env_workers = config.get("env_workers", 1)
+    if isinstance(env_workers, bool) or not isinstance(env_workers, int) or env_workers < 1:
+        raise ValueError("env_workers must be a positive integer.")
+    if width % env_workers != 0:
+        raise ValueError(f"num_envs ({width}) must be divisible by env_workers ({env_workers}).")
+    base_port = int(require(config, "env_port"))
+    if base_port < 1 or base_port + env_workers - 1 > 65535:
+        raise ValueError("env_port range for env_workers must lie in 1..65535.")
     return updates, episodes, width
 
 
@@ -700,6 +709,7 @@ def train_online(config: dict) -> Path:
         "vram_scope": "learner-process PyTorch allocator only; excludes Isaac and other processes",
         "vram_peak_scope": "per rollout/PPO update, reset before rollout",
         "start_update": start_update,
+        "env_workers": int(config.get("env_workers", 1)),
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     # A self-contained checkpoint can be evaluated without the original run directory.
@@ -724,7 +734,18 @@ def train_online(config: dict) -> Path:
 
     from starter.policies.act_online_metrics import metric_row, plot_online_training
 
-    env = RemoteEnv(str(require(config, "env_host")), int(require(config, "env_port")))
+    env_host = str(require(config, "env_host"))
+    env_port = int(require(config, "env_port"))
+    env_workers = int(config.get("env_workers", 1))
+    if env_workers == 1:
+        env = RemoteEnv(env_host, env_port)
+    else:
+        env = ShardedRemoteEnv(
+            env_host,
+            [env_port + i for i in range(env_workers)],
+            num_envs=width,
+            min_reset_free_vram_mib=int(config.get("min_reset_free_vram_mib", 0)),
+        )
     episode_count = completed_updates = 0
     stop_reason = "completed"
     expected_waves = episodes_per_update // width

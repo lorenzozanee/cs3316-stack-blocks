@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
 
@@ -49,6 +49,7 @@ class ColabScriptsTests(unittest.TestCase):
             logs = Path(tmp)
             args = types.SimpleNamespace(
                 num_envs=16,
+                env_workers=1,
                 port=5555,
                 min_reset_free_vram_mib=2560,
                 round=25,
@@ -64,6 +65,7 @@ class ColabScriptsTests(unittest.TestCase):
             env_data = load_config(env_cfg)
             train_data = load_config(train_cfg)
             self.assertEqual(env_data["num_envs"], 16)
+            self.assertEqual(env_data["env_workers"], 1)
             self.assertEqual(env_data["min_reset_free_vram_mib"], 2560)
             self.assertEqual(train_data["max_train_seconds"], 3600)
             self.assertEqual(train_data["finetune_episodes"], 16)
@@ -72,15 +74,21 @@ class ColabScriptsTests(unittest.TestCase):
 
             self.assertNotIn("act_inference_batch_size", train_data)
             args.round = 26
+            args.env_workers = 4
             args.act_inference_batch_size = 8
-            _, train_cfg2, _ = mod.write_configs(args, "2026.11.21-12.00.00")
+            env_cfg2, train_cfg2, _ = mod.write_configs(args, "2026.11.21-12.00.00")
+            self.assertEqual(load_config(env_cfg2)["env_workers"], 4)
             train_data2 = load_config(train_cfg2)
             self.assertEqual(train_data2["max_train_seconds"], 7200)
             self.assertEqual(train_data2["act_inference_batch_size"], 8)
+            self.assertEqual(train_data2["rollout_layout_ids"], list(range(55)))
 
+            args.round = 27
             args.num_envs = 12
             _, train_cfg3, _ = mod.write_configs(args, "2026.11.21-13.00.00")
-            self.assertEqual(load_config(train_cfg3)["finetune_episodes"], 24)
+            train_data3 = load_config(train_cfg3)
+            self.assertEqual(train_data3["finetune_episodes"], 24)
+            self.assertEqual(train_data3["rollout_layout_ids"], list(range(55)))
 
             args.measure_updates = 1
             _, train_cfg4, _ = mod.write_configs(args, "2026.11.21-14.00.00")
@@ -216,6 +224,98 @@ class ColabScriptsTests(unittest.TestCase):
         self.assertEqual(env["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_NVIDIA_CUROBO"], "0.8.0")
         self.assertEqual(env["OMNI_CRASHREPORTER_ENABLED"], "0")
         self.assertEqual(env["VK_ICD_FILENAMES"], "/content/env/nvidia_icd.json")
+
+    def test_build_sim_commands_single_and_multi_worker(self):
+        mod = _load_colab_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / "logs"
+            args = types.SimpleNamespace(
+                environment=Path("/content/env"),
+                logs=logs,
+                num_envs=64,
+                env_workers=1,
+                port=5555,
+                min_reset_free_vram_mib=2560,
+                tasking_threads=None,
+                physx_threads=None,
+            )
+            single = mod.build_sim_commands(args, "stamp1")
+            self.assertEqual(len(single), 1)
+            cmd, log_path, extra_env, cache_root = single[0]
+            self.assertEqual(log_path, logs / "isaac_server.log")
+            self.assertEqual(extra_env, {})
+            self.assertIsNone(cache_root)
+            self.assertNotIn("--coordinated-recycle", cmd)
+            self.assertEqual(cmd[cmd.index("--num-envs") + 1], "64")
+
+            args.env_workers = 4
+            args.tasking_threads = 8
+            args.physx_threads = 4
+            multi = mod.build_sim_commands(args, "stamp2")
+            self.assertEqual(len(multi), 4)
+            ports = []
+            cache_roots = set()
+            for idx, (cmd, log_path, extra_env, cache_root) in enumerate(multi):
+                self.assertEqual(log_path, logs / f"isaac_server_w{idx}.log")
+                self.assertEqual(cmd[cmd.index("--num-envs") + 1], "16")
+                ports.append(int(cmd[cmd.index("--port") + 1]))
+                self.assertIn("--coordinated-recycle", cmd)
+                self.assertIn("--portable-root", cmd)
+                kit_args = cmd[cmd.index("--kit_args") + 1]
+                self.assertNotIn("ujitsoCollisionCooking", kit_args)
+                self.assertIn("--/plugins/carb.tasking.plugin/threadCount=8", kit_args)
+                self.assertIn("--/persistent/physics/numThreads=4", kit_args)
+                self.assertIsNotNone(cache_root)
+                cache_roots.add(cache_root)
+                self.assertEqual(extra_env, {"XDG_CACHE_HOME": str(cache_root / "xdg")})
+                self.assertEqual(cmd[cmd.index("--portable-root") + 1], str(cache_root / "portable"))
+            self.assertEqual(ports, [5555, 5556, 5557, 5558])
+            self.assertEqual(len(cache_roots), 4)
+
+    def test_launcher_stops_learner_only_on_supervisor_failure(self):
+        for fail in (False, True):
+            with self.subTest(supervisor_failure=fail), tempfile.TemporaryDirectory() as tmp:
+                mod = _load_colab_module()
+                root = Path(tmp)
+                (root / "ready").touch()
+                (root / "config.json").write_text('{"policy_type": "act_residual_ppo"}')
+                (root / "base.ckpt").touch()
+                logs = root / "logs"
+                argv = [str(SCRIPT_PATH), "--environment", str(root), "--checkpoint", str(root / "base.ckpt"),
+                        "--logs", str(logs), "--round", "26", "--num-envs", "4", "--env-workers", "2",
+                        "--min-reset-free-vram-mib", "2560", "--measure-updates", "1"]
+                learner, sim0, sim1 = (Mock(pid=i) for i in range(3))
+                for proc in (learner, sim0, sim1):
+                    proc.returncode = None
+                    proc.poll.side_effect = lambda proc=proc: proc.returncode
+                    proc.terminate.side_effect = lambda proc=proc: setattr(proc, "returncode", -15)
+                procs = [learner, sim0, OSError("cannot launch worker 1") if fail else sim1]
+                gpu = "2026/11/21 20:42:30, NVIDIA RTX PRO 6000, 100, 97887, 0, 97151"
+
+                def learner_finishes(seconds):
+                    if seconds == 1:
+                        learner.returncode = 0
+
+                with (patch.object(sys, "argv", argv), patch.object(sys, "path", list(sys.path)),
+                      patch.object(mod, "write_configs", return_value=(logs / "env.yaml", logs / "online.yaml", root / "out")),
+                      patch.object(mod.subprocess, "Popen", side_effect=procs),
+                      patch.object(mod.subprocess, "check_output", return_value=gpu),
+                      patch.object(mod.time, "sleep", side_effect=learner_finishes)):
+                    if fail:
+                        with self.assertRaisesRegex(OSError, "cannot launch worker 1"):
+                            mod.main()
+                        learner.terminate.assert_called_once_with()
+                    else:
+                        self.assertEqual(mod.main(), 0)
+                        learner.terminate.assert_not_called()
+                        sim1.terminate.assert_called_once_with()
+                sim0.terminate.assert_called_once_with()
+                status = json.loads((logs / "status.json").read_text())
+                self.assertEqual(status["state"], "finished")
+                self.assertEqual(status["learner_exit"], -15 if fail else 0)
+                self.assertEqual("supervisor_error" in status, fail)
+                self.assertTrue(Path(status["archive"]).is_file())
+                self.assertEqual(list(root.glob(".*-worker-*-cache")), [])
 
 
 if __name__ == "__main__":

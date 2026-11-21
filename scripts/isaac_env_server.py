@@ -22,10 +22,14 @@ parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--once", action="store_true")
 parser.add_argument("--min-reset-free-vram-mib", type=int, default=0)
+parser.add_argument("--coordinated-recycle", action="store_true")
+parser.add_argument("--portable-root")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 if args.min_reset_free_vram_mib < 0:
     parser.error("--min-reset-free-vram-mib must be nonnegative")
+if args.portable_root:
+    os.makedirs(args.portable_root, exist_ok=True)
 
 from env.camera_manager.capture.render_sync import add_zero_delay_kit_args
 
@@ -104,18 +108,26 @@ def main() -> None:
     print(f"[env] task {task_name} ready num_envs {width} layouts {layout_count}", flush=True)
     recycled = serve(
         adapter, args.host, args.port, once=args.once,
-        should_recycle=_vram_below_reset_headroom if args.min_reset_free_vram_mib else None,
+        should_recycle=(_vram_below_reset_headroom
+                        if args.min_reset_free_vram_mib and not args.coordinated_recycle
+                        else None),
+        coordinated_recycle=args.coordinated_recycle,
+        free_vram_mib=_free_vram_mib,
     )
     if recycled:
         # The RPC sockets are closed. Let the container release the renderer even if Kit teardown hangs.
         os._exit(0)
 
 
-def _vram_below_reset_headroom() -> bool:
+def _free_vram_mib() -> int:
     import torch
 
     free_bytes, _ = torch.cuda.mem_get_info(args.device)
-    free_mib = free_bytes // 2**20
+    return int(free_bytes // 2**20)
+
+
+def _vram_below_reset_headroom() -> bool:
+    free_mib = _free_vram_mib()
     if free_mib >= args.min_reset_free_vram_mib:
         return False
     print(f"[env] recycling before reset: free VRAM {free_mib} MiB below "

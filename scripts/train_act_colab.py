@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import hashlib
 import math
 import json
@@ -127,6 +128,7 @@ def write_configs(args, run_stamp: str) -> tuple[Path, Path, Path]:
     online = yaml.safe_load((ROOT / "configs/act_online.yaml").read_text(encoding="utf-8"))
     env.update(
         num_envs=args.num_envs,
+        env_workers=args.env_workers,
         env_port=args.port,
         min_reset_free_vram_mib=args.min_reset_free_vram_mib,
     )
@@ -189,6 +191,61 @@ def build_runtime_env(environment: Path, base_env: dict[str, str] | None = None)
     return env
 
 
+def build_sim_commands(
+    args, run_stamp: str = "run",
+) -> list[tuple[list[str | Path], Path, dict[str, str], Path | None]]:
+    per_worker = args.num_envs // args.env_workers
+    kit_parts = [
+        "--enable isaacsim.replicator.behavior",
+        "--enable isaacsim.sensors.camera",
+        "--/app/hangDetector/enabled=false",
+    ]
+    if args.physx_threads is not None:
+        kit_parts.append(f"--/persistent/physics/numThreads={args.physx_threads}")
+    if args.tasking_threads is not None:
+        kit_parts.append(f"--/plugins/carb.tasking.plugin/threadCount={args.tasking_threads}")
+        kit_parts.append(f"--/plugins/omni.tbb.globalcontrol/maxThreadCount={args.tasking_threads}")
+    base_kit_args = " ".join(kit_parts)
+    commands: list[tuple[list[str | Path], Path, dict[str, str], Path | None]] = []
+    for index in range(args.env_workers):
+        extra_env: dict[str, str] = {}
+        cache_root: Path | None = None
+        kit_args = base_kit_args
+        cmd: list[str | Path] = [
+            args.environment / "sim/bin/python", "-u", ROOT / "scripts/isaac_env_server.py",
+            "--task", "stack_blocks", "--env-cfg", "arx_x5", "--port", str(args.port + index),
+            "--num-envs", str(per_worker), "--headless", "--enable_cameras", "--device", "cuda:0",
+            "--min-reset-free-vram-mib", str(args.min_reset_free_vram_mib),
+        ]
+        if args.env_workers > 1:
+            cache_root = args.logs.parent / f".{run_stamp}-worker-{index}-cache"
+            extra_env = {"XDG_CACHE_HOME": str(cache_root / "xdg")}
+            kit_args = (
+                f"{base_kit_args}"
+                f" --/app/tokens/cache={cache_root / 'cache'}"
+                f" --/app/tokens/data={cache_root / 'data'}"
+                f" --/app/tokens/logs={cache_root / 'logs'}"
+            )
+            cmd.extend(["--coordinated-recycle", "--portable-root", str(cache_root / "portable")])
+        cmd.extend(["--kit_args", kit_args])
+        log_name = "isaac_server.log" if args.env_workers == 1 else f"isaac_server_w{index}.log"
+        commands.append((cmd, args.logs / log_name, extra_env, cache_root))
+    return commands
+
+
+def _stop_processes(processes) -> None:
+    alive = [proc for proc in processes if proc is not None and proc.poll() is None]
+    for proc in alive:
+        proc.terminate()
+    deadline = time.monotonic() + 15
+    for proc in alive:
+        try:
+            proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--environment", required=True, type=Path)
@@ -196,19 +253,31 @@ def main() -> int:
     parser.add_argument("--logs", required=True, type=Path)
     parser.add_argument("--round", required=True, type=int)
     parser.add_argument("--num-envs", required=True, type=int)
+    parser.add_argument("--env-workers", type=int, default=1)
     parser.add_argument("--min-reset-free-vram-mib", required=True, type=int)
     parser.add_argument("--port", type=int, default=5555)
+    parser.add_argument("--worker-stagger-seconds", type=float, default=3.0)
+    parser.add_argument("--tasking-threads", type=int)
+    parser.add_argument("--physx-threads", type=int)
     parser.add_argument("--finetune-episodes", type=int)
     parser.add_argument("--act-inference-batch-size", type=int)
     parser.add_argument("--max-train-seconds", type=int)
     parser.add_argument("--drive-credentials-file", type=Path)
     parser.add_argument("--measure-updates", type=int)
     args = parser.parse_args()
-    if (args.round < 25 or args.num_envs < 1 or args.min_reset_free_vram_mib < 1
+    if (args.round < 25 or args.num_envs < 1 or args.env_workers < 1
+            or args.min_reset_free_vram_mib < 1
+            or args.worker_stagger_seconds < 0
+            or (args.tasking_threads is not None and args.tasking_threads < 1)
+            or (args.physx_threads is not None and args.physx_threads < 1)
             or (args.measure_updates is not None and args.measure_updates < 1)
             or (args.finetune_episodes is not None and args.finetune_episodes < 1)
             or (args.max_train_seconds is not None and args.max_train_seconds < 1)):
-        parser.error("Require round >= 25 and positive scene, episode, budget and headroom counts.")
+        parser.error("Require round >= 25 and positive scene, worker, episode, budget and headroom counts.")
+    if args.num_envs % args.env_workers != 0:
+        parser.error(f"--num-envs ({args.num_envs}) must be divisible by --env-workers ({args.env_workers}).")
+    if args.port < 1 or args.port + args.env_workers - 1 > 65535:
+        parser.error("Port range for --env-workers must lie in 1..65535.")
     if args.act_inference_batch_size is not None and args.act_inference_batch_size < 1:
         parser.error("--act-inference-batch-size must be positive.")
     if not args.measure_updates:
@@ -238,31 +307,38 @@ def main() -> int:
         raise FileExistsError(output)
 
     env = build_runtime_env(args.environment)
-    sim_cmd = [
-        args.environment / "sim/bin/python", "-u", ROOT / "scripts/isaac_env_server.py",
-        "--task", "stack_blocks", "--env-cfg", "arx_x5", "--port", str(args.port),
-        "--num-envs", str(args.num_envs), "--headless", "--enable_cameras", "--device", "cuda:0",
-        "--min-reset-free-vram-mib", str(args.min_reset_free_vram_mib),
-        "--kit_args", "--enable isaacsim.replicator.behavior --enable isaacsim.sensors.camera",
-    ]
+    sim_specs = build_sim_commands(args, run_stamp)
+    for _, _, extra_env, cache_root in sim_specs:
+        if cache_root is not None:
+            for sub in ("cache", "data", "logs", "portable", "xdg"):
+                (cache_root / sub).mkdir(parents=True, exist_ok=True)
     learner_cmd = [
         args.environment / "learner/bin/python", "-u", "-m", "starter.pipelines.act", "online",
         "--config", env_cfg, "--online-config", train_cfg, "--checkpoint", args.checkpoint,
     ]
     gpu_query = [
-        "nvidia-smi", "--query-gpu=timestamp,name,memory.used,memory.total,utilization.gpu",
+        "nvidia-smi", "--query-gpu=timestamp,name,memory.used,memory.total,utilization.gpu,memory.free",
         "--format=csv,noheader,nounits", "-i", "0",
     ]
     gpu = subprocess.check_output(gpu_query, text=True).strip()
     if "RTX PRO 6000" not in gpu or int(gpu.split(",")[3]) < 95000:
         raise RuntimeError(f"Expected a 96 GB G4 runtime, got {gpu}.")
-    sim = learner = None
+    sims: list[subprocess.Popen | None] = [None] * len(sim_specs)
+    restart_at = [0.0] * len(sim_specs)
+    worker_restarts = [0] * len(sim_specs)
+    worker_exits: list[int | None] = [None] * len(sim_specs)
+    learner = None
     checkpoint = output / "policy_last.ckpt"
     archived_inode = None
     last_backup = float("-inf")
     backup_job = None
-    restart_at = 0.0
-    status = {"run_stamp": run_stamp, "num_envs": args.num_envs, "output": str(output)}
+    status = {
+        "run_stamp": run_stamp,
+        "num_envs": args.num_envs,
+        "env_workers": args.env_workers,
+        "per_worker_envs": args.num_envs // args.env_workers,
+        "output": str(output),
+    }
     status_path = args.logs / "status.json"
 
     def write_status(**fields):
@@ -284,35 +360,54 @@ def main() -> int:
         last_backup = time.monotonic()
 
     try:
-        with ((args.logs / "isaac_server.log").open("ab") as sim_log,
-              (args.logs / "learner.log").open("ab") as learner_log,
-              (args.logs / "resources.csv").open("a", buffering=1) as resources,
-              ThreadPoolExecutor(max_workers=1) as uploader):
+        with ExitStack() as stack:
+            sim_logs = [stack.enter_context(log_path.open("ab")) for _, log_path, _, _ in sim_specs]
+            learner_log = stack.enter_context((args.logs / "learner.log").open("ab"))
+            resources = stack.enter_context((args.logs / "resources.csv").open("a", buffering=1))
+            uploader = stack.enter_context(ThreadPoolExecutor(max_workers=1))
             learner = subprocess.Popen(
                 learner_cmd, stdout=learner_log, stderr=subprocess.STDOUT, cwd=ROOT, env=env,
             )
             while learner.poll() is None:
-                if (sim is None or sim.poll() is not None) and time.monotonic() >= restart_at:
-                    if sim is not None:
-                        write_status(simulator_exit=sim.returncode)
-                    sim = subprocess.Popen(
-                        sim_cmd, stdout=sim_log, stderr=subprocess.STDOUT, cwd=DOJO, env=env,
-                    )
-                    restart_at = time.monotonic() + 15
+                spawned_this_tick = False
+                for index, (sim_cmd, _log_path, extra_env, _cache_root) in enumerate(sim_specs):
+                    proc = sims[index]
+                    now = time.monotonic()
+                    if (proc is None or proc.poll() is not None) and now >= restart_at[index]:
+                        if proc is not None:
+                            worker_exits[index] = proc.returncode
+                            worker_restarts[index] += 1
+                            write_status(
+                                simulator_exit=proc.returncode,
+                                simulator_exits=list(worker_exits),
+                                worker_restarts=list(worker_restarts),
+                            )
+                        if spawned_this_tick and args.worker_stagger_seconds > 0:
+                            time.sleep(args.worker_stagger_seconds)
+                        worker_env = {**env, **extra_env} if extra_env else env
+                        sims[index] = subprocess.Popen(
+                            sim_cmd, stdout=sim_logs[index], stderr=subprocess.STDOUT, cwd=DOJO, env=worker_env,
+                        )
+                        restart_at[index] = time.monotonic() + 15
+                        spawned_this_tick = True
+                sim_pids = [proc.pid if proc is not None else None for proc in sims]
                 try:
                     use = subprocess.check_output(gpu_query, text=True, timeout=10).strip()
                     resources.write(use + "\n")
                     write_status(
                         learner_pid=learner.pid,
-                        simulator_pid=sim.pid if sim is not None else None,
+                        simulator_pid=sim_pids[0],
+                        simulator_pids=sim_pids,
                         heartbeat=time.time(),
                         gpu=use,
+                        gpu_query_error=None,
                         state="running",
                     )
                 except (subprocess.SubprocessError, OSError) as error:
                     write_status(
                         learner_pid=learner.pid,
-                        simulator_pid=sim.pid if sim is not None else None,
+                        simulator_pid=sim_pids[0],
+                        simulator_pids=sim_pids,
                         heartbeat=time.time(),
                         gpu_query_error=str(error),
                         state="running",
@@ -326,20 +421,22 @@ def main() -> int:
                     backup_job = uploader.submit(
                         _backup_checkpoint, output, backup, snapshot, run_stamp, args.drive_credentials_file,
                     )
-                time.sleep(10)
+                time.sleep(1)
             collect_backup(wait=True)
             write_status(learner_exit=learner.returncode, state="packaging")
+    except (Exception, KeyboardInterrupt) as error:
+        # A failed supervisor cannot restart Isaac or back up a live learner.
+        _stop_processes([learner, *sims])
+        write_status(supervisor_error=f"{type(error).__name__}: {error}",
+                     learner_exit=learner.returncode if learner is not None else None, state="packaging")
+        raise
     finally:
         collect_backup(wait=True)
-        # The learner owns the soft training budget. Stop only the simulator after learner exit.
-        if sim is not None and learner is not None and learner.poll() is not None and sim.poll() is None:
-            sim.terminate()
-            try:
-                sim.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                sim.kill()
-                sim.wait()
-        if learner is not None and learner.poll() is not None:
+        _stop_processes(sims)
+        for _, _, _, cache_root in sim_specs:
+            if cache_root is not None:
+                shutil.rmtree(cache_root, ignore_errors=True)
+        if learner is not None:
             archive = args.logs.parent / f"{run_stamp}.tar.gz"
             with tarfile.open(archive, "w:gz", compresslevel=1) as bundle:
                 if output.is_dir():
