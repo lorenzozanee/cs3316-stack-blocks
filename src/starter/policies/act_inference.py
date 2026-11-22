@@ -100,6 +100,7 @@ class FrozenACTRunner:
         capture_features: bool = False,
         *,
         inference_batch_size: int | None = None,
+        freeze_policy: bool = True,
     ):
         if inference_batch_size is not None and (
             type(inference_batch_size) is not int or inference_batch_size < 1
@@ -108,7 +109,8 @@ class FrozenACTRunner:
         self.inference_batch_size = inference_batch_size
         self.device = torch.device(device)
         self.policy = policy.to(self.device).eval()
-        self.policy.requires_grad_(False)
+        if freeze_policy:
+            self.policy.requires_grad_(False)
         self.stats = _normalization_stats(stats)
         self.temporal_agg = bool(temporal_agg)
         self.capture_features = bool(capture_features)
@@ -116,7 +118,9 @@ class FrozenACTRunner:
         if self.chunk_size < 1:
             raise ValueError("ACT policy must predict at least one action.")
         self.histories: dict[object, deque] = {}
+        self.last_raw_chunks: dict[object, np.ndarray] = {}
         self._visual_features: torch.Tensor | None = None
+        self._capture_active = False
         self._hook = None
         if self.capture_features:
             # The first backbone output map has 512 channels; global-average it
@@ -125,15 +129,18 @@ class FrozenACTRunner:
             self._hook = backbone.register_forward_hook(self._capture_visual)
 
     def _capture_visual(self, _module, _inputs, output) -> None:
+        if not self._capture_active:
+            return
         features = output[0] if isinstance(output, (tuple, list)) else output
         if not isinstance(features, torch.Tensor) or features.ndim != 4:
             raise ValueError("ACT backbone must return a [batch, channels, height, width] map.")
         if features.shape[1] != 512:
             raise ValueError(f"ACT backbone must expose 512 channels, got {features.shape[1]}.")
-        self._visual_features = features.mean(dim=(2, 3))
+        self._visual_features = features.detach().mean(dim=(2, 3))
 
     def reset(self) -> None:
         self.histories = {}
+        self.last_raw_chunks = {}
         self._visual_features = None
 
     def _preprocess(self, obs: Mapping) -> tuple[np.ndarray, np.ndarray]:
@@ -162,8 +169,12 @@ class FrozenACTRunner:
         image = torch.from_numpy(np.stack(images)[:, None]).to(self.device)
         self._visual_features = None
         # Captured features must remain usable as inputs to a trainable head.
-        with torch.no_grad():
-            predictions = self.policy(qpos, image)
+        self._capture_active = bool(with_features)
+        try:
+            with torch.no_grad():
+                predictions = self.policy(qpos, image)
+        finally:
+            self._capture_active = False
         if not isinstance(predictions, torch.Tensor) or predictions.ndim != 3:
             raise ValueError("ACT policy must return a [batch, chunk, action] tensor.")
         if predictions.shape[0] != len(observations) or predictions.shape[2] != ACTION_DIM:
@@ -209,6 +220,7 @@ class FrozenACTRunner:
         chunks: list[np.ndarray] = []
         normalized_actions: list[np.ndarray] = []
         for env_id, predicted in zip(env_ids, predictions):
+            self.last_raw_chunks[env_id] = predicted
             if self.temporal_agg:
                 history = self.histories.setdefault(env_id, deque(maxlen=self.chunk_size))
                 history.append(predicted)

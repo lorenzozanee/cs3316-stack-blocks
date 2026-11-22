@@ -291,8 +291,6 @@ def main() -> int:
     if args.act_inference_batch_size is not None and args.act_inference_batch_size < 1:
         parser.error("--act-inference-batch-size must be positive.")
     if not args.measure_updates:
-        if args.max_train_seconds is not None:
-            parser.error("Formal training uses the round budget; --max-train-seconds is for probes.")
         if args.drive_credentials_file is None or not args.drive_credentials_file.is_file():
             parser.error("Formal training requires a readable private Drive credentials file.")
     if args.drive_credentials_file:

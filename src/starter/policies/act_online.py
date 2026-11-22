@@ -29,6 +29,18 @@ from starter.envs.remote import RemoteEnv, ShardedRemoteEnv
 from starter.interfaces import ACTION_DIM, BLOCK_LABELS, PARTIAL_SCORE, STEP_LIMIT, SUCCESS_SCORE
 from starter.paths import OUTPUTS_ROOT, REPO_ROOT, run_name, run_stamp
 from starter.policies.act import _training_device, _validate_task, _vram_stats, load_offline_policy
+from starter.policies.act_awr import (
+    ActAnchor,
+    ActWaveData,
+    SpatialSoftmaxBlockPoseHead,
+    act_awr_update,
+    build_act_optimizer,
+    concatenate_act_waves,
+    configure_act_unfreeze,
+    encode_rgb_anchor,
+    move_optimizer_state,
+    validate_act_awr_config,
+)
 from starter.policies.act_inference import (
     FEATURE_DIM,
     ONLINE_FORMAT,
@@ -112,7 +124,8 @@ def _block_positions(privileged) -> dict:
 
 @torch.no_grad()
 def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale,
-                 reward_cfg, prefixes=None, capture_prefix=None, timings=None):
+                 reward_cfg, prefixes=None, capture_prefix=None, timings=None,
+                 act_sample_stride: int | None = None, act_waves_out: list | None = None):
     """Finish every scene before resetting; never fabricate inactive transitions.
 
     Features and the raw sampled residual are cached before the environment
@@ -121,13 +134,16 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
     approach and carry waypoints, and dwell-gated grasp and placement bonuses.
     Milestones intentionally add a target-region preference beyond the official
     task; their hidden episode history is not part of actor/critic inputs.
-    Object poses condition only the residual actor/critic, never frozen ACT.
+    Object poses condition only the residual actor/critic, never ACT forward.
     Replayed actions warm ACT and reward history, but never become PPO samples.
     """
     prefixes = prefixes or {}
     if any(not 0 <= i < len(seeds) or entry["scene"] != i or entry["width"] != len(seeds)
            or entry["layout_id"] != seeds[i] for i, entry in prefixes.items()):
         raise ValueError("Post-grasp replay must match layout and scene slot.")
+    capture_act = act_waves_out is not None
+    if capture_act and (act_sample_stride is None or act_sample_stride < 1):
+        raise ValueError("act_sample_stride must be a positive integer when capturing ACT anchors.")
 
     def timed(key, call, *args, **kwargs):
         if timings is None:
@@ -167,6 +183,11 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                     for obs, state in zip(observations, reset_privileged)]
     chunks, features = timed("act_seconds", runner.predict_base, residual_obs, active, with_features=True)
     current = {i: (chunks[pos][0], features[pos]) for pos, i in enumerate(active)}
+    current_obs = {i: residual_obs[pos] for pos, i in enumerate(active)} if capture_act else {}
+    act_anchors: list[ActAnchor] = []
+    executed_norm_by_scene: dict[int, list[np.ndarray]] = {i: [] for i in active} if capture_act else {}
+    action_mean = runner.stats["action_mean"] if capture_act else None
+    action_std = runner.stats["action_std"] if capture_act else None
     prefix_steps = {i: len(prefixes[i]["actions"]) if i in prefixes else 0 for i in active}
     trajectories = {i: [] for i in active}
     previous_scores = {i: 0.0 for i in active}
@@ -209,6 +230,27 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                 (actions - base)[:, [0, 1, 2, 8, 9, 10]].reshape(-1, 2, 3), axis=-1,
             ).mean(axis=-1)
             physical.update(zip(learning, actions.tolist()))
+            if capture_act:
+                exec_norm = ((actions - action_mean) / action_std).astype(np.float32)
+                for pos, i in enumerate(learning):
+                    step_idx = len(trajectories[i])
+                    executed_norm_by_scene[i].append(exec_norm[pos])
+                    if step_idx % act_sample_stride == 0:
+                        obs_i = current_obs[i]
+                        block_xyz = np.concatenate([
+                            np.asarray(obs_i["blocks"][label]["pos"], dtype=np.float32)
+                            for label in BLOCK_LABELS
+                        ])
+                        act_anchors.append(
+                            ActAnchor(
+                                episode_index=i,
+                                step_index=step_idx,
+                                image_jpeg=encode_rgb_anchor(obs_i["image"]),
+                                qpos_norm=inputs[pos][:ACTION_DIM].numpy().copy(),
+                                pred_old=np.asarray(runner.last_raw_chunks[i], dtype=np.float16).copy(),
+                                block_xyz=block_xyz,
+                            )
+                        )
         for i in active:
             if i not in physical:
                 physical[i] = prefixes[i]["actions"][control_step - 1]
@@ -218,6 +260,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         # Include truncated terminal frames for bootstrapping, exclude true terminals.
         bootstrap_ids = [i for i, result in zip(active, results) if not result[2]]
         next_current = {}
+        next_obs_by_scene = {}
         next_values = {}
         privileged_after = env._privileged
         if len(privileged_after) != len(active):
@@ -231,6 +274,8 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             _, _, bootstrap_values = actor.act(next_features, deterministic=True)
             next_current = {i: (next_chunks[pos][0], next_features[pos])
                             for pos, i in enumerate(bootstrap_ids)}
+            if capture_act:
+                next_obs_by_scene = {i: next_obs[pos] for pos, i in enumerate(bootstrap_ids)}
             next_values = dict(zip(bootstrap_ids, bootstrap_values.cpu().tolist()))
         remaining = []
         for pos, (i, result) in enumerate(zip(active, results)):
@@ -405,10 +450,15 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         if not active:
             break
         current = {i: next_current[i] for i in active}
+        if capture_act:
+            current_obs = {i: next_obs_by_scene[i] for i in active}
     if active:
         raise RuntimeError(f"Scenes {active} exceeded the task's {STEP_LIMIT}-step limit.")
     batches = []
-    for trajectory in trajectories.values():
+    act_advantages: list[np.ndarray] = []
+    act_executed: list[np.ndarray] = []
+    scene_to_ep: dict[int, int] = {}
+    for scene, trajectory in trajectories.items():
         feature, action, log_prob, value, reward, next_value, terminated, ended = zip(*trajectory)
         values = torch.stack(value)
         advantages, returns = compute_gae(
@@ -419,6 +469,29 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         )
         batches.append(PPOBatch(torch.stack(feature), torch.stack(action), torch.stack(log_prob),
                                 values, advantages, returns))
+        if capture_act:
+            ep_idx = len(act_executed)
+            scene_to_ep[scene] = ep_idx
+            ep_adv = advantages.numpy().copy()
+            ep_exec = np.stack(executed_norm_by_scene[scene]).astype(np.float32)
+            if len(ep_exec) != len(ep_adv):
+                raise RuntimeError(f"Scene {scene} executed/advantage length mismatch: {len(ep_exec)} != {len(ep_adv)}.")
+            act_advantages.append(ep_adv)
+            act_executed.append(ep_exec)
+    if capture_act:
+        remapped_anchors = [
+            ActAnchor(
+                episode_index=scene_to_ep[anchor.episode_index],
+                step_index=anchor.step_index,
+                image_jpeg=anchor.image_jpeg,
+                qpos_norm=anchor.qpos_norm,
+                pred_old=anchor.pred_old,
+                block_xyz=anchor.block_xyz,
+            )
+            for anchor in act_anchors
+        ]
+        act_waves_out.append(ActWaveData(anchors=remapped_anchors, executed_norm=act_executed,
+                                         advantages=act_advantages))
     return concatenate_batches(batches), episodes
 
 
@@ -556,6 +629,7 @@ def _validate_config(config):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{key} must be positive and finite.")
     validate_reward_config(_reward_config(config))
+    validate_act_awr_config(config)
     if "post_grasp_prefix_file" in config and (not isinstance(config["post_grasp_prefix_file"], str)
                                                or not config["post_grasp_prefix_file"].strip()):
         raise ValueError("post_grasp_prefix_file must be a path to a nonempty replay archive.")
@@ -628,6 +702,8 @@ def train_online(config: dict) -> Path:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
+    unfreeze_act = bool(require(config, "unfreeze_act"))
+    payload = None
     if resume:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
         _validate_online_payload(payload, device)
@@ -635,9 +711,11 @@ def train_online(config: dict) -> Path:
         _validate_task(base_config)
         base = ACTPolicy(base_config, pretrained_backbone=False)
         base.load_state_dict(payload["base_state_dict"], strict=True)
-        frozen_state = {key: value.detach().cpu().clone() for key, value in base.state_dict().items()}
+        frozen_state = (None if unfreeze_act else
+                        {key: value.detach().cpu().clone() for key, value in base.state_dict().items()})
         runner = FrozenACTRunner(base, payload["stats"], device, capture_features=True,
-                                 inference_batch_size=inference_batch_size)
+                                 inference_batch_size=inference_batch_size,
+                                 freeze_policy=not unfreeze_act)
         residual_config = dict(payload["residual_config"])
         if int(residual_config.get("feature_dim", -1)) != FEATURE_DIM:
             raise ValueError(f"Residual feature_dim must be {FEATURE_DIM}.")
@@ -670,11 +748,13 @@ def train_online(config: dict) -> Path:
         base_config = checkpoint_config
         _validate_task(base_config)
         base = load_offline_policy(checkpoint, device)
-        frozen_state = {key: value.detach().cpu().clone() for key, value in base.state_dict().items()}
+        frozen_state = (None if unfreeze_act else
+                        {key: value.detach().cpu().clone() for key, value in base.state_dict().items()})
         with (checkpoint.parent / "dataset_stats.pkl").open("rb") as stream:
             stats = pickle.load(stream)
         runner = FrozenACTRunner(base, stats, device, capture_features=True,
-                                 inference_batch_size=inference_batch_size)
+                                 inference_batch_size=inference_batch_size,
+                                 freeze_policy=not unfreeze_act)
         residual_config = {"feature_dim": FEATURE_DIM, "hidden_dim": int(config["hidden_dim"]),
                            "initial_std": float(config["initial_std"]),
                            "learn_std": bool(config["learn_std"])}
@@ -683,20 +763,62 @@ def train_online(config: dict) -> Path:
         residual_scale = float(config["residual_scale"])
         start_update = global_step = layout_cursor = 0
 
+    trainable_act_named = []
+    frozen_cvae = {}
+    aux_pose_head = None
+    act_optimizer = None
+    need_aux_warmup = False
+    if unfreeze_act:
+        trainable_act_named, frozen_cvae = configure_act_unfreeze(base)
+        if float(config["act_aux_pose_weight"]) > 0.0:
+            aux_pose_head = SpatialSoftmaxBlockPoseHead(
+                base.model.input_proj.out_channels
+            ).to(device)
+            need_aux_warmup = True
+            if payload is not None and "aux_pose_state_dict" in payload:
+                aux_pose_head.load_state_dict(payload["aux_pose_state_dict"], strict=True)
+                need_aux_warmup = False
+        act_optimizer = build_act_optimizer(trainable_act_named, aux_pose_head, config)
+        if payload is not None and "base_optimizer" in payload:
+            saved_groups = payload["base_optimizer"].get("param_groups", [])
+            if len(saved_groups) == len(act_optimizer.param_groups):
+                act_optimizer.load_state_dict(payload["base_optimizer"])
+                act_rates = [float(config["act_lr"]), float(config["act_backbone_lr"])]
+                if aux_pose_head is not None:
+                    act_rates.append(float(config["act_aux_pose_lr"]))
+                for group, rate in zip(act_optimizer.param_groups, act_rates):
+                    group["lr"] = rate
+                    group["weight_decay"] = float(config["act_weight_decay"])
+            else:
+                print(
+                    f"[act_awr] skipping saved base_optimizer: saved {len(saved_groups)} "
+                    f"param groups != current {len(act_optimizer.param_groups)}",
+                    flush=True,
+                )
+        move_optimizer_state(act_optimizer, "cpu")
+
     output = online_output_dir(config)
     output.mkdir(parents=True, exist_ok=False)
     snapshot = dict(config, base_checkpoint=str(checkpoint), policy_type="act_residual_ppo",
                     residual_scale=residual_scale, resumed_from_update=start_update,
                     reward_type="score_delta_plus_physical_pbrs_waypoints_and_milestones",
-                    residual_features="normalized_qpos+base_action+frozen_visual+block_poses")
+                    residual_features=("normalized_qpos+base_action+visual+block_poses"
+                                       if unfreeze_act else
+                                       "normalized_qpos+base_action+frozen_visual+block_poses"))
     (output / "config.json").write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+    act_trainable_params = sum(p.numel() for _, p in trainable_act_named)
+    aux_pose_params = sum(p.numel() for p in aux_pose_head.parameters()) if aux_pose_head is not None else 0
     metadata = {
         "torch_version": str(torch.__version__), "numpy_version": np.__version__,
         "cuda_version": torch.version.cuda, "device": str(device),
         "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "unfreeze_act": unfreeze_act,
         "base_parameters": sum(p.numel() for p in base.parameters()),
+        "act_trainable_parameters": act_trainable_params,
+        "aux_pose_parameters": aux_pose_params,
         "residual_parameters": sum(p.numel() for p in residual.parameters()),
-        "trainable_parameters": sum(p.numel() for p in residual.parameters() if p.requires_grad),
+        "trainable_parameters": (sum(p.numel() for p in residual.parameters() if p.requires_grad)
+                                 + act_trainable_params + aux_pose_params),
         "baseline_pins": (REPO_ROOT / "third_party/pins.lock").read_text(encoding="utf-8"),
         "metrics_scope": "stochastic training rollouts; not held-out evaluation",
         "reward": "Public-score deltas + physical-state PBRS gamma*phi(next)-phi(current) "
@@ -733,9 +855,11 @@ def train_online(config: dict) -> Path:
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     # A self-contained checkpoint can be evaluated without the original run directory.
     def save(path, absolute_update, steps):
+        base_state = ({key: value.detach().cpu() for key, value in base.state_dict().items()}
+                      if unfreeze_act else frozen_state)
         payload = {
             "format": ONLINE_FORMAT, "base_config": base_config,
-            "base_state_dict": frozen_state, "residual_config": residual_config,
+            "base_state_dict": base_state, "residual_config": residual_config,
             "residual_state_dict": residual.state_dict(),
             "stats": {key: torch.as_tensor(runner.stats[key]) for key in runner.stats},
             "residual_scale": residual_scale, "temporal_agg": True,
@@ -746,6 +870,12 @@ def train_online(config: dict) -> Path:
             "torch_cuda_rng_state": (torch.cuda.get_rng_state(device)
                                      if device.type == "cuda" else None),
         }
+        if unfreeze_act:
+            payload["base_optimizer"] = act_optimizer.state_dict()
+            if aux_pose_head is not None:
+                payload["aux_pose_state_dict"] = {
+                    key: value.detach().cpu() for key, value in aux_pose_head.state_dict().items()
+                }
         # Replace atomically so an interrupted write never corrupts recovery.
         temporary = path.with_name(path.name + ".tmp")
         torch.save(payload, temporary)
@@ -777,7 +907,8 @@ def train_online(config: dict) -> Path:
     episode_count = completed_updates = 0
     stop_reason = "completed"
     expected_waves = episodes_per_update // width
-    print(f"ACT residual PPO: frozen base={checkpoint}; resumed_update={start_update}; "
+    mode = "unfrozen ACT (AWR) + residual PPO" if unfreeze_act else "frozen base"
+    print(f"ACT residual PPO ({mode}): base={checkpoint}; resumed_update={start_update}; "
           f"rollout_layout_ids={layout_ids}; budget={max_train_seconds:.0f}s; "
           f"output={output}", flush=True)
     try:
@@ -798,6 +929,7 @@ def train_online(config: dict) -> Path:
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(device)
                 waves, episodes = [], []
+                act_waves = [] if unfreeze_act else None
                 timings = {}
                 residual.eval()
                 for _ in range(expected_waves):
@@ -818,6 +950,8 @@ def train_online(config: dict) -> Path:
                         env, runner, residual, seeds, gamma=float(config["gamma"]),
                         gae_lambda=float(config["gae_lambda"]), residual_scale=residual_scale,
                         reward_cfg=reward_cfg, prefixes=prefixes, timings=timings,
+                        act_sample_stride=(int(config["act_sample_stride"]) if unfreeze_act else None),
+                        act_waves_out=act_waves,
                     )
                     layout_cursor += width
                     waves.append(batch)
@@ -851,7 +985,8 @@ def train_online(config: dict) -> Path:
                 if not waves:
                     break
                 batch = concatenate_batches(waves)
-                global_step += len(batch.features)
+                batch_steps = len(batch.features)
+                global_step += batch_steps
                 rollout_stats = _rollout_metrics(batch, episodes, residual_scale)
                 rollout_seconds = time.monotonic() - update_started
                 optimization_started = time.monotonic()
@@ -865,12 +1000,39 @@ def train_online(config: dict) -> Path:
                 )
                 losses.update(_mean_policy_metrics(residual, batch.features,
                                                    runner.stats["action_std"], residual_scale))
+                del batch
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
+                act_optimization_seconds = 0.0
+                if unfreeze_act:
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    act_opt_started = time.monotonic()
+                    act_metrics = act_awr_update(
+                        base,
+                        aux_pose_head,
+                        act_optimizer,
+                        trainable_act_named,
+                        frozen_cvae,
+                        concatenate_act_waves(act_waves),
+                        config=config,
+                        device=device,
+                        warmup_aux_epochs=(int(config["act_aux_warmup_epochs"])
+                                           if need_aux_warmup else 0),
+                    )
+                    need_aux_warmup = False
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    act_optimization_seconds = time.monotonic() - act_opt_started
+                    losses.update(act_metrics)
+                    losses["act_optimization_seconds"] = act_optimization_seconds
+                    losses["act_lr"] = act_optimizer.param_groups[0]["lr"]
+                    losses["act_backbone_lr"] = act_optimizer.param_groups[1]["lr"]
+                else:
+                    for key, value in base.state_dict().items():
+                        if not torch.equal(value.detach().cpu(), frozen_state[key]):
+                            raise RuntimeError(f"Frozen ACT state changed: {key}.")
                 optimization_seconds = time.monotonic() - optimization_started
-                for key, value in base.state_dict().items():
-                    if not torch.equal(value.detach().cpu(), frozen_state[key]):
-                        raise RuntimeError(f"Frozen ACT state changed: {key}.")
                 now = time.monotonic()
                 elapsed = now - started
                 update_seconds = now - update_started
@@ -889,7 +1051,7 @@ def train_online(config: dict) -> Path:
                           "rollout_seconds": rollout_seconds, "optimization_seconds": optimization_seconds,
                           "update_seconds": update_seconds, "elapsed_seconds": elapsed,
                           "eta_seconds": remaining,
-                          "steps_per_second": len(batch.features) / update_seconds,
+                          "steps_per_second": batch_steps / update_seconds,
                           "vram": vram}
                 metrics.write(json.dumps(record, allow_nan=False) + "\n")
                 metrics.flush()
@@ -905,6 +1067,21 @@ def train_online(config: dict) -> Path:
                               f"reserved={vram['reserved_gib']:.2f}GiB "
                               f"peak={vram['peak_allocated_gib']:.2f}GiB "
                               f"total={vram['total_gib']:.2f}GiB (learner PyTorch)")
+                act_summary = ""
+                if unfreeze_act:
+                    aux_mae = record.get("act_aux_pose_mae_m")
+                    aux_text = f" aux_mae_mm={1000 * aux_mae:.1f}" if aux_mae is not None else ""
+                    awr_val = record.get("act_awr_loss")
+                    shift_val = record.get("act_prior_shift_l1")
+                    awr_text = f"{awr_val:.4f}" if awr_val is not None else "n/a"
+                    shift_text = f"{shift_val:.4f}" if shift_val is not None else "n/a"
+                    act_summary = (
+                        f" | ACT[awr={awr_text} "
+                        f"shift={shift_text} "
+                        f"steps={record['act_updates']} ess={record['act_weight_ess']:.2f} "
+                        f"dW={record['act_param_delta_l2']:.4f}{aux_text} "
+                        f"t={act_optimization_seconds:.1f}s]"
+                    )
                 print(f"update {local_update}/{total} (absolute {absolute_update}): steps={global_step} "
                       f"waves={len(waves)}/{expected_waves} "
                       f"success={record['success_count']}/{len(episodes)} ({record['success_rate']:.1%}) "
@@ -912,7 +1089,8 @@ def train_online(config: dict) -> Path:
                       f"policy_loss={record['policy_loss']:.5f} value_loss={record['value_loss']:.5f} "
                       f"KL={record['approx_kl']:.5f} optimizer_steps={record['updates']} "
                       f"early_stop={record['early_stopped']} | lr={record['lr']:.3e} "
-                      f"mean_correction_mm={1000 * record['mean_policy_position_residual_m']:.2f} "
+                      f"mean_correction_mm={1000 * record['mean_policy_position_residual_m']:.2f}"
+                      f"{act_summary} "
                       f"extrema[max_lift_mm={1000 * record['max_lift_m_over_episodes']:.2f} "
                       f"max_pair={record['max_pair_sum_over_episodes']:.2f} "
                       f"min_d_mm={1000 * record['min_d_min_m_over_episodes']:.1f} "

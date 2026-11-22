@@ -709,6 +709,7 @@ def _online_config(base_checkpoint: Path) -> dict:
     config.update(
         base_checkpoint=str(base_checkpoint),
         device="cpu",
+        unfreeze_act=False,
         finetune_updates=2,
         finetune_episodes=4,
         num_envs=2,

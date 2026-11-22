@@ -138,6 +138,26 @@ value_coef: 0.5
 entropy_coef: 0.0
 max_grad_norm: 0.5
 target_kl: 0.3
+# Online unfrozen-ACT fine-tuning via advantage-weighted chunk regression (AWR)
+# on the active inference pathway (66.5M params; unused CVAE encoder stays frozen)
+# plus a training-only spatial-softmax visual block-pose head on input_proj tokens.
+unfreeze_act: true
+act_lr: 1e-6
+act_backbone_lr: 5e-7
+act_weight_decay: 1e-4
+act_epochs: 1
+act_batch_size: 4
+act_grad_accum_steps: 8
+act_max_samples: 3072
+act_sample_stride: 10
+act_awr_beta: 1.0
+act_awr_max_weight: 20.0
+act_prior_coef: 0.1
+act_max_action_shift: 0.15
+act_max_grad_norm: 1.0
+act_aux_pose_weight: 0.25
+act_aux_pose_lr: 1e-3
+act_aux_warmup_epochs: 2
 save_freq: 25
 # Explicit opt-in is needed if policy and Isaac use the same physical GPU.
 allow_shared_gpu: true

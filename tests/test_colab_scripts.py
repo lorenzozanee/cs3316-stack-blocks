@@ -88,10 +88,13 @@ class ColabScriptsTests(unittest.TestCase):
 
             args.round = 27
             args.num_envs = 12
+            args.max_train_seconds = 3600
             _, train_cfg3, _ = mod.write_configs(args, "2026.11.21-13.00.00")
             train_data3 = load_config(train_cfg3)
             self.assertEqual(train_data3["finetune_episodes"], 24)
+            self.assertEqual(train_data3["max_train_seconds"], 3600)
             self.assertEqual(train_data3["rollout_layout_ids"], list(range(55)))
+            args.max_train_seconds = None
 
             args.measure_updates = 1
             _, train_cfg4, _ = mod.write_configs(args, "2026.11.21-14.00.00")
