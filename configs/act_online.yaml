@@ -107,6 +107,8 @@ settle_angular_speed: 0.100
 upright_cos_min: 0.9659258262890683
 empty_grasp_penalty: 0.3
 drop_penalty: 0.4
+early_open_penalty: 0.4
+missed_release_penalty: 0.4
 empty_place_penalty: 0.3
 empty_tower_intrusion_penalty: 0.4
 tower_break_penalty: 1.5

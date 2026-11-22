@@ -79,11 +79,9 @@ milestones pay once per level after
 consecutive observations of the same supported and released configuration.
 Route progress and dwell are episode history and add a preference outside PBRS.
 
-The module returns only terms and bonuses.  It never reads an action, the
-official score, ``terminated`` or an RNG and it never ends an episode.
-Terminal ``phi=0`` and truncation bootstrap remain the trainer's
-responsibility.  Unit tests verify reward algebra and boundaries only; they
-do not show that a policy learns, and no success or learning rate is claimed.
+The dense event layer can guard gripper targets and assess unresolved carries
+at an episode boundary. Official scoring, episode termination and PBRS
+bootstrapping remain the trainer's responsibility.
 """
 from __future__ import annotations
 
@@ -159,6 +157,8 @@ DEFAULTS = {
     # Event penalties (non-negative magnitudes; subtracted when triggered).
     "empty_grasp_penalty": 0.3,
     "drop_penalty": 0.4,
+    "early_open_penalty": 0.4,
+    "missed_release_penalty": 0.4,
     "empty_place_penalty": 0.3,
     "empty_tower_intrusion_penalty": 0.4,
     "tower_break_penalty": 1.5,
@@ -199,13 +199,16 @@ _TOWER_BREAK_DWELL_STEPS = 2
 _EMPTY_TOWER_BREAK_WINDOW = 5
 _MAX_EMPTY_GRASP_PENALTIES = 4
 _MAX_DROP_PENALTIES = 4
+_MAX_EARLY_OPEN_PENALTIES = 4
+_MAX_MISSED_RELEASE_PENALTIES = 4
+_OPEN_COMMAND_MARGIN = 0.02
 _MAX_EMPTY_PLACE_PENALTIES = 4
 _MAX_EMPTY_TOWER_INTRUSIONS = 4
 _MAX_TOWER_BREAK_PENALTIES = 4
 _MAX_ARM_CONFLICT_PENALTIES = 4
 _PENALTY_KEYS = (
     "empty_grasp", "drop", "empty_place", "empty_tower_intrusion",
-    "tower_break", "empty_tower_break", "arm_conflict",
+    "tower_break", "empty_tower_break", "arm_conflict", "early_open", "missed_release",
 )
 
 _MILESTONES = ("grasp", "base", "pair2", "pair3")
@@ -215,8 +218,8 @@ _WEIGHT_KEYS = (
     "reach_weight", "manipulation_weight", "base_weight", "pair_weight",
     "release_weight", "milestone_grasp",
     "milestone_base", "milestone_pair2", "milestone_pair3", "waypoint_bonus",
-    "empty_grasp_penalty", "drop_penalty", "empty_place_penalty",
-    "empty_tower_intrusion_penalty", "tower_break_penalty",
+    "empty_grasp_penalty", "drop_penalty", "early_open_penalty", "missed_release_penalty",
+    "empty_place_penalty", "empty_tower_intrusion_penalty", "tower_break_penalty",
     "arm_conflict_penalty",
 )
 _POSITIVE_KEYS = (
@@ -513,8 +516,11 @@ class _CarryDestination:
 @dataclass(kw_only=True)
 class _DenseCarry(_CarryDestination):
     row: dict
+    grip_limit: float
     previous: np.ndarray | None = None
     drop_pending: int = 0
+    arm_was_near: bool = True
+    opening_started: bool = False
 
 
 @dataclass
@@ -545,6 +551,7 @@ class StackingReward:
         self.transport_attempts: list[dict] = []
         self._transport_traces: dict[str, _TransportTrace] = {}
         self._carry_destinations: dict[str, _CarryDestination] = {}
+        self._guarded_carries: list[tuple[str, int, float, float]] = []
         self._reset_proprio = _vector(reset_proprio, ACTION_DIM, "reset_proprio")
         reset_state = _mapping(reset_state, "reset_state")
         self._reset_poses = _block_poses(reset_state, "reset_state")
@@ -1266,43 +1273,40 @@ class StackingReward:
         attempt.invalid = True
         attempt.row["end_reason"] = reason
 
-    def _advance_dense_carry(self, frame: _Frame, label: str,
-                             attempt: _DenseCarry) -> tuple[float, float]:
+    def _advance_dense_carry(self, frame: _Frame, label: str, attempt: _DenseCarry,
+                             executed_action: Sequence[float] | None) -> tuple[float, float]:
         anchor, arm = attempt.anchor, attempt.arm
         lower = anchor[-1] if anchor else None
         held = frame.hold[arm, label] >= _GRASP_HOLD_MIN
         available = self._available_anchor(frame)
         placement = _MILESTONES[len(anchor) + 1]
-        settled_self = (not held and available == anchor + (label,)
-                        and self.release_steps[placement] is None
-                        and attempt.row["aligned_step"] is not None)
-        carrying = held and (attempt.previous is not None or attempt.drop_pending > 0)
-        if anchor != self._settled_anchor[:len(anchor)]:
-            self._end_attempt(attempt, "anchor")
-            return 0.0, 0.0
-        if not settled_self and len(available) > len(anchor):
-            if not carrying or label in available:
+        settled_self = available == anchor + (label,) and attempt.row["aligned_step"] is not None
+        replaced = anchor != self._settled_anchor[:len(anchor)]
+        if not settled_self and (replaced or len(available) > len(anchor)):
+            if label in available:
                 self._end_attempt(attempt, "anchor")
                 return 0.0, 0.0
             anchor = attempt.anchor = available
-            attempt.hard_tower = True
-            lower = anchor[-1]
+            lower = anchor[-1] if anchor else None
             placement = _MILESTONES[len(anchor) + 1]
+            attempt.hard_tower = bool(anchor)
+            if replaced:
+                attempt.previous = None
+            attempt.arm_was_near = False
+            attempt.opening_started = False
             attempt.row.update(lower=lower, target_lower=lower, aligned_step=None)
-        if ((not settled_self and available != anchor)
-                or not self._destination_valid(frame, label, attempt)
-                or (lower is None and self._occupied(frame, None, label))):
-            if carrying:
-                # Keep the identity across transient instability; skip this motion.
-                attempt.drop_pending = 0
-                attempt.previous = frame.pos[label].copy()
-                return 0.0, 0.0
-            self._end_attempt(attempt, "destination")
-            return 0.0, 0.0
 
+        goal_valid = self._dense_goal_valid(frame, label, attempt, available, settled_self)
         near_goal = self._near_release_goal(frame, label, lower)
+        arm_near = arm in frame.associated_arms[label]
+        was_near_at_goal = attempt.arm_was_near and attempt.row["aligned_step"] is not None
+        attempt.arm_was_near = arm_near and near_goal
         if held:
             attempt.drop_pending = 0
+            attempt.opening_started = False
+            if not goal_valid:
+                attempt.previous = frame.pos[label].copy()
+                return 0.0, 0.0
             if near_goal and attempt.row["aligned_step"] is None:
                 attempt.row["aligned_step"] = self._step_index
             if attempt.previous is None:
@@ -1327,17 +1331,31 @@ class StackingReward:
                for other in BLOCK_LABELS if other != label):
             self._end_attempt(attempt, "other_block")
             return 0.0, 0.0
-        if not near_goal or (attempt.row["aligned_step"] is None
-                             and arm not in frame.associated_arms[label]):
+        if not near_goal:
+            attempt.opening_started = False
             attempt.drop_pending += 1
             if (float(frame.measured[arm]) >= _RELEASE_MIN
                     or attempt.drop_pending >= _DROP_CONFIRM_STEPS):
                 self._end_attempt(attempt, "dropped")
             return 0.0, 0.0
         attempt.drop_pending = 0
+        if attempt.row["aligned_step"] is None and not arm_near:
+            self._end_attempt(attempt, "unattributed")
+            return 0.0, 0.0
+        measured = float(frame.measured[arm])
+        commanded = measured if executed_action is None else float(executed_action[7 + 8 * arm])
+        opening = max(measured, commanded)
+        if arm_near or was_near_at_goal:
+            if opening >= _RELEASE_MIN or opening > self._arm_prev_measured[arm] + _OPEN_COMMAND_MARGIN:
+                attempt.opening_started = True
+        if not arm_near and not attempt.opening_started:
+            self._end_attempt(attempt, "abandoned")
+            return 0.0, 0.0
+        if not goal_valid:
+            return 0.0, 0.0
         if attempt.row["aligned_step"] is None:
             attempt.row["aligned_step"] = self._step_index
-        if float(frame.measured[arm]) < _RELEASE_MIN or not frame.released[label]:
+        if measured < _RELEASE_MIN:
             return 0.0, 0.0
         self._end_attempt(attempt, "released")
         attempt.row["opened_step"] = self._step_index
@@ -1373,25 +1391,64 @@ class StackingReward:
     def _available_anchor(self, frame: _Frame) -> tuple[str, ...]:
         return self._stable_prefix(frame, self._settled_anchor)
 
+    def _dense_goal_valid(self, frame: _Frame, label: str, attempt: _DenseCarry,
+                          available: tuple[str, ...], settled_self: bool) -> bool:
+        return ((available == attempt.anchor or settled_self)
+                and self._destination_valid(frame, label, attempt)
+                and (bool(attempt.anchor) or not self._occupied(frame, None, label)))
+
+    def guard_gripper_action(self, action: np.ndarray) -> tuple[str, ...]:
+        """Clamp off-target gripper targets in place and report opening requests."""
+        early_open = tuple(label for label, arm, _, measured in self._guarded_carries
+                           if float(action[7 + 8 * arm]) > measured + _OPEN_COMMAND_MARGIN)
+        for _, arm, limit, _ in self._guarded_carries:
+            index = 7 + 8 * arm
+            action[index] = min(float(action[index]), limit)
+        return early_open
+
+    def _prepare_gripper_guard(self, frame: _Frame) -> None:
+        self._guarded_carries.clear()
+        available = self._available_anchor(frame)
+        for label, attempt in self._carry_destinations.items():
+            anchor = attempt.anchor
+            lower = anchor[-1] if anchor else None
+            settled_self = available == anchor + (label,) and attempt.row["aligned_step"] is not None
+            if (self._dense_goal_valid(frame, label, attempt, available, settled_self)
+                    and self._near_release_goal(frame, label, lower)):
+                continue
+            opening = float(frame.measured[attempt.arm])
+            self._guarded_carries.append((label, attempt.arm, min(attempt.grip_limit, opening), opening))
+
+    def _carry_penalty(self, name: str, cap: int) -> float:
+        if self.penalty_counts[name] >= cap:
+            return 0.0
+        self.penalty_counts[name] += 1
+        return float(self.cfg[f"{name}_penalty"])
+
     def _dense_events(
-        self, frame: _Frame, confirmed: dict[str, int]
+        self, frame: _Frame, confirmed: dict[str, int], executed_action, early_open: tuple[str, ...],
     ) -> tuple[float, float, float, set[int], set[int]]:
-        carry_bonus = placement_bonus = drop_penalty = 0.0
+        carry_bonus = placement_bonus = carry_penalty = 0.0
+        for label in early_open:
+            row = self._carry_destinations[label].row
+            row["early_open_requests"] += 1
+            if row["early_open_step"] is None:
+                row["early_open_step"] = self._step_index
+                carry_penalty += self._carry_penalty("early_open", _MAX_EARLY_OPEN_PENALTIES)
         active_arms = {attempt.arm for attempt in self._carry_destinations.values()}
         ending_arms: set[int] = set()
         for label, attempt in list(self._carry_destinations.items()):
-            carry, placement = self._advance_dense_carry(frame, label, attempt)
+            carry, placement = self._advance_dense_carry(frame, label, attempt, executed_action)
             carry_bonus += carry
             placement_bonus += placement
             if attempt.invalid:
                 reason = attempt.row["end_reason"]
-                if reason == "released":
-                    ending_arms.add(attempt.arm)
-                elif reason == "dropped":
-                    ending_arms.add(attempt.arm)
-                    if self.penalty_counts["drop"] < _MAX_DROP_PENALTIES:
-                        self.penalty_counts["drop"] += 1
-                        drop_penalty += float(self.cfg["drop_penalty"])
+                attempt.row.update(end_step=self._step_index, end_measured_open=float(frame.measured[attempt.arm]))
+                ending_arms.add(attempt.arm)
+                if reason == "dropped":
+                    carry_penalty += self._carry_penalty("drop", _MAX_DROP_PENALTIES)
+                elif reason in {"abandoned", "other_block"}:
+                    carry_penalty += self._carry_penalty("missed_release", _MAX_MISSED_RELEASE_PENALTIES)
                 del self._carry_destinations[label]
 
         anchor = self._available_anchor(frame)
@@ -1402,12 +1459,17 @@ class StackingReward:
             aligned = self._step_index if self._near_release_goal(frame, label, lower) else None
             row = dict(arm=arm, carried=label, target_lower=lower, lower=lower,
                        grasp_step=self._step_index, aligned_step=aligned,
-                       opened_step=None, settled_step=None, end_reason=None)
+                       opened_step=None, settled_step=None, early_open_step=None,
+                       early_open_requests=0, end_reason=None, end_step=None, end_measured_open=None)
             self.transport_attempts.append(row)
+            grip_limit = float(frame.measured[arm])
+            if executed_action is not None:
+                grip_limit = min(grip_limit, float(executed_action[7 + 8 * arm]))
             self._carry_destinations[label] = _DenseCarry(
-                arm, anchor, hard_tower=bool(anchor), row=row, previous=frame.pos[label].copy())
+                arm, anchor, hard_tower=bool(anchor), row=row, grip_limit=grip_limit,
+                previous=frame.pos[label].copy())
             active_arms.add(arm)
-        return carry_bonus, placement_bonus, drop_penalty, active_arms, ending_arms
+        return carry_bonus, placement_bonus, carry_penalty, active_arms, ending_arms
 
     def _arm_has_block(self, frame: _Frame, arm: int, protected: set[str],
                        active_arms: set[int], ending_arms: set[int]) -> bool:
@@ -1538,7 +1600,8 @@ class StackingReward:
                 self.penalty_counts["arm_conflict"] += 1
                 penalty += float(self.cfg["arm_conflict_penalty"])
 
-        if len(available) > len(self._intact_anchor) and self._intact_prefix(frame, available) == available:
+        if (available != self._intact_anchor[:len(available)]
+                and self._intact_prefix(frame, available) == available):
             self._intact_anchor = available
             self._tower_break_dwell = 0
         elif self._intact_anchor:
@@ -1548,6 +1611,8 @@ class StackingReward:
             else:
                 self._tower_break_dwell += 1
                 if self._tower_break_dwell >= _TOWER_BREAK_DWELL_STEPS:
+                    if self._settled_anchor[:len(self._intact_anchor)] == self._intact_anchor:
+                        self._settled_anchor = intact
                     self._intact_anchor = intact
                     self._tower_break_dwell = 0
                     if self.penalty_counts["tower_break"] < _MAX_TOWER_BREAK_PENALTIES:
@@ -1739,7 +1804,10 @@ class StackingReward:
                          dense_transport_return=self._dense_transport_return)
         return terms
 
-    def step(self, proprio, physical: Mapping) -> tuple[dict, float]:
+    def step(
+        self, proprio, physical: Mapping, *, executed_action: Sequence[float] | None = None,
+        early_open: tuple[str, ...] = (), ended: bool = False,
+    ) -> tuple[dict, float]:
         """Advance ordered routes and dwell-gated grasp and placement events."""
         terms, identities, frame = self._evaluate(proprio, physical)
         self._step_index += 1
@@ -1748,13 +1816,13 @@ class StackingReward:
         active_arms: set[int] = set()
         released_arms: set[int] = set()
         if self._dense_transport_reward:
-            carry_bonus, placement_bonus, drop_penalty, active_arms, released_arms = (
-                self._dense_events(frame, confirmed))
+            carry_bonus, placement_bonus, carry_penalty, active_arms, released_arms = (
+                self._dense_events(frame, confirmed, executed_action, early_open))
             approach_bonus = self._dense_approach(frame)
             self._dense_approach_return += approach_bonus
             self._dense_transport_return += carry_bonus
             milestone_bonus += placement_bonus
-            penalty_step += drop_penalty
+            penalty_step += carry_penalty
             terms.update(dense_approach_return=self._dense_approach_return,
                          dense_transport_return=self._dense_transport_return)
         elif self._transport_to_support:
@@ -1794,6 +1862,16 @@ class StackingReward:
             milestone_bonus += scale * float(self.cfg[f"milestone_{name}"])
         if self._dense_transport_reward:
             penalty_step += self._dense_penalties(frame, active_arms, released_arms)
+            if ended:
+                for attempt in self._carry_destinations.values():
+                    self._end_attempt(attempt, "episode_end")
+                    attempt.row.update(end_step=self._step_index, end_measured_open=float(frame.measured[attempt.arm]))
+                    if attempt.row["grasp_step"] < self._step_index:
+                        penalty_step += self._carry_penalty("missed_release", _MAX_MISSED_RELEASE_PENALTIES)
+                self._carry_destinations.clear()
+                self._guarded_carries.clear()
+            else:
+                self._prepare_gripper_guard(frame)
         self.milestone_return += milestone_bonus
         self.penalty_return -= penalty_step
         self.waypoint_return += waypoint_bonus

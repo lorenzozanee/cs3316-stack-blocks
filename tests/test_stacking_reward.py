@@ -1524,12 +1524,12 @@ class DenseRouteTests(unittest.TestCase):
         self.reward = _reward(dense_transport_reward=True)
         self.base_goal = np.array([0.0, -0.2, TOP + HALF])
 
-    def step_at(self, label, point, opening=REAL_GRIP_30, *, arm=0, linear=None):
+    def step_at(self, label, point, opening=REAL_GRIP_30, *, arm=0, linear=None, **reward_step):
         self.positions[label] = np.array(point)
         wrist = WaypointRewardTests._wrist(point)
         proprio = _proprio(**{("left", "right")[arm]: wrist})
         measured = (opening, 1.0) if arm == 0 else (1.0, opening)
-        return self.reward.step(proprio, _state(self.positions, measured=measured, linear=linear))
+        return self.reward.step(proprio, _state(self.positions, measured=measured, linear=linear), **reward_step)
 
     def lift(self, label, start, *, arm=0):
         for _ in range(3):
@@ -1670,6 +1670,90 @@ class DenseRouteTests(unittest.TestCase):
         self.assertIsNotNone(self.reward.milestone_steps["pair2"])
         self.assertEqual(len(self.reward.transport_attempts), 2)
 
+    def test_guard_blocks_only_the_carrying_arm_until_current_goal_is_valid(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0, 0, 0.07]
+        action = _proprio()
+        action[[7, 15]] = [0.25, 0.9]
+        for _ in range(3):
+            self.step_at(label, start, executed_action=action)
+        for expected_count in (1, 1):
+            requested = np.copy(action)
+            requested[7] = 0.9
+            blocked = self.reward.guard_gripper_action(requested)
+            self.assertEqual(blocked, (label,))
+            np.testing.assert_allclose(requested[[7, 15]], [0.25, 0.9])
+            terms, _ = self.step_at(label, start, early_open=blocked, executed_action=requested)
+            self.assertEqual(terms["penalty_counts"]["early_open"], expected_count)
+            self.assertEqual(terms["penalty_counts"]["drop"], 0)
+        self.step_at(label, self.base_goal)
+        requested[7] = 0.9
+        self.assertEqual(self.reward.guard_gripper_action(requested), ())
+        self.assertAlmostEqual(requested[7], 0.9)
+        self.step_at(label, start)
+        self.assertEqual(self.reward.guard_gripper_action(requested), (label,))
+        self.step_at(label, self.base_goal)
+        terms, _ = self.step_at(label, self.base_goal, opening=0.8, ended=True)
+        self.assertEqual(terms["penalty_counts"]["missed_release"], 0)
+        self.assertEqual(self.reward.transport_attempts[0]["end_reason"], "released")
+        self.assertEqual(self.reward.transport_attempts[0]["early_open_requests"], 2)
+
+    def test_episode_end_charges_unreleased_carry_once_and_does_not_double_charge_drop(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0, 0, 0.07]
+        for opening, reason, missed, dropped in (
+            (REAL_GRIP_30, "episode_end", 1, 0), (1.0, "dropped", 0, 1),
+        ):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.lift(label, start, arm=1)
+                action = _proprio()
+                action[[7, 15]] = 1.0
+                self.assertEqual(self.reward.guard_gripper_action(action), (label,))
+                self.assertAlmostEqual(action[7], 1.0)
+                self.assertAlmostEqual(action[15], REAL_GRIP_30)
+                terms, _ = self.step_at(label, start, arm=1, opening=opening, ended=True)
+                row = self.reward.transport_attempts[0]
+                self.assertEqual(row["end_reason"], reason)
+                self.assertEqual(row["end_measured_open"], opening)
+                self.assertEqual(terms["penalty_counts"]["missed_release"], missed)
+                self.assertEqual(terms["penalty_counts"]["drop"], dropped)
+
+    def test_final_step_pickup_has_no_opportunity_to_release(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0, 0, 0.07]
+        for _ in range(2):
+            self.step_at(label, start)
+        terms, _ = self.step_at(label, start, ended=True)
+        row = self.reward.transport_attempts[0]
+        self.assertEqual(row["grasp_step"], row["end_step"])
+        self.assertEqual(row["end_reason"], "episode_end")
+        self.assertEqual(terms["penalty_counts"]["missed_release"], 0)
+
+    def test_guard_retargets_after_tower_break_and_keeps_identity_through_brief_loss(self):
+        base, upper, _ = BLOCK_LABELS
+        start = self.positions[upper] + [0, 0, 0.07]
+        self.lift(upper, start, arm=1)
+        self.positions[base] = self.base_goal.copy()
+        for _ in range(3):
+            self.step_at(upper, start, arm=1)
+        self.step_at(upper, start, opening=0.0, arm=1)
+        row = self.reward.transport_attempts[0]
+        self.assertIsNone(row["end_reason"])
+        self.assertEqual(row["target_lower"], base)
+        self.positions[base] += [0.14, 0.0, 0.0]
+        for _ in range(2):
+            self.step_at(upper, start, arm=1)
+        self.assertEqual(self.reward.penalty_counts["tower_break"], 1)
+        self.step_at(upper, self.base_goal, arm=1)
+        self.assertIsNone(row["target_lower"])
+        action = _proprio()
+        action[15] = 1.0
+        self.assertEqual(self.reward.guard_gripper_action(action), ())
+        self.step_at(upper, self.base_goal, opening=0.8, arm=1, ended=True)
+        self.assertEqual(row["end_reason"], "released")
+        self.assertEqual(self.reward.penalty_counts["missed_release"], 0)
+
     def test_wrong_arm_and_off_goal_opening_do_not_pay_release_bonus(self):
         label = BLOCK_LABELS[0]
         start = self.positions[label] + [0, 0, 0.07]
@@ -1749,7 +1833,8 @@ class DenseRouteTests(unittest.TestCase):
         self.lift(label, start)
         self.positions[label] = self.base_goal.copy()
         self.reward.step(_proprio(), _state(self.positions, measured=(1.0, 1.0)))
-        self.assertEqual(self.reward.transport_attempts[0]["end_reason"], "dropped")
+        self.assertEqual(self.reward.transport_attempts[0]["end_reason"], "unattributed")
+        self.assertEqual(self.reward.penalty_counts["drop"], 0)
         self.assertIsNone(self.reward.release_steps["base"])
         self.assertIsNone(self.reward.transport_attempts[0]["opened_step"])
 
@@ -1793,6 +1878,31 @@ class DenseRouteTests(unittest.TestCase):
             self.reward.step(_proprio(), _state(self.positions))
         self.assertEqual(row["settled_step"], 8)
         self.assertAlmostEqual(self.reward.milestone_return, M_GRASP + M_BASE)
+
+    def test_remote_open_without_local_start_does_not_credit_release(self):
+        label = BLOCK_LABELS[0]
+        self.lift(label, self.positions[label] + [0, 0, 0.07])
+        self.step_at(label, self.base_goal)
+        self.reward.step(_proprio(), _state(self.positions, measured=(REAL_GRIP_30, 1.0)))
+        self.reward.step(_proprio(), _state(self.positions, measured=(0.8, 1.0)))
+        row = self.reward.transport_attempts[0]
+        self.assertEqual(row["end_reason"], "abandoned")
+        self.assertIsNone(row["opened_step"])
+        self.assertIsNone(self.reward.release_steps["base"])
+        self.assertEqual(self.reward.penalty_counts["missed_release"], 1)
+        self.assertEqual(self.reward.penalty_counts["drop"], 0)
+
+    def test_release_uses_carrying_arm_when_other_closed_arm_is_near(self):
+        label = BLOCK_LABELS[0]
+        self.lift(label, self.positions[label] + [0, 0, 0.07])
+        self.step_at(label, self.base_goal)
+        left = WaypointRewardTests._wrist(self.base_goal)
+        right = WaypointRewardTests._wrist(self.base_goal + [0, 0.015, 0])
+        self.reward.step(_proprio(left=left, right=right),
+                         _state(self.positions, measured=(0.8, EMPTY_CLOSED)))
+        self.assertEqual(self.reward.transport_attempts[0]["end_reason"], "released")
+        self.assertIsNotNone(self.reward.release_steps["base"])
+        self.assertIsNone(self.reward.milestone_steps["base"])
 
     def test_another_block_cannot_collect_the_released_blocks_settle_bonus(self):
         carried, other, _ = BLOCK_LABELS

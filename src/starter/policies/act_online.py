@@ -219,12 +219,17 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         learning = [i for i in active if control_step > prefix_steps[i]]
         sample_positions = {i: pos for pos, i in enumerate(learning)}
         physical = {}
+        early_open = {}
         if learning:
             inputs = torch.stack([current[i][1] for i in learning])
             raw_actions, log_probs, values = actor.act(inputs)
             inputs, raw_actions, log_probs, values = (item.cpu() for item in (inputs, raw_actions, log_probs, values))
             base = np.stack([current[i][0] for i in learning])
             actions = compose_residual_action(base, raw_actions, runner.stats["action_std"], residual_scale)
+            for i, action in zip(learning, actions):
+                requests = rewards[i].guard_gripper_action(action)
+                if requests:
+                    early_open[i] = requests
             # Mean Euclidean target-position correction across both arms, in metres.
             position_residuals = np.linalg.norm(
                 (actions - base)[:, [0, 1, 2, 8, 9, 10]].reshape(-1, 2, 3), axis=-1,
@@ -287,7 +292,10 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                 raise ValueError("An episode cannot be both terminated and truncated.")
             ended = bool(terminated or truncated)
             step_positions = _block_positions(privileged_after[pos])
-            terms, bonus = rewards[i].step(observation["proprio"], privileged_after[pos])
+            terms, bonus = rewards[i].step(
+                observation["proprio"], privileged_after[pos],
+                executed_action=physical[i], early_open=early_open.get(i, ()), ended=ended,
+            )
             next_potential = terms["phi"]
             event_bonus = terms.get("event_bonus", bonus)
             if i not in sample_positions:
@@ -889,10 +897,10 @@ def train_online(config: dict) -> Path:
     reset_deadline = config.get("reset_deadline_seconds")
     reset_options = {}
     if reset_deadline is not None:
-        # Keep room for initial cold boot and one respawn + cold reboot + retry.
+        reset_retries = 2
         reset_options = {
-            "reset_timeout": max(900.0, 2.0 * float(reset_deadline) + 600.0),
-            "reset_retries": 1,
+            "reset_timeout": max(900.0, (reset_retries + 1) * float(reset_deadline) + 600.0),
+            "reset_retries": reset_retries,
         }
     if env_workers == 1:
         env = RemoteEnv(env_host, env_port, **reset_options)

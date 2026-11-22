@@ -62,6 +62,7 @@ def _zero_reward_cfg() -> dict:
                        milestone_grasp=0.0, milestone_base=0.0,
                        milestone_pair2=0.0, milestone_pair3=0.0,
                        empty_grasp_penalty=0.0, drop_penalty=0.0,
+                       early_open_penalty=0.0, missed_release_penalty=0.0,
                        empty_place_penalty=0.0, empty_tower_intrusion_penalty=0.0,
                        tower_break_penalty=0.0, arm_conflict_penalty=0.0)
 
@@ -258,6 +259,38 @@ class PostGraspReplayTest(unittest.TestCase):
         self.assertEqual(runner.calls[:4], [[0, 1]]*4)
         sampled = [c['features'][:, :2].tolist() for c in actor.calls if not c['deterministic']]
         self.assertEqual(sampled, [[[1, 0]], [[1, 1]], [[1, 2]], [[0, 3], [1, 3]], [[0, 4]]])
+
+    def test_gripper_guard_preserves_ppo_samples_after_forced_prefix(self):
+        cfg = _reward_cfg(dense_transport_reward=True)
+        entries = []
+        self._run(self.Env(), reward_cfg=cfg, capture_prefix=entries.append)
+        env = self.Env()
+        actor = _RecordingActor()
+        sample = actor.act
+
+        def request_open(features, deterministic=False):
+            raw, log_probs, values = sample(features, deterministic)
+            raw[:, 7] = 0.5
+            log_probs[:] = -1.25
+            return raw, log_probs, values
+
+        with mock.patch.object(actor, "act", side_effect=request_open):
+            batch, records = collect_wave(
+                env, _ScriptedRunner(), actor, [14, 15], gamma=0.9, gae_lambda=0.95,
+                residual_scale=0.2, reward_cfg=cfg, prefixes={0: entries[0]},
+            )
+        scene_rows = batch.features[:, 0] == 0
+        self.assertEqual(int(scene_rows.sum()), 2)
+        torch.testing.assert_close(batch.actions[scene_rows, 7], torch.full((2,), 0.5))
+        torch.testing.assert_close(batch.log_probs[scene_rows], torch.full((2,), -1.25))
+        for step, action in enumerate(entries[0]["actions"]):
+            self.assertEqual(env.actions[step][0], action)
+        measured = entries[0]["frames"][-1]["measured"][0]
+        self.assertAlmostEqual(env.actions[3][0][7], min(measured, entries[0]["actions"][-1][7]))
+        self.assertAlmostEqual(env.actions[3][0][15], 0.5)
+        episode = next(row for row in records if row["layout_id"] == 14)
+        self.assertEqual(episode["penalty_counts"]["early_open"], 1)
+        self.assertEqual(episode["penalty_counts"]["missed_release"], 1)
 
     def test_dense_prefix_recomputes_progress_and_checks_discrete_events(self):
         class ApproachEnv(self.Env):
@@ -1306,7 +1339,7 @@ class TrainOnlineTest(unittest.TestCase):
             cfg = _online_config(checkpoint)
             cfg.update(
                 num_envs=4, finetune_episodes=4, finetune_updates=1,
-                env_workers=2, min_reset_free_vram_mib=2560,
+                env_workers=2, min_reset_free_vram_mib=2560, reset_deadline_seconds=210,
             )
             fake_env = _OnlineFakeEnv()
             out = root / "sharded_out"
@@ -1315,7 +1348,8 @@ class TrainOnlineTest(unittest.TestCase):
                     mock.patch("sys.stdout", io.StringIO()):
                 ckpt = act_online.train_online(cfg)
             sharded_cls.assert_called_once_with(
-                "127.0.0.1", [5555, 5556], num_envs=4, min_reset_free_vram_mib=2560
+                "127.0.0.1", [5555, 5556], num_envs=4, min_reset_free_vram_mib=2560,
+                reset_timeout=1230.0, reset_retries=2,
             )
             meta = json.loads((ckpt.parent / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["env_workers"], 2)

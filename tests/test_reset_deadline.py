@@ -80,7 +80,7 @@ class ResetDeadlineTest(unittest.TestCase):
         for thread in threads:
             thread.start()
         env = ShardedRemoteEnv("127.0.0.1", [p0, p1], num_envs=2,
-                               timeout=10, reset_timeout=12, reset_retries=1)
+                               timeout=10, reset_timeout=15, reset_retries=2)
         try:
             env.connect()
             drive(env)
@@ -102,23 +102,22 @@ class ResetDeadlineTest(unittest.TestCase):
             time.sleep(0.6)  # Completed reset guards cannot terminate a later step.
             self.assertTrue(all(row[3] for row in env.step_batch([[0.0], [0.0]], [0, 1])))
 
-        healthy, replacement = self._run_generations(["hang", "ok"], drive)
+        healthy, replacement = self._run_generations(["hang", "hang", "ok"], drive)
         self.assertEqual([code for code, _ in healthy], [0])
-        self.assertEqual([code for code, _ in replacement], [-signal.SIGKILL, 0])
+        self.assertEqual([code for code, _ in replacement], [-signal.SIGKILL, -signal.SIGKILL, 0])
         self.assertEqual(healthy[0][1].count("reset [14]"), 1)
-        self.assertIn("reset [23]", replacement[0][1])
-        self.assertNotIn("reset reply", replacement[0][1])
-        self.assertIn("reset [23]", replacement[1][1])
+        self.assertTrue(all("reset [23]" in log for _, log in replacement))
+        self.assertTrue(all("reset reply" not in log for _, log in replacement[:-1]))
         self.assertIn("step\n", healthy[0][1])
-        self.assertIn("step\n", replacement[1][1])
+        self.assertIn("step\n", replacement[-1][1])
 
-    def test_two_hangs_fail_without_third_reset(self):
+    def test_three_hangs_fail_without_fourth_reset(self):
         def drive(env):
             with self.assertRaisesRegex(ConnectionError, "Reset retry limit reached"):
                 env.reset_batch([14, 23])
 
-        healthy, stalled = self._run_generations(["hang", "hang"], drive)
-        self.assertEqual([code for code, _ in stalled], [-signal.SIGKILL] * 2)
+        healthy, stalled = self._run_generations(["hang", "hang", "hang"], drive)
+        self.assertEqual([code for code, _ in stalled], [-signal.SIGKILL] * 3)
         self.assertTrue(all("reset [23]" in log for _, log in stalled))
         self.assertEqual(healthy[0][1].count("reset [14]"), 1)
 

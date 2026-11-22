@@ -38,6 +38,7 @@
 - 每轮评测前必须把 eval.yaml 的 ckpt 切到本轮训练产物，严禁误用基座 epoch4000；评测后核对 run 目录记录的 ckpt 路径。**规则：切 ckpt → dry-run 核对 → 评测 → 复核，四步缺一不可。**
 
 ## 运行与资源
+- Round 28 在第 3、5 波复位前因剩余显存低于 2,560 MiB 协调回收。第 3 波一条同布局重试在 63.1 秒恢复，第 5 波同一 worker 两次达到 210 秒看门狗期限，耗尽重试，learner 退出 1。前四波 464 局和最后一次原子 checkpoint 已核验。日志未定位仿真卡住的根因。**规则：分别核对回收触发、单次复位期限、重试上限和最后成功的更新。整波一旦开始要保留相同布局，重试有界，耗尽时从最后验证过的 checkpoint 交接。**
 - 共享 12GB GPU 上 Isaac 渲染器显存随回合数爬升（round11b 3h40m 10.5→11.4GB 时 Vulkan OOM 崩溃）；波次耗时渐增是前兆。监督循环自动重启无损恢复（崩溃在波次边界时）。**规则：长轮预期可能 OOM；不强杀；重启后核对残差/render_products=3 与回合连续性。**
 - round12 OOM 后 Kit 与 round11b 不同：转储后**挂住不退出**（容器缺 zenity，渲染图死、显存被占），监督循环等不到退出；`docker exec kill` 对容器 PID1 的 TERM/KILL 无效，主机 kill 无权限（root 进程）。**规则：确认渲染已死且挂住时，用 `docker kill --signal=KILL <容器>` 由守护进程结束它触发监督重启——这是崩溃恢复，不是预算强杀；先确认崩溃在波次边界、无在途回合数据。**
 - round15 复现 hung-Kit 并验证既有恢复规则有效：10:00:32 OOM（@~3.8h，VRAM 11726MiB/95.9%，`zenity not found`，env server 空转 106%CPU，容器 RestartCount=0、supervisor 阻塞在 docker run 无法自愈）；`docker kill --signal=KILL` 10:03:37 → fresh env `render_products=3`、回合 166→168 连续（u11 partial batch 保留、无重采样、无数据丢失）、~8min 停机计入预算、learner 全程存活重连。**规则补充：显存蠕变会短暂平台后再加速（round15 09:22 11069MiB ~0.9MiB/min 平台 → 09:59 11460 → 10:00 11726 触顶），不能因短窗口平台下调 OOM 风险；波次耗时持续爬升（u7→10：1448→1515→1621→1703s）比显存瞬时值更可靠的前兆。headless 容器 GLFW initialization failed / carb.audio eDeviceLost / MDLC C302 均为 benign 启动噪声，不是渲染故障（render_products=3 + 真实物理步进为准）。**
