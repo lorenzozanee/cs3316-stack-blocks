@@ -175,6 +175,7 @@ _LIFT_ZERO_FRACTION = 3.0       # no credit above three side lengths
 _LATERAL_FULL_FRACTION = 0.25   # lateral margin full at a quarter side
 _GRIPPER_FULL_OPEN = 0.8        # official is_all_gripper_open threshold
 _GRASP_HOLD_MIN = 0.5
+_CARRY_HOLD_MIN = 0.25          # hysteresis floor for active dense carry retention
 _RELEASE_MIN = 0.8              # applied directly to a locally associated arm
 _CUBE_EXTENT_REL_TOL = 0.02
 # Hard support thresholds are conservative internal geometric resolutions,
@@ -1108,7 +1109,8 @@ class StackingReward:
         best_score = -1.0
         # Both terms follow the confirmed carried block when there is one.
         active = {label: dest for label, dest in self._carry_destinations.items()
-                  if label not in frame.support and frame.hold[dest.arm, label] >= _GRASP_HOLD_MIN}
+                  if label not in frame.support and frame.hold[dest.arm, label] >= (
+                      _CARRY_HOLD_MIN if isinstance(dest, _DenseCarry) else _GRASP_HOLD_MIN)}
         for label in active or BLOCK_LABELS:
             if label in frame.support:
                 continue
@@ -1241,7 +1243,8 @@ class StackingReward:
         return credit
 
     def _dense_approach(self, frame: _Frame) -> float:
-        free_arms = [arm for arm in (0, 1) if all(
+        carried_arms = {attempt.arm for attempt in self._carry_destinations.values()}
+        free_arms = [arm for arm in (0, 1) if arm not in carried_arms and all(
             frame.hold[arm, label] < _GRASP_HOLD_MIN for label in BLOCK_LABELS)]
         reward = 0.0
         anchor = self._available_anchor(frame)
@@ -1291,7 +1294,7 @@ class StackingReward:
                              executed_action: Sequence[float] | None) -> tuple[float, float]:
         anchor, arm = attempt.anchor, attempt.arm
         lower = anchor[-1] if anchor else None
-        held = frame.hold[arm, label] >= _GRASP_HOLD_MIN
+        held = frame.hold[arm, label] >= _CARRY_HOLD_MIN
         available = self._available_anchor(frame)
         placement = _MILESTONES[len(anchor) + 1]
         settled_self = available == anchor + (label,) and attempt.row["aligned_step"] is not None

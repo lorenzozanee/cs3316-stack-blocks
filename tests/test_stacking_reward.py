@@ -2221,6 +2221,92 @@ class DenseRouteTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_reward_config(_cfg(**{key: -0.1}))
 
+    def test_carry_hysteresis_retains_guard_and_releases_while_still_catching_real_drops(self):
+        label, other, _ = BLOCK_LABELS
+        # Grasp entry still requires hold >= 0.50 (11.5 mm offset on 30 mm cube gives hold ~0.41).
+        lifted = self.positions[label] + [0.0, 0.0, 0.07]
+        self.positions[label] = lifted.copy()
+        offset_grasp = lifted + [0.0, 0.0, 0.0115]
+        for _ in range(4):
+            self.reward.step(_proprio(left=WaypointRewardTests._wrist(offset_grasp)),
+                             _state(self.positions, measured=(REAL_GRIP_30, 1.0)))
+        self.assertIsNone(self.reward.milestone_steps["grasp"])
+        self.assertEqual(self.reward.transport_attempts, [])
+
+        # Confirm grasp cleanly, then carry at exact 0.25 floor (14.625 mm offset on 30 mm cube)
+        # and at ~0.41 (11.5 mm): guard stays active, arm 0 is excluded from approach even while
+        # moving closer to `other`, and free arm 1 still earns approach toward `other`.
+        self.setUp()
+        start = self.positions[label] + [0.0, 0.0, 0.07]
+        self.lift(label, start)
+        self.positions[other] = self.base_goal + [0.0, 0.0, 0.05]
+        right_far = np.array([0.40, -0.35, TOP + 0.12])
+        self.reward.step(_proprio(left=WaypointRewardTests._wrist(start + [0.0, 0.0, 0.0115]),
+                                  right=WaypointRewardTests._wrist(right_far)),
+                         _state(self.positions, measured=(REAL_GRIP_30, 1.0)))
+        approach_before = self.reward._dense_approach_return
+        for frac, dz in ((0.3, 0.0115), (0.6, 0.014625)):
+            pos = start + frac * (self.base_goal + [0.0, 0.0, 0.05] - start)
+            self.positions[label] = pos.copy()
+            action = np.zeros(16, dtype=float)
+            action[7] = 0.95
+            base_action = action.copy()
+            early = self.reward.guard_gripper_action(action, base_action=base_action)
+            self.assertEqual(early, (label,))
+            self.assertLessEqual(action[7], REAL_GRIP_30 + 1e-6)
+            grasp = pos + [0.0, 0.0, dz]
+            self.reward.step(_proprio(left=WaypointRewardTests._wrist(grasp),
+                                      right=WaypointRewardTests._wrist(right_far)),
+                             _state(self.positions, measured=(REAL_GRIP_30, 1.0)),
+                             executed_action=action, early_open=early)
+        row = self.reward.transport_attempts[0]
+        self.assertIsNone(row["end_reason"])
+        self.assertEqual(self.reward.penalty_counts["drop"], 0)
+        self.assertEqual(row["guard_clamp_steps"], 2)
+        self.assertEqual(self.reward._dense_approach_return, approach_before)
+
+        # Free arm 1 moving toward `other` while arm 0 carries at hold ~0.41 still earns approach.
+        right_closer = 0.5 * (right_far + self.positions[other])
+        self.reward.step(_proprio(left=WaypointRewardTests._wrist(self.positions[label] + [0.0, 0.0, 0.0115]),
+                                  right=WaypointRewardTests._wrist(right_closer)),
+                         _state(self.positions, measured=(REAL_GRIP_30, 1.0)))
+        self.assertGreater(self.reward._dense_approach_return, approach_before)
+
+        # Align at goal while closed (hold ~0.41), then open to 0.82 (hold -> 0) to release cleanly.
+        self.positions[label] = self.base_goal.copy()
+        self.reward.step(_proprio(left=WaypointRewardTests._wrist(self.base_goal + [0.0, 0.0, 0.0115])),
+                         _state(self.positions, measured=(REAL_GRIP_30, 1.0)))
+        self.assertIsNotNone(row["aligned_step"])
+        self.reward.step(_proprio(left=WaypointRewardTests._wrist(self.base_goal + [0.0, 0.0, 0.0115])),
+                         _state(self.positions, measured=(0.82, 1.0)))
+        self.assertEqual(row["end_reason"], "released")
+        self.assertIsNotNone(row["opened_step"])
+        self.assertEqual(self.reward.penalty_counts["drop"], 0)
+
+        # Falling below _CARRY_HOLD_MIN (15.5 mm offset -> hold ~0.205 < 0.25) confirms closed drop in 2 steps.
+        self.setUp()
+        start = self.positions[label] + [0.0, 0.0, 0.07]
+        self.lift(label, start)
+        slipped = start + [0.0, 0.0, 0.0155]
+        for _ in range(2):
+            self.reward.step(_proprio(left=WaypointRewardTests._wrist(slipped)),
+                             _state(self.positions, measured=(REAL_GRIP_30, 1.0)))
+        row2 = self.reward.transport_attempts[0]
+        self.assertEqual(row2["end_reason"], "dropped")
+        self.assertEqual(self.reward.penalty_counts["drop"], 1)
+        self.assertLess(row2["drop_trace"]["confirmed"]["hold"], 0.25)
+
+        # Opening gripper >= 0.80 off-goal while centered confirms open drop in 1 step.
+        self.setUp()
+        start = self.positions[label] + [0.0, 0.0, 0.07]
+        self.lift(label, start)
+        self.reward.step(_proprio(left=WaypointRewardTests._wrist(start)),
+                         _state(self.positions, measured=(0.85, 1.0)))
+        row3 = self.reward.transport_attempts[0]
+        self.assertEqual(row3["end_reason"], "dropped")
+        self.assertEqual(self.reward.penalty_counts["drop"], 1)
+        self.assertEqual(row3["drop_trace"]["confirmed"]["hold"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
