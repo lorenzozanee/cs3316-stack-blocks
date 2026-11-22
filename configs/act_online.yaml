@@ -141,7 +141,7 @@ target_kl: 0.3
 # Online unfrozen-ACT fine-tuning via advantage-weighted chunk regression (AWR)
 # on the active inference pathway (66.5M params; unused CVAE encoder stays frozen)
 # plus a training-only spatial-softmax visual block-pose head on input_proj tokens.
-unfreeze_act: true
+unfreeze_act: false
 act_lr: 1e-6
 act_backbone_lr: 5e-7
 act_weight_decay: 1e-4

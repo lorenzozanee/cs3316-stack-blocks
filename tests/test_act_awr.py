@@ -47,14 +47,15 @@ class ActAwrUnitTest(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(1)
 
-    def test_default_yaml_has_all_act_awr_keys_and_validates(self):
+    def test_default_yaml_freezes_act_and_supports_opt_in_awr(self):
         cfg = load_config(ROOT / "configs/act_online.yaml")
+        self.assertFalse(validate_act_awr_config(cfg))
         for key in ACT_AWR_KEYS:
             self.assertIn(key, cfg, f"Missing {key} in configs/act_online.yaml")
-        self.assertTrue(validate_act_awr_config(cfg))
+        self.assertTrue(validate_act_awr_config(dict(cfg, unfreeze_act=True)))
 
     def test_validate_act_awr_config_rejects_bad_values(self):
-        base = load_config(ROOT / "configs/act_online.yaml")
+        base = dict(load_config(ROOT / "configs/act_online.yaml"), unfreeze_act=True)
         bad_bool = dict(base, unfreeze_act="yes")
         with self.assertRaises(ValueError):
             validate_act_awr_config(bad_bool)
