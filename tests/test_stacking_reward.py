@@ -2020,6 +2020,42 @@ class DenseRouteTests(unittest.TestCase):
             self.assertEqual(self.reward.penalty_counts["drop"], expected)
         self.assertAlmostEqual(self.reward.penalty_return, -4 * drop_pen)
 
+    def test_drop_trace_records_same_arm_commands_and_clears_recovered_loss(self):
+        label = BLOCK_LABELS[0]
+        start = self.positions[label] + [0, 0, 0.07]
+        self.lift(label, start, arm=1)
+        self.step_at(label, start, arm=1, opening=0.0)
+        base = _proprio()
+        base[[7, 15]] = [0.9, 0.37]
+        action = base.copy()
+        action[15] = 0.01
+        blocked = self.reward.guard_gripper_action(action, base_action=base)
+        self.assertEqual(blocked, ())
+        self.step_at(label, start, arm=1, executed_action=action, early_open=blocked)
+
+        action = base.copy()
+        action[15] = 0.9
+        blocked = self.reward.guard_gripper_action(action, base_action=base)
+        self.assertEqual(blocked, (label,))
+        self.step_at(label, start, arm=1, opening=0.0, executed_action=action, early_open=blocked)
+        self.step_at(label, start, arm=1, opening=0.0)
+
+        row = self.reward.transport_attempts[-1]
+        self.assertEqual(row["guard_clamp_steps"], 2)
+        self.assertEqual(row["early_open_requests"], 1)
+        self.assertEqual(row["end_reason"], "dropped")
+        trace = row["drop_trace"]
+        held, first, confirmed = (trace[k] for k in ("last_held", "first_off_goal_loss", "confirmed"))
+        self.assertEqual((held["step"], first["step"], confirmed["step"]),
+                         (row["end_step"] - 2, row["end_step"] - 1, row["end_step"]))
+        self.assertGreater(held["hold"], first["hold"])
+        self.assertEqual(first["base"], float(base[15]))
+        self.assertEqual(first["requested"], 0.9)
+        self.assertAlmostEqual(first["executed"], REAL_GRIP_30)
+        self.assertEqual(first["measured"], 0.0)
+        np.testing.assert_allclose(first["block_xyz"], start)
+        self.assertIsNone(confirmed["requested"])
+
     def test_empty_place_penalty_for_closed_or_opening_jaw_with_exemptions_and_hysteresis(self):
         empty_pen = DEFAULTS["empty_place_penalty"]
         in_zone = _proprio(left=WaypointRewardTests._wrist(self.base_goal + [0.0, 0.0, 0.02]))

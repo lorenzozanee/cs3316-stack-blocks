@@ -521,6 +521,9 @@ class _DenseCarry(_CarryDestination):
     drop_pending: int = 0
     arm_was_near: bool = True
     opening_started: bool = False
+    gripper_inputs: tuple[float, float] | None = None
+    last_held: dict | None = None
+    first_off_goal_loss: dict | None = None
 
 
 @dataclass
@@ -1273,6 +1276,17 @@ class StackingReward:
         attempt.invalid = True
         attempt.row["end_reason"] = reason
 
+    def _carry_sample(self, frame: _Frame, label: str, attempt: _DenseCarry,
+                      executed_action: Sequence[float] | None) -> dict:
+        arm = attempt.arm
+        base, requested = attempt.gripper_inputs or (None, None)
+        return dict(step=self._step_index, hold=float(frame.hold[arm, label]),
+                    associated=arm in frame.associated_arms[label],
+                    block_xyz=frame.pos[label].tolist(), grasp_xyz=frame.grasp[arm].tolist(),
+                    support_clearance_m=float(frame.bottom[label] - frame.support_top[label]),
+                    measured=float(frame.measured[arm]), base=base, requested=requested,
+                    executed=None if executed_action is None else float(executed_action[7 + 8 * arm]))
+
     def _advance_dense_carry(self, frame: _Frame, label: str, attempt: _DenseCarry,
                              executed_action: Sequence[float] | None) -> tuple[float, float]:
         anchor, arm = attempt.anchor, attempt.arm
@@ -1302,6 +1316,8 @@ class StackingReward:
         was_near_at_goal = attempt.arm_was_near and attempt.row["aligned_step"] is not None
         attempt.arm_was_near = arm_near and near_goal
         if held:
+            attempt.last_held = self._carry_sample(frame, label, attempt, executed_action)
+            attempt.first_off_goal_loss = None
             attempt.drop_pending = 0
             attempt.opening_started = False
             if not goal_valid:
@@ -1334,10 +1350,17 @@ class StackingReward:
         if not near_goal:
             attempt.opening_started = False
             attempt.drop_pending += 1
+            sample = self._carry_sample(frame, label, attempt, executed_action)
+            if attempt.drop_pending == 1:
+                attempt.first_off_goal_loss = sample
             if (float(frame.measured[arm]) >= _RELEASE_MIN
                     or attempt.drop_pending >= _DROP_CONFIRM_STEPS):
+                attempt.row["drop_trace"] = dict(last_held=attempt.last_held,
+                                                 first_off_goal_loss=attempt.first_off_goal_loss,
+                                                 confirmed=sample)
                 self._end_attempt(attempt, "dropped")
             return 0.0, 0.0
+        attempt.first_off_goal_loss = None
         attempt.drop_pending = 0
         if attempt.row["aligned_step"] is None and not arm_near:
             self._end_attempt(attempt, "unattributed")
@@ -1397,8 +1420,12 @@ class StackingReward:
                 and self._destination_valid(frame, label, attempt)
                 and (bool(attempt.anchor) or not self._occupied(frame, None, label)))
 
-    def guard_gripper_action(self, action: np.ndarray) -> tuple[str, ...]:
+    def guard_gripper_action(self, action: np.ndarray, *, base_action: np.ndarray | None = None) -> tuple[str, ...]:
         """Clamp off-target gripper targets in place and report opening requests."""
+        if base_action is not None:
+            for attempt in self._carry_destinations.values():
+                index = 7 + 8 * attempt.arm
+                attempt.gripper_inputs = (float(base_action[index]), float(action[index]))
         early_open = tuple(label for label, arm, _, measured in self._guarded_carries
                            if float(action[7 + 8 * arm]) > measured + _OPEN_COMMAND_MARGIN)
         for _, arm, limit, _ in self._guarded_carries:
@@ -1438,7 +1465,11 @@ class StackingReward:
         active_arms = {attempt.arm for attempt in self._carry_destinations.values()}
         ending_arms: set[int] = set()
         for label, attempt in list(self._carry_destinations.items()):
+            if attempt.gripper_inputs is not None and executed_action is not None:
+                index = 7 + 8 * attempt.arm
+                attempt.row["guard_clamp_steps"] += float(executed_action[index]) < attempt.gripper_inputs[1]
             carry, placement = self._advance_dense_carry(frame, label, attempt, executed_action)
+            attempt.gripper_inputs = None
             carry_bonus += carry
             placement_bonus += placement
             if attempt.invalid:
@@ -1460,14 +1491,16 @@ class StackingReward:
             row = dict(arm=arm, carried=label, target_lower=lower, lower=lower,
                        grasp_step=self._step_index, aligned_step=aligned,
                        opened_step=None, settled_step=None, early_open_step=None,
-                       early_open_requests=0, end_reason=None, end_step=None, end_measured_open=None)
+                       early_open_requests=0, guard_clamp_steps=0,
+                       end_reason=None, end_step=None, end_measured_open=None)
             self.transport_attempts.append(row)
             grip_limit = float(frame.measured[arm])
             if executed_action is not None:
                 grip_limit = min(grip_limit, float(executed_action[7 + 8 * arm]))
-            self._carry_destinations[label] = _DenseCarry(
-                arm, anchor, hard_tower=bool(anchor), row=row, grip_limit=grip_limit,
-                previous=frame.pos[label].copy())
+            attempt = _DenseCarry(arm, anchor, hard_tower=bool(anchor), row=row,
+                                  grip_limit=grip_limit, previous=frame.pos[label].copy())
+            attempt.last_held = self._carry_sample(frame, label, attempt, executed_action)
+            self._carry_destinations[label] = attempt
             active_arms.add(arm)
         return carry_bonus, placement_bonus, carry_penalty, active_arms, ending_arms
 

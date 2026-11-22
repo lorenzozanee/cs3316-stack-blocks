@@ -226,8 +226,8 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             inputs, raw_actions, log_probs, values = (item.cpu() for item in (inputs, raw_actions, log_probs, values))
             base = np.stack([current[i][0] for i in learning])
             actions = compose_residual_action(base, raw_actions, runner.stats["action_std"], residual_scale)
-            for i, action in zip(learning, actions):
-                requests = rewards[i].guard_gripper_action(action)
+            for i, action, base_action in zip(learning, actions, base):
+                requests = rewards[i].guard_gripper_action(action, base_action=base_action)
                 if requests:
                     early_open[i] = requests
             # Mean Euclidean target-position correction across both arms, in metres.
