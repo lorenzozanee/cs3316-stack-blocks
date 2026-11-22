@@ -52,6 +52,7 @@ class ColabScriptsTests(unittest.TestCase):
                 env_workers=1,
                 port=5555,
                 min_reset_free_vram_mib=2560,
+                reset_deadline_seconds=None,
                 round=25,
                 measure_updates=None,
                 finetune_episodes=None,
@@ -75,9 +76,11 @@ class ColabScriptsTests(unittest.TestCase):
             self.assertNotIn("act_inference_batch_size", train_data)
             args.round = 26
             args.env_workers = 4
+            args.reset_deadline_seconds = 210
             args.act_inference_batch_size = 8
             env_cfg2, train_cfg2, _ = mod.write_configs(args, "2026.11.21-12.00.00")
             self.assertEqual(load_config(env_cfg2)["env_workers"], 4)
+            self.assertEqual(load_config(env_cfg2)["reset_deadline_seconds"], 210)
             train_data2 = load_config(train_cfg2)
             self.assertEqual(train_data2["max_train_seconds"], 7200)
             self.assertEqual(train_data2["act_inference_batch_size"], 8)
@@ -236,6 +239,7 @@ class ColabScriptsTests(unittest.TestCase):
                 env_workers=1,
                 port=5555,
                 min_reset_free_vram_mib=2560,
+                reset_deadline_seconds=None,
                 tasking_threads=None,
                 physx_threads=None,
             )
@@ -246,9 +250,11 @@ class ColabScriptsTests(unittest.TestCase):
             self.assertEqual(extra_env, {})
             self.assertIsNone(cache_root)
             self.assertNotIn("--coordinated-recycle", cmd)
+            self.assertNotIn("--reset-deadline-seconds", cmd)
             self.assertEqual(cmd[cmd.index("--num-envs") + 1], "64")
 
             args.env_workers = 4
+            args.reset_deadline_seconds = 210
             args.tasking_threads = 8
             args.physx_threads = 4
             multi = mod.build_sim_commands(args, "stamp2")
@@ -260,6 +266,7 @@ class ColabScriptsTests(unittest.TestCase):
                 self.assertEqual(cmd[cmd.index("--num-envs") + 1], "16")
                 ports.append(int(cmd[cmd.index("--port") + 1]))
                 self.assertIn("--coordinated-recycle", cmd)
+                self.assertEqual(cmd[cmd.index("--reset-deadline-seconds") + 1], "210")
                 self.assertIn("--portable-root", cmd)
                 kit_args = cmd[cmd.index("--kit_args") + 1]
                 self.assertNotIn("ujitsoCollisionCooking", kit_args)

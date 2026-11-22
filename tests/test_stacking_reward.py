@@ -1845,6 +1845,236 @@ class DenseRouteTests(unittest.TestCase):
             self.step_at(upper, goal, opening=1.0, arm=1)
         self.assertIsNotNone(self.reward.milestone_steps["pair2"])
 
+    def test_placement_radius_04_anchors_layer2_with_vertical_clearance(self):
+        base, upper, _ = BLOCK_LABELS
+        # Base placed 3.5 cm from target center (outside old 1 cm radius, inside new 4 cm radius).
+        off_center = self.base_goal + [0.035, 0.0, 0.0]
+        self.lift(base, self.positions[base] + [0.0, 0.0, 0.07])
+        self.step_at(base, off_center)
+        self.step_at(base, off_center, opening=0.8)
+        for _ in range(3):
+            self.step_at(base, off_center, opening=1.0)
+        self.assertIsNotNone(self.reward.milestone_steps["base"])
+        self.assertEqual(self.reward._settled_anchor, (base,))
+
+        # Lifting 2nd block sets target_lower to base, with higher Z + vertical clearance during approach.
+        side_pos = np.array([off_center[0] + 0.12, off_center[1], TOP + 3 * HALF])
+        self.lift(upper, side_pos, arm=1)
+        self.assertEqual(self.reward.transport_attempts[-1]["target_lower"], base)
+        low_terms, _ = self.step_at(upper, side_pos, arm=1)
+        # Moving UP to clear base's top earns positive carry progress.
+        high_pos = side_pos + [0.0, 0.0, 0.6 * SIZE]
+        high_terms, _ = self.step_at(upper, high_pos, arm=1)
+        self.assertGreater(high_terms["dense_transport_return"], low_terms["dense_transport_return"])
+        # Moving to exact top of base completes carry to full 0.45 and pays pair2.
+        goal2 = off_center + [0.0, 0.0, SIZE]
+        final_terms, _ = self.step_at(upper, goal2, arm=1)
+        self.assertGreater(final_terms["dense_transport_return"], high_terms["dense_transport_return"])
+        self.step_at(upper, goal2, opening=0.8, arm=1)
+        for _ in range(3):
+            self.step_at(upper, goal2, opening=1.0, arm=1)
+        self.assertIsNotNone(self.reward.milestone_steps["pair2"])
+        self.assertEqual(self.reward.penalty_return, 0.0)
+
+    def test_drop_penalty_triggers_with_flicker_guard_and_episode_cap(self):
+        label = BLOCK_LABELS[0]
+        drop_pen = DEFAULTS["drop_penalty"]
+        start_home = WaypointRewardTests._positions(self.reset)[label].copy()
+        # 1) Single-frame closed-jaw flicker does NOT drop or penalize.
+        start = start_home + [0.0, 0.0, 0.07]
+        self.lift(label, start)
+        terms_flicker, _ = self.step_at(label, start, opening=0.0)
+        self.assertEqual(terms_flicker["penalty_counts"]["drop"], 0)
+        self.assertEqual(self.reward.penalty_return, 0.0)
+        self.assertIsNone(self.reward.transport_attempts[-1]["end_reason"])
+        # Recovering hold clears pending counter.
+        self.step_at(label, start, opening=REAL_GRIP_30)
+        self.assertEqual(self.reward.penalty_counts["drop"], 0)
+
+        # 2) Two consecutive closed-jaw unheld frames off-goal confirm drop once.
+        self.step_at(label, start, opening=0.0)
+        self.assertEqual(self.reward.penalty_counts["drop"], 0)
+        terms_drop, bonus = self.step_at(label, start, opening=0.0)
+        self.assertEqual(self.reward.transport_attempts[-1]["end_reason"], "dropped")
+        self.assertEqual(terms_drop["penalty_counts"]["drop"], 1)
+        self.assertAlmostEqual(terms_drop["penalty_return"], -drop_pen)
+        self.assertLess(bonus, 0.0)
+
+        # 3) Opening off-goal drops immediately; total drop penalties cap at 4.
+        far = _proprio(left=WaypointRewardTests._wrist(start_home + [0.0, -0.15, 0.0]))
+        for expected in (2, 3, 4, 4):
+            self.positions[label] = start_home + [0.0, 0.0, 0.07]
+            self.lift(label, self.positions[label])
+            self.positions[label] = start_home.copy()
+            self.reward.step(far, _state(self.positions, measured=(1.0, 1.0)))
+            self.assertEqual(self.reward.penalty_counts["drop"], expected)
+        self.assertAlmostEqual(self.reward.penalty_return, -4 * drop_pen)
+
+    def test_empty_place_penalty_for_closed_or_opening_jaw_with_exemptions_and_hysteresis(self):
+        empty_pen = DEFAULTS["empty_place_penalty"]
+        in_zone = _proprio(left=WaypointRewardTests._wrist(self.base_goal + [0.0, 0.0, 0.02]))
+        outside = _proprio(left=WaypointRewardTests._wrist(self.base_goal + [0.0, -0.20, 0.15]))
+
+        # Open empty gripper hovering in placement zone is NOT penalized.
+        self.reward.step(in_zone, _state(self.positions, measured=(1.0, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_place"], 0)
+
+        # Closed empty gripper in placement zone fires once and latches until exit + margin.
+        terms1, bonus1 = self.reward.step(in_zone, _state(self.positions, measured=(0.0, 1.0)))
+        self.assertEqual(terms1["penalty_counts"]["empty_place"], 1)
+        self.assertAlmostEqual(terms1["penalty_return"], -empty_pen)
+        self.assertLess(bonus1, 0.0)
+        # Staying inside does not re-fire.
+        self.reward.step(in_zone, _state(self.positions, measured=(0.0, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_place"], 1)
+
+        # Exiting past margin resets latch; entering at 0.70 then opening to 0.85 also triggers!
+        self.reward.step(outside, _state(self.positions, measured=(0.70, 1.0)))
+        self.reward.step(in_zone, _state(self.positions, measured=(0.70, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_place"], 1)
+        self.reward.step(in_zone, _state(self.positions, measured=(0.85, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_place"], 2)
+
+        # Reaching an unplaced block that sits inside the placement zone is exempt.
+        self.reward.step(outside, _state(self.positions, measured=(1.0, 1.0)))
+        home = WaypointRewardTests._positions(self.reset)
+        self.positions[BLOCK_LABELS[0]] = self.base_goal + [0.0, 0.0, 0.002]
+        self.reward.step(in_zone, _state(self.positions, measured=(0.0, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_place"], 2)
+
+        # Restore block outside zone and verify cap at 4.
+        self.positions[BLOCK_LABELS[0]] = home[BLOCK_LABELS[0]].copy()
+        for expected in (3, 4, 4):
+            self.reward.step(outside, _state(self.positions, measured=(1.0, 1.0)))
+            self.reward.step(in_zone, _state(self.positions, measured=(0.0, 1.0)))
+            self.assertEqual(self.reward.penalty_counts["empty_place"], expected)
+        self.assertAlmostEqual(self.reward.penalty_return, -4 * empty_pen)
+
+    def test_empty_tower_intrusion_and_tower_break_with_grace_and_nudge_hysteresis(self):
+        base, upper, _ = BLOCK_LABELS
+        intrusion_pen = DEFAULTS["empty_tower_intrusion_penalty"]
+        break_pen = DEFAULTS["tower_break_penalty"]
+        # Place and settle base block cleanly with arm 0.
+        self.lift(base, self.positions[base] + [0.0, 0.0, 0.07], arm=0)
+        self.step_at(base, self.base_goal, arm=0)
+        self.step_at(base, self.base_goal, opening=0.8, arm=0)
+        for _ in range(3):
+            self.step_at(base, self.base_goal, opening=1.0, arm=0)
+        self.assertIsNotNone(self.reward.milestone_steps["base"])
+
+        # During 40-step post-release grace, arm 0 lingering at tower is exempt.
+        at_tower = _proprio(left=WaypointRewardTests._wrist(self.base_goal + [0.0, 0.0, 0.005]))
+        self.reward.step(at_tower, _state(self.positions, measured=(0.0, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_tower_intrusion"], 0)
+        self.assertEqual(self.reward.penalty_counts["empty_place"], 0)
+
+        # Idle arm 1 (never carried) entering tower with closed jaw fires intrusion once,
+        # NOT double-counted with empty_place on the same frame.
+        arm1_in_tower = _proprio(right=WaypointRewardTests._wrist(self.base_goal + [0.0, 0.0, 0.005]))
+        terms_intr, _ = self.reward.step(arm1_in_tower, _state(self.positions, measured=(1.0, 0.0)))
+        self.assertEqual(terms_intr["penalty_counts"]["empty_tower_intrusion"], 1)
+        self.assertEqual(terms_intr["penalty_counts"]["empty_place"], 0)
+        self.assertAlmostEqual(terms_intr["penalty_return"], -intrusion_pen)
+
+        # Minor 2 mm base nudge across 4 cm circle boundary (to 4.2 cm) does NOT fire tower_break.
+        self.positions[base] = self.base_goal + [0.042, 0.0, 0.0]
+        for _ in range(3):
+            self.reward.step(_proprio(), _state(self.positions, measured=(1.0, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["tower_break"], 0)
+
+        # Restore base inside circle, let arm 1 re-enter tower (2nd intrusion),
+        # then knock base over for 2 frames: 1st frame alone does not trigger;
+        # 2nd frame triggers tower_break + empty_tower_break attribution.
+        self.positions[base] = self.base_goal.copy()
+        self.reward.step(arm1_in_tower, _state(self.positions, measured=(1.0, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_tower_intrusion"], 2)
+        tilted = [math.cos(math.radians(22.5)), math.sin(math.radians(22.5)), 0.0, 0.0]
+        tilted_rots = {label: [1.0, 0.0, 0.0, 0.0] for label in BLOCK_LABELS}
+        tilted_rots[base] = tilted
+        self.reward.step(_proprio(), _state(self.positions, rotations=tilted_rots))
+        self.assertEqual(self.reward.penalty_counts["tower_break"], 0)
+        terms_brk, _ = self.reward.step(_proprio(), _state(self.positions, rotations=tilted_rots))
+        self.assertEqual(terms_brk["penalty_counts"]["tower_break"], 1)
+        self.assertEqual(terms_brk["penalty_counts"]["empty_tower_break"], 1)
+        self.assertAlmostEqual(terms_brk["penalty_return"], -(2 * intrusion_pen + break_pen))
+
+    def test_empty_grasp_penalty_requires_rearm_exempts_engaging_and_caps(self):
+        pen = DEFAULTS["empty_grasp_penalty"]
+        midair = _proprio(left=WaypointRewardTests._wrist(np.array([-0.35, -0.35, TOP + 0.15])))
+        self.reward.step(midair, _state(self.positions, measured=(1.0, 1.0)))
+        # Midair empty pinch fires once and requires rearm >= 0.75 before firing again.
+        terms1, bonus1 = self.reward.step(midair, _state(self.positions, measured=(0.15, 1.0)))
+        self.assertEqual(terms1["penalty_counts"]["empty_grasp"], 1)
+        self.assertAlmostEqual(terms1["penalty_return"], -pen)
+        self.assertAlmostEqual(terms1["event_bonus"], -pen)
+        self.assertAlmostEqual(bonus1, -pen)
+        # Staying closed or opening only to 0.60 does not rearm.
+        self.reward.step(midair, _state(self.positions, measured=(0.60, 1.0)))
+        self.reward.step(midair, _state(self.positions, measured=(0.15, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_grasp"], 1)
+        # Rearming >= 0.75 near an unplaced block is exempt (engaging).
+        near_block = _proprio(left=WaypointRewardTests._wrist(self.positions[BLOCK_LABELS[0]]))
+        self.reward.step(near_block, _state(self.positions, measured=(0.80, 1.0)))
+        self.reward.step(near_block, _state(self.positions, measured=(0.15, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["empty_grasp"], 1)
+        # Episode cap at 4.
+        for expected in (2, 3, 4, 4):
+            self.reward.step(midair, _state(self.positions, measured=(0.80, 1.0)))
+            self.reward.step(midair, _state(self.positions, measured=(0.15, 1.0)))
+            self.assertEqual(self.reward.penalty_counts["empty_grasp"], expected)
+        self.assertAlmostEqual(self.reward.penalty_return, -4 * pen)
+
+    def test_arm_conflict_penalty_on_collision_or_same_block_hold_allows_parallel(self):
+        pen = DEFAULTS["arm_conflict_penalty"]
+        # Productive dual-arm parallel work on different blocks far apart: zero penalty.
+        p0 = self.positions[BLOCK_LABELS[0]]
+        p2 = self.positions[BLOCK_LABELS[2]]
+        parallel = _proprio(
+            left=WaypointRewardTests._wrist(p0),
+            right=WaypointRewardTests._wrist(p2),
+        )
+        self.reward.step(parallel, _state(self.positions, measured=(REAL_GRIP_30, REAL_GRIP_30)))
+        self.assertEqual(self.reward.penalty_counts["arm_conflict"], 0)
+        self.assertEqual(self.reward.penalty_return, 0.0)
+
+        # Two grippers colliding within 60 mm fire once and latch until > 100 mm apart.
+        center = np.array([0.0, -0.35, TOP + 0.12])
+        collide = _proprio(
+            left=WaypointRewardTests._wrist(center + [-0.02, 0.0, 0.0]),
+            right=WaypointRewardTests._wrist(center + [0.02, 0.0, 0.0]),
+        )
+        terms1, bonus1 = self.reward.step(collide, _state(self.positions, measured=(1.0, 1.0)))
+        self.assertEqual(terms1["penalty_counts"]["arm_conflict"], 1)
+        self.assertAlmostEqual(terms1["penalty_return"], -pen)
+        self.assertAlmostEqual(terms1["event_bonus"], -pen)
+        self.assertLess(bonus1, 0.0)
+        # At 80 mm (still inside 60+40=100 mm hysteresis exit), stays latched.
+        mid_sep = _proprio(
+            left=WaypointRewardTests._wrist(center + [-0.04, 0.0, 0.0]),
+            right=WaypointRewardTests._wrist(center + [0.04, 0.0, 0.0]),
+        )
+        self.reward.step(mid_sep, _state(self.positions, measured=(1.0, 1.0)))
+        self.reward.step(collide, _state(self.positions, measured=(1.0, 1.0)))
+        self.assertEqual(self.reward.penalty_counts["arm_conflict"], 1)
+
+        # Separating past 100 mm clears latch; contesting same block triggers conflict and caps at 4.
+        far_sep = _proprio(
+            left=WaypointRewardTests._wrist(center + [-0.08, 0.0, 0.0]),
+            right=WaypointRewardTests._wrist(center + [0.08, 0.0, 0.0]),
+        )
+        for expected in (2, 3, 4, 4):
+            self.reward.step(far_sep, _state(self.positions, measured=(1.0, 1.0)))
+            self.reward.step(collide, _state(self.positions, measured=(1.0, 1.0)))
+            self.assertEqual(self.reward.penalty_counts["arm_conflict"], expected)
+        self.assertAlmostEqual(self.reward.penalty_return, -4 * pen)
+
+    def test_negative_penalty_weights_rejected(self):
+        for key in ("empty_grasp_penalty", "drop_penalty", "empty_place_penalty",
+                    "empty_tower_intrusion_penalty", "tower_break_penalty",
+                    "arm_conflict_penalty"):
+            with self.assertRaises(ValueError):
+                validate_reward_config(_cfg(**{key: -0.1}))
+
 
 if __name__ == "__main__":
     unittest.main()

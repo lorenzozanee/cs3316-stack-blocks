@@ -132,6 +132,8 @@ def write_configs(args, run_stamp: str) -> tuple[Path, Path, Path]:
         env_port=args.port,
         min_reset_free_vram_mib=args.min_reset_free_vram_mib,
     )
+    if args.reset_deadline_seconds is not None:
+        env["reset_deadline_seconds"] = args.reset_deadline_seconds
     budget = args.max_train_seconds if args.max_train_seconds is not None else (3600 if args.round == 25 else 7200)
     episodes = (args.finetune_episodes if args.finetune_episodes is not None else
                 args.num_envs if args.measure_updates else
@@ -217,6 +219,8 @@ def build_sim_commands(
             "--num-envs", str(per_worker), "--headless", "--enable_cameras", "--device", "cuda:0",
             "--min-reset-free-vram-mib", str(args.min_reset_free_vram_mib),
         ]
+        if args.reset_deadline_seconds is not None:
+            cmd.extend(["--reset-deadline-seconds", str(args.reset_deadline_seconds)])
         if args.env_workers > 1:
             cache_root = args.logs.parent / f".{run_stamp}-worker-{index}-cache"
             extra_env = {"XDG_CACHE_HOME": str(cache_root / "xdg")}
@@ -255,6 +259,8 @@ def main() -> int:
     parser.add_argument("--num-envs", required=True, type=int)
     parser.add_argument("--env-workers", type=int, default=1)
     parser.add_argument("--min-reset-free-vram-mib", required=True, type=int)
+    parser.add_argument("--reset-deadline-seconds", type=float,
+                        help="Restart a simulator if its reset exceeds this measured deadline.")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--worker-stagger-seconds", type=float, default=3.0)
     parser.add_argument("--tasking-threads", type=int)
@@ -274,6 +280,10 @@ def main() -> int:
             or (args.finetune_episodes is not None and args.finetune_episodes < 1)
             or (args.max_train_seconds is not None and args.max_train_seconds < 1)):
         parser.error("Require round >= 25 and positive scene, worker, episode, budget and headroom counts.")
+    if args.reset_deadline_seconds is not None and (
+        not math.isfinite(args.reset_deadline_seconds) or args.reset_deadline_seconds <= 0
+    ):
+        parser.error("--reset-deadline-seconds must be positive and finite.")
     if args.num_envs % args.env_workers != 0:
         parser.error(f"--num-envs ({args.num_envs}) must be divisible by --env-workers ({args.env_workers}).")
     if args.port < 1 or args.port + args.env_workers - 1 > 65535:

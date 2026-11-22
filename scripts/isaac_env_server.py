@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import math
 import os
 import sys
 
@@ -22,12 +23,17 @@ parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--once", action="store_true")
 parser.add_argument("--min-reset-free-vram-mib", type=int, default=0)
+parser.add_argument("--reset-deadline-seconds", type=float)
 parser.add_argument("--coordinated-recycle", action="store_true")
 parser.add_argument("--portable-root")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 if args.min_reset_free_vram_mib < 0:
     parser.error("--min-reset-free-vram-mib must be nonnegative")
+if args.reset_deadline_seconds is not None and (
+    not math.isfinite(args.reset_deadline_seconds) or args.reset_deadline_seconds <= 0
+):
+    parser.error("--reset-deadline-seconds must be positive and finite")
 if args.portable_root:
     os.makedirs(args.portable_root, exist_ok=True)
 
@@ -113,6 +119,7 @@ def main() -> None:
                         else None),
         coordinated_recycle=args.coordinated_recycle,
         free_vram_mib=_free_vram_mib,
+        reset_deadline_seconds=args.reset_deadline_seconds,
     )
     if recycled:
         # The RPC sockets are closed. Let the container release the renderer even if Kit teardown hangs.

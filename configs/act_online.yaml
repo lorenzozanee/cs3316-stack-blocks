@@ -88,7 +88,7 @@ waypoint_bonus: 0.15
 waypoint_radius: 0.025
 placement_x: 0.0
 placement_y: -0.2
-placement_radius: 0.01
+placement_radius: 0.04
 placement_soft_scale: 0.15
 grasp_offset: 0.143
 # x5 measured-opening normalization and physical jaw aperture from robot_config,
@@ -98,13 +98,19 @@ gripper_scale_high: 0.044
 gripper_aperture_zero: 0.000807165976524353
 # Internal geometric tolerances relative to actual projected width/block size;
 # neither is a contact-force measurement or calibrated solver tolerance.
-grasp_aperture_fraction: 0.10
-grasp_centering_fraction: 0.50
+grasp_aperture_fraction: 0.18
+grasp_centering_fraction: 0.65
 support_gap_floor: 0.002
 support_gap_fraction: 0.08
 settle_linear_speed: 0.010
 settle_angular_speed: 0.100
 upright_cos_min: 0.9659258262890683
+empty_grasp_penalty: 0.3
+drop_penalty: 0.4
+empty_place_penalty: 0.3
+empty_tower_intrusion_penalty: 0.4
+tower_break_penalty: 1.5
+arm_conflict_penalty: 0.4
 hidden_dim: 128
 # Corrections are clipped to this fraction of each offline action std.
 residual_scale: 0.2

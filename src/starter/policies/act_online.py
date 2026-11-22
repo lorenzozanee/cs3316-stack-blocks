@@ -112,7 +112,7 @@ def _block_positions(privileged) -> dict:
 
 @torch.no_grad()
 def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale,
-                 reward_cfg, prefixes=None, capture_prefix=None):
+                 reward_cfg, prefixes=None, capture_prefix=None, timings=None):
     """Finish every scene before resetting; never fabricate inactive transitions.
 
     Features and the raw sampled residual are cached before the environment
@@ -128,7 +128,16 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
     if any(not 0 <= i < len(seeds) or entry["scene"] != i or entry["width"] != len(seeds)
            or entry["layout_id"] != seeds[i] for i, entry in prefixes.items()):
         raise ValueError("Post-grasp replay must match layout and scene slot.")
-    observations, _ = env.reset_batch(seeds)
+
+    def timed(key, call, *args, **kwargs):
+        if timings is None:
+            return call(*args, **kwargs)
+        started = time.monotonic()
+        result = call(*args, **kwargs)
+        timings[key] = timings.get(key, 0.0) + (time.monotonic() - started)
+        return result
+
+    observations, _ = timed("reset_seconds", env.reset_batch, seeds)
     if len(observations) != len(seeds):
         raise ValueError("Environment reset width does not match num_envs.")
     reset_privileged = getattr(env, "_privileged", None)
@@ -156,7 +165,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
     active = list(range(len(seeds)))
     residual_obs = [dict(obs, blocks=state["blocks"])
                     for obs, state in zip(observations, reset_privileged)]
-    chunks, features = runner.predict_base(residual_obs, active, with_features=True)
+    chunks, features = timed("act_seconds", runner.predict_base, residual_obs, active, with_features=True)
     current = {i: (chunks[pos][0], features[pos]) for pos, i in enumerate(active)}
     prefix_steps = {i: len(prefixes[i]["actions"]) if i in prefixes else 0 for i in active}
     trajectories = {i: [] for i in active}
@@ -203,7 +212,7 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         for i in active:
             if i not in physical:
                 physical[i] = prefixes[i]["actions"][control_step - 1]
-        results = env.step_batch([physical[i] for i in active], active)
+        results = timed("step_rpc_seconds", env.step_batch, [physical[i] for i in active], active)
         if len(results) != len(active):
             raise ValueError("Environment step results must follow active scene order.")
         # Include truncated terminal frames for bootstrapping, exclude true terminals.
@@ -216,7 +225,9 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
         if bootstrap_ids:
             next_obs = [dict(result[0], blocks=privileged_after[pos]["blocks"])
                         for pos, result in enumerate(results) if not result[2]]
-            next_chunks, next_features = runner.predict_base(next_obs, bootstrap_ids, with_features=True)
+            next_chunks, next_features = timed(
+                "act_seconds", runner.predict_base, next_obs, bootstrap_ids, with_features=True,
+            )
             _, _, bootstrap_values = actor.act(next_features, deterministic=True)
             next_current = {i: (next_chunks[pos][0], next_features[pos])
                             for pos, i in enumerate(bootstrap_ids)}
@@ -327,6 +338,9 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
                                  "episode_return": episode_returns[i],
                                  "shaping_return": shaping_returns[i],
                                  "milestone_return": terms["milestone_return"] - terms0["milestone_return"],
+                                 "penalty_return": terms["penalty_return"] - terms0["penalty_return"],
+                                 "penalty_counts": {key: count - terms0["penalty_counts"][key]
+                                                    for key, count in terms["penalty_counts"].items()},
                                  "milestone_steps": dict(rewards[i].milestone_steps),
                                  **({"dense_approach_return": terms["dense_approach_return"]
                                      - terms0["dense_approach_return"],
@@ -446,6 +460,9 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
         "mean_episode_return": float(np.mean([ep["episode_return"] for ep in episodes])),
         "mean_shaping_return": float(np.mean([ep["shaping_return"] for ep in episodes])),
         "mean_milestone_return": float(np.mean([ep["milestone_return"] for ep in episodes])),
+        "mean_penalty_return": float(np.mean([ep["penalty_return"] for ep in episodes])),
+        **{f"penalty_{key}_count": sum(ep["penalty_counts"][key] for ep in episodes)
+           for key in episodes[0]["penalty_counts"]},
         "mean_phi_base": float(np.mean([ep["phi_base_final"] for ep in episodes])),
         "mean_base_score": float(np.mean([ep["base_score_final"] for ep in episodes])),
         "mean_stable_tower_levels": float(np.mean([ep["stable_tower_levels_final"] for ep in episodes])),
@@ -708,6 +725,8 @@ def train_online(config: dict) -> Path:
         "explained_variance": "final critic vs rollout GAE returns; null if return variance is zero",
         "vram_scope": "learner-process PyTorch allocator only; excludes Isaac and other processes",
         "vram_peak_scope": "per rollout/PPO update, reset before rollout",
+        "timing_scope": "reset_seconds, act_seconds and step_rpc_seconds are learner wall time "
+                        "summed over waves; ACT time is host-visible, not a GPU kernel profile",
         "start_update": start_update,
         "env_workers": int(config.get("env_workers", 1)),
     }
@@ -737,14 +756,23 @@ def train_online(config: dict) -> Path:
     env_host = str(require(config, "env_host"))
     env_port = int(require(config, "env_port"))
     env_workers = int(config.get("env_workers", 1))
+    reset_deadline = config.get("reset_deadline_seconds")
+    reset_options = {}
+    if reset_deadline is not None:
+        # Keep room for initial cold boot and one respawn + cold reboot + retry.
+        reset_options = {
+            "reset_timeout": max(900.0, 2.0 * float(reset_deadline) + 600.0),
+            "reset_retries": 1,
+        }
     if env_workers == 1:
-        env = RemoteEnv(env_host, env_port)
+        env = RemoteEnv(env_host, env_port, **reset_options)
     else:
         env = ShardedRemoteEnv(
             env_host,
             [env_port + i for i in range(env_workers)],
             num_envs=width,
             min_reset_free_vram_mib=int(config.get("min_reset_free_vram_mib", 0)),
+            **reset_options,
         )
     episode_count = completed_updates = 0
     stop_reason = "completed"
@@ -770,6 +798,7 @@ def train_online(config: dict) -> Path:
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(device)
                 waves, episodes = [], []
+                timings = {}
                 residual.eval()
                 for _ in range(expected_waves):
                     # Stop only at complete wave boundaries; a nonempty partial
@@ -788,7 +817,7 @@ def train_online(config: dict) -> Path:
                     batch, wave_episodes = collect_wave(
                         env, runner, residual, seeds, gamma=float(config["gamma"]),
                         gae_lambda=float(config["gae_lambda"]), residual_scale=residual_scale,
-                        reward_cfg=reward_cfg, prefixes=prefixes,
+                        reward_cfg=reward_cfg, prefixes=prefixes, timings=timings,
                     )
                     layout_cursor += width
                     waves.append(batch)
@@ -856,6 +885,7 @@ def train_online(config: dict) -> Path:
                           "lr": optimizer.param_groups[0]["lr"],
                           "critic_lr": optimizer.param_groups[1]["lr"],
                           "target_kl": float(config["target_kl"]),
+                          **timings,
                           "rollout_seconds": rollout_seconds, "optimization_seconds": optimization_seconds,
                           "update_seconds": update_seconds, "elapsed_seconds": elapsed,
                           "eta_seconds": remaining,
@@ -897,9 +927,6 @@ def train_online(config: dict) -> Path:
                          absolute_update, global_step)
                 save(output / "policy_last.ckpt", absolute_update, global_step)
                 completed_updates = local_update
-                if (local_update == 1 or local_update % int(config["save_freq"]) == 0
-                        or local_update == updates or stop_reason == "budget"):
-                    plot_online_training(output)
                 if stop_reason == "budget":
                     break
             if completed_updates == 0:
@@ -909,6 +936,8 @@ def train_online(config: dict) -> Path:
     metadata.update(completed_updates=completed_updates, stop_reason=stop_reason,
                     final_update=start_update + completed_updates, final_global_step=global_step)
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    if completed_updates:
+        plot_online_training(output)
     last = output / "policy_last.ckpt"
     print(f"ACT residual PPO stopped ({stop_reason}): completed_updates={completed_updates}; "
           f"absolute_update={start_update + completed_updates}; saved {last}", flush=True)

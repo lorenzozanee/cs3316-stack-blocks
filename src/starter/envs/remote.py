@@ -32,6 +32,7 @@ def serve(
     should_recycle: Callable[[], bool] | None = None,
     coordinated_recycle: bool = False,
     free_vram_mib: Callable[[], int] | None = None,
+    reset_deadline_seconds: float | None = None,
 ) -> bool:
     """Serve batched ``reset`` / ``step`` and return true for a planned recycle.
 
@@ -71,20 +72,23 @@ def serve(
                         and len(seeds) == width and should_recycle()):
                     # EOF lets the client retry these layouts on the replacement server.
                     return True
-                observations, infos = env.reset_batch(seeds)
-                finished_at_reset = finished
-                privileged = env.privileged_batch(list(range(width)))
-                blobs = _BlobCollector()
-                _write(
-                    connection,
-                    {
+                from starter.envs.reset_deadline import reset_deadline
+
+                started = time.monotonic()
+                print(f"[env] reset start port={port} layouts={seeds}", flush=True)
+                with reset_deadline(reset_deadline_seconds, port):
+                    observations, infos = env.reset_batch(seeds)
+                    privileged = env.privileged_batch(list(range(width)))
+                    blobs = _BlobCollector()
+                    reply = {
                         "observations": [_pack_observation(item, blobs) for item in observations],
                         "privileged": [_pack(item) for item in privileged],
                         "infos": [_pack(item) for item in infos],
                         "num_envs": width,
-                    },
-                    blobs.chunks,
-                )
+                    }
+                finished_at_reset = finished
+                _write(connection, reply, blobs.chunks)
+                print(f"[env] reset reply port={port} seconds={time.monotonic() - started:.3f}", flush=True)
             elif op == "step":
                 active = [int(index) for index in message["active"]]
                 results = env.step_batch(message["actions"], active)
@@ -145,6 +149,7 @@ class RemoteEnv:
         restart_each_episode: bool = False,
         timeout: float = 2400.0,
         reset_timeout: float = 10800.0,
+        reset_retries: int | None = None,
     ):
         self.host = host
         self.port = int(port)
@@ -153,6 +158,7 @@ class RemoteEnv:
         # The first reset builds every cluttered scene. That exceeds the
         # per-step socket timeout when the policy and Isaac share one GPU.
         self.reset_timeout = float(reset_timeout)
+        self.reset_retries = reset_retries
         self._socket: socket.socket | None = None
         self._sock_lock = threading.Lock()
         self._aborted = threading.Event()
@@ -204,6 +210,7 @@ class RemoteEnv:
         # the scene build.
         deadline = time.monotonic() + self.reset_timeout
         last_error: Exception | None = None
+        retries = 0
         while True:
             if self._aborted.is_set():
                 raise RuntimeError("Remote env aborted.")
@@ -232,6 +239,10 @@ class RemoteEnv:
                     raise
                 last_error = exc
                 self.close()
+                if self.reset_retries is not None and retries >= self.reset_retries:
+                    raise ConnectionError(f"Reset retry limit reached on port {self.port}.") from exc
+                retries += 1
+                print(f"[env] retrying reset port={self.port} attempt={retries + 1}", flush=True)
                 if self._aborted.wait(min(2.0, max(deadline - time.monotonic(), 0.0))):
                     raise RuntimeError("Remote env aborted.") from exc
                 continue
@@ -354,6 +365,7 @@ class ShardedRemoteEnv:
         min_reset_free_vram_mib: int = 0,
         timeout: float = 2400.0,
         reset_timeout: float = 10800.0,
+        reset_retries: int | None = None,
     ):
         port_list = [int(port) for port in ports]
         if not port_list or len(set(port_list)) != len(port_list):
@@ -372,7 +384,7 @@ class ShardedRemoteEnv:
         self.worker_envs = self.num_envs // len(self.ports)
         self.min_reset_free_vram_mib = int(min_reset_free_vram_mib)
         self._workers = tuple(
-            RemoteEnv(self.host, port, timeout=timeout, reset_timeout=reset_timeout)
+            RemoteEnv(self.host, port, timeout=timeout, reset_timeout=reset_timeout, reset_retries=reset_retries)
             for port in self.ports
         )
         self._pool = ThreadPoolExecutor(max_workers=len(self._workers))

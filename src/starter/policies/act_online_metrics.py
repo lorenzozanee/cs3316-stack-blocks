@@ -73,7 +73,11 @@ def _endpoint_labels(axis, entries, *, fontsize=8):
             groups.append([entry])
     for group in groups:
         for index, (x, y, text) in enumerate(group):
-            offset = (index - (len(group) - 1) / 2) * 11 if len(group) > 1 else 0
+            offset = (index - (len(group) - 1) / 2) * 11
+            if len(group) > 1 and group[0][1] <= low + 0.05 * span:
+                offset = 4 + index * 11
+            elif len(group) > 1 and group[-1][1] >= high - 0.05 * span:
+                offset = -4 - (len(group) - 1 - index) * 11
             axis.annotate(text, (x, y), xytext=(7, offset), textcoords="offset points",
                           va="center", fontsize=fontsize, color=INK)
 
@@ -86,9 +90,12 @@ def _format_axis(axis, updates):
     from matplotlib.ticker import MaxNLocator
 
     span = max(updates[-1] - updates[0], 1)
-    axis.set_xlabel("PPO update")
-    axis.set_xlim(updates[0] - 0.03 * span, updates[-1] + 0.18 * span)
-    axis.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
+    axis.set_xlabel("Round-local PPO update")
+    axis.set_xlim(updates[0] - max(0.25, 0.03 * span), updates[-1] + max(0.35, 0.18 * span))
+    if len(updates) <= 6:
+        axis.set_xticks(updates)
+    else:
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=5, integer=True, min_n_ticks=2))
     axis.spines[["top", "right"]].set_visible(False)
     axis.grid(axis="y", color=GRID, linewidth=0.5)
     axis.set_axisbelow(True)
@@ -136,32 +143,32 @@ def plot_online_training(run_dir: str | Path) -> None:
 
         # 1. Outcome rates. PARTIAL_SCORE is a peak threshold, so successes count too.
         axis = axes[0, 0]
+        axis.set_ylim(0, 1.05)
         entries = []
         for index, (key, name) in enumerate((
             ("success_rate", "Success"),
             ("partial_rate", f"Partial (peak ≥ {PARTIAL_SCORE:g}, includes successes)"),
         )):
-            line = _line(axis, updates, values(key), color=COLORS[index], label=name)
+            line = _line(axis, updates, values(key), color=COLORS[index], style=("-", "--")[index], label=name)
             entries.append((updates[-1], line[-1], f"{line[-1]:.1%}"))
         _endpoint_labels(axis, entries)
         _legend(axis, loc="best")
         axis.set_title("Episode outcome rates", loc="left", fontsize=11)
         axis.set_ylabel("Percent of episodes")
-        axis.set_ylim(0, 1.05)
         axis.yaxis.set_major_formatter(PercentFormatter(1))
 
         # 2. Final and peak scores.
         axis = axes[0, 1]
+        axis.set_ylim(0, 105)
         entries = []
         for index, (key, name) in enumerate((("mean_final_score", "Final"),
                                              ("mean_peak_score", "Peak"))):
-            line = _line(axis, updates, values(key), color=COLORS[index], label=name)
-            entries.append((updates[-1], line[-1], f"{line[-1]:.1f}"))
+            line = _line(axis, updates, values(key), color=COLORS[index], style=("-", "--")[index], label=name)
+            entries.append((updates[-1], line[-1], f"{line[-1]:.2f}"))
         _endpoint_labels(axis, entries)
         _legend(axis, loc="best")
         axis.set_title("Episode scores", loc="left", fontsize=11)
         axis.set_ylabel("Score")
-        axis.set_ylim(0, 105)
 
         # 3. Episode length.
         axis = axes[0, 2]

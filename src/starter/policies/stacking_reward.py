@@ -128,9 +128,13 @@ DEFAULTS = {
     "waypoint_bonus": 0.15,
     "waypoint_radius": 0.025,
     # Target region.  x/y are task configuration, not baked into formulas.
+    # 40 mm is the tabletop base target circle (>3x inside the 132.26 mm
+    # closest initial spawn across all 55 seed-0 layouts) so first placements
+    # establish the tower anchor for 2nd/3rd-layer Z targets; tower-top lateral
+    # alignment remains governed by _lateral_support (<= 0.25 * lower_side).
     "placement_x": 0.0,
     "placement_y": -0.2,
-    "placement_radius": 0.01,
+    "placement_radius": 0.04,
     "placement_soft_scale": 0.15,
     # Gripper calibration from the robot asset (not reward geometry):
     # measured=(joint-low)/(high-low); real joint limits are [0, high], so
@@ -140,16 +144,25 @@ DEFAULTS = {
     "gripper_aperture_zero": 0.000807165976524353,
     # Grasp proxies.  The aperture tolerance and centering radius scale with
     # the cube side; both are internal geometric tolerances, not contact
-    # proof and not simulator-calibrated solver thresholds.
+    # proof and not simulator-calibrated solver thresholds. 0.18 stays strictly
+    # zero for empty pinched jaws (0.8 mm) and open jaws (>= 67.2 mm) across all
+    # 30-40 mm cubes at every rotation while absorbing PhysX jaw compliance.
     "grasp_offset": 0.143,
-    "grasp_aperture_fraction": 0.10,
-    "grasp_centering_fraction": 0.50,
+    "grasp_aperture_fraction": 0.18,
+    "grasp_centering_fraction": 0.65,
     # Support and settling tolerances.
     "support_gap_floor": 0.002,
     "support_gap_fraction": 0.08,
     "settle_linear_speed": 0.01,
     "settle_angular_speed": 0.1,
     "upright_cos_min": math.cos(math.radians(15.0)),
+    # Event penalties (non-negative magnitudes; subtracted when triggered).
+    "empty_grasp_penalty": 0.3,
+    "drop_penalty": 0.4,
+    "empty_place_penalty": 0.3,
+    "empty_tower_intrusion_penalty": 0.4,
+    "tower_break_penalty": 1.5,
+    "arm_conflict_penalty": 0.4,
 }
 
 REWARD_KEYS = tuple(DEFAULTS)
@@ -171,6 +184,29 @@ _CUBE_EXTENT_REL_TOL = 0.02
 _HARD_GAP_FRACTION = 0.10       # |signed gap| <= 10% of the current tolerance
 _HARD_LATERAL_KERNEL_MIN = 1.0  # COM margin >= one quarter of the lower side
 _RELEASE_REWARD_FRACTION = 0.6
+# Empty-gripper, drop, and tower-break penalty geometry and episode caps.
+_EMPTY_CARRY_LIFT_FRACTION = 0.15
+_EMPTY_CARRY_RADIUS_FRACTION = 1.25
+_EMPTY_CARRY_GRACE_STEPS = 40
+_EMPTY_CLOSED_MAX = 0.65
+_EMPTY_PINCH_MAX = 0.30
+_EMPTY_GRASP_REARM = 0.75
+_EMPTY_ZONE_EXIT_MARGIN = 0.04
+_ARM_CONFLICT_DISTANCE = 0.06
+_DROP_CONFIRM_STEPS = 2
+_STACK_APPROACH_CLEARANCE_FRACTION = 0.6
+_TOWER_BREAK_DWELL_STEPS = 2
+_EMPTY_TOWER_BREAK_WINDOW = 5
+_MAX_EMPTY_GRASP_PENALTIES = 4
+_MAX_DROP_PENALTIES = 4
+_MAX_EMPTY_PLACE_PENALTIES = 4
+_MAX_EMPTY_TOWER_INTRUSIONS = 4
+_MAX_TOWER_BREAK_PENALTIES = 4
+_MAX_ARM_CONFLICT_PENALTIES = 4
+_PENALTY_KEYS = (
+    "empty_grasp", "drop", "empty_place", "empty_tower_intrusion",
+    "tower_break", "empty_tower_break", "arm_conflict",
+)
 
 _MILESTONES = ("grasp", "base", "pair2", "pair3")
 _WAYPOINT_ROUTES = tuple(("approach", label) for label in BLOCK_LABELS) + tuple(
@@ -179,6 +215,9 @@ _WEIGHT_KEYS = (
     "reach_weight", "manipulation_weight", "base_weight", "pair_weight",
     "release_weight", "milestone_grasp",
     "milestone_base", "milestone_pair2", "milestone_pair3", "waypoint_bonus",
+    "empty_grasp_penalty", "drop_penalty", "empty_place_penalty",
+    "empty_tower_intrusion_penalty", "tower_break_penalty",
+    "arm_conflict_penalty",
 )
 _POSITIVE_KEYS = (
     "reach_scale", "placement_radius", "placement_soft_scale", "grasp_offset",
@@ -448,8 +487,10 @@ class _Frame:
     grasp_candidates: dict
     support: tuple
     base_ok: dict
+    base_intact: dict
     tabletop_released: dict
     edge_hard: dict
+    edge_intact: dict
     measured: np.ndarray
     released: dict
     upright: dict
@@ -473,6 +514,7 @@ class _CarryDestination:
 class _DenseCarry(_CarryDestination):
     row: dict
     previous: np.ndarray | None = None
+    drop_pending: int = 0
 
 
 @dataclass
@@ -511,7 +553,7 @@ class StackingReward:
         # Validate the remaining reset fields now; they are part of the
         # episode contract even though only current state is scored later.
         _block_velocities(reset_state, "reset_state")
-        _measured_grippers(reset_state, "reset_state")
+        reset_measured = _measured_grippers(reset_state, "reset_state")
 
         self._reset_heights = {
             label: float(self._reset_poses[label]["pos"][2]) for label in BLOCK_LABELS
@@ -531,6 +573,19 @@ class StackingReward:
         self._step_index = 0
         self.milestone_steps = {name: None for name in _MILESTONES}
         self.milestone_return = 0.0
+        self.penalty_return = 0.0
+        self.penalty_counts = {key: 0 for key in _PENALTY_KEYS}
+        self._intact_anchor: tuple[str, ...] = ()
+        self._tower_break_dwell = 0
+        self._arm_last_carry_step: list[int | None] = [None, None]
+        self._arm_last_empty_tower_step: list[int | None] = [None, None]
+        self._arm_zone_state: list[str] = ["outside", "outside"]
+        self._arm_tower_intruding: list[bool] = [False, False]
+        self._arm_prev_measured: list[float] = [float(reset_measured[0]), float(reset_measured[1])]
+        self._arm_empty_grasp_armed: list[bool] = [
+            float(reset_measured[0]) >= _EMPTY_GRASP_REARM,
+            float(reset_measured[1]) >= _EMPTY_GRASP_REARM,
+        ]
         self._dwell = {name: 0 for name in _MILESTONES[1:]}
         self._dwell_ids = {name: None for name in _MILESTONES[1:]}
         self.grasp_attempts = {}
@@ -542,6 +597,9 @@ class StackingReward:
         self.waypoint_return = 0.0
         self.waypoint_counts = {f"{kind}:{label}": 0 for kind, label in _WAYPOINT_ROUTES}
         reset_grasp = _grasp_points(reset_proprio, float(self.cfg["grasp_offset"]))
+        self._arms_conflicting: bool = (
+            math.dist(reset_grasp[0], reset_grasp[1]) <= _ARM_CONFLICT_DISTANCE
+        )
         self._previous_grasp = reset_grasp
         self._approach = {
             label: [self._path(point, self._reset_poses[label]["pos"]) for point in reset_grasp]
@@ -775,9 +833,18 @@ class StackingReward:
                     and released_hard[label])
             for label in BLOCK_LABELS
         }
+        base_intact = {
+            label: bool(distance_xy[label] <= radius + _EMPTY_ZONE_EXIT_MARGIN
+                        and inside_table[label]
+                        and _hard_gap_ok(table_gap[label], table_gap_tol[label])
+                        and upright[label] >= cos_min)
+            for label in BLOCK_LABELS
+        }
         base_ok = {
             label: bool(distance_xy[label] <= radius and inside_table[label]
-                        and released_at_table_height[label])
+                        and _hard_gap_ok(table_gap[label], table_gap_tol[label])
+                        and upright[label] >= cos_min
+                        and quiet_ok[label] and released_hard[label])
             for label in BLOCK_LABELS
         }
         tabletop_released = {
@@ -796,6 +863,7 @@ class StackingReward:
         quiet_edge: dict[tuple[str, str], float] = {}
         release_edge: dict[tuple[str, str], float] = {}
         edge_hard: dict[tuple[str, str], bool] = {}
+        edge_intact: dict[tuple[str, str], bool] = {}
         for lower, upper in permutations(BLOCK_LABELS, 2):
             if pos[upper][2] <= pos[lower][2]:
                 continue
@@ -813,11 +881,14 @@ class StackingReward:
             geometry_edge[(lower, upper)] = geometry
             quiet_edge[(lower, upper)] = quieted
             release_edge[(lower, upper)] = quieted * release_pair
-            edge_hard[(lower, upper)] = bool(
+            intact = bool(
                 _hard_gap_ok(gap, tolerance)
                 and lateral_kernel >= _HARD_LATERAL_KERNEL_MIN - 1e-12
                 and upright[lower] >= cos_min
-                and upright[upper] >= cos_min
+                and upright[upper] >= cos_min)
+            edge_intact[(lower, upper)] = intact
+            edge_hard[(lower, upper)] = bool(
+                intact
                 and quiet_ok[lower] and quiet_ok[upper]
                 and released_hard[lower] and released_hard[upper])
 
@@ -956,14 +1027,16 @@ class StackingReward:
             "per_block_lift": {label: float(lift[label]) for label in BLOCK_LABELS},
             "support_gaps": support_gaps,
             "milestone_return": float(self.milestone_return),
+            "penalty_return": float(self.penalty_return),
+            "penalty_counts": dict(self.penalty_counts),
             "waypoint_return": float(self.waypoint_return),
             "waypoint_counts": dict(self.waypoint_counts),
         }
         identities = {"base": base_id, "pair2": pair2_id, "pair3": pair3_id}
         frame = _Frame(pos, grasp, half_height, half_x, half_y, bottom, hold, associated_arms,
-                       grasp_candidates, support, base_ok, tabletop_released, edge_hard,
-                       measured, released_hard, upright, upright_score, inside_table,
-                       table_gap_tol, support_top, distances, grasp_closure_by_block)
+                       grasp_candidates, support, base_ok, base_intact, tabletop_released,
+                       edge_hard, edge_intact, measured, released_hard, upright, upright_score,
+                       inside_table, table_gap_tol, support_top, distances, grasp_closure_by_block)
         return terms, identities, frame
 
     def _surface(self, frame: _Frame, lower: str | None) -> tuple[np.ndarray, float]:
@@ -977,7 +1050,13 @@ class StackingReward:
 
     def _carry_goal(self, frame: _Frame, lower: str | None, carried: str) -> np.ndarray:
         xy, z = self._surface(frame, lower)
-        return np.array([*xy, z + frame.half_height[carried]])
+        clearance = 0.0
+        if lower is not None and self._dense_transport_reward:
+            lateral = math.dist(frame.pos[carried][:2], xy)
+            side = self._sides[lower]
+            clearance = (_STACK_APPROACH_CLEARANCE_FRACTION * side
+                         * _clip01((lateral - 0.5 * side) / side))
+        return np.array([*xy, z + frame.half_height[carried] + clearance])
 
     def _occupied(self, frame: _Frame, lower: str | None, carried: str) -> bool:
         xy, z = self._surface(frame, lower)
@@ -1175,9 +1254,9 @@ class StackingReward:
         lateral = math.dist(frame.pos[label][:2], xy)
         gap = frame.bottom[label] - top
         tolerance = frame.table_gap_tol[label] if lower is None else self._gap_tolerance(lower, label)
-        centered = (lateral <= self.cfg["placement_radius"]
-                    and (frame.inside_table[label] if lower is None else
-                         self._lateral_support(lower, lateral) >= _HARD_LATERAL_KERNEL_MIN - 1e-12))
+        centered = ((lateral <= self.cfg["placement_radius"] and frame.inside_table[label])
+                    if lower is None else
+                    self._lateral_support(lower, lateral) >= _HARD_LATERAL_KERNEL_MIN - 1e-12)
         return (centered and frame.upright[label] >= self.cfg["upright_cos_min"]
                 and -_HARD_GAP_FRACTION * tolerance - 1e-12 <= gap
                 <= _LIFT_RAMP_FRACTION * self._sides[label] + 1e-12)
@@ -1197,11 +1276,12 @@ class StackingReward:
         settled_self = (not held and available == anchor + (label,)
                         and self.release_steps[placement] is None
                         and attempt.row["aligned_step"] is not None)
+        carrying = held and (attempt.previous is not None or attempt.drop_pending > 0)
         if anchor != self._settled_anchor[:len(anchor)]:
             self._end_attempt(attempt, "anchor")
             return 0.0, 0.0
         if not settled_self and len(available) > len(anchor):
-            if not held or attempt.previous is None or label in available:
+            if not carrying or label in available:
                 self._end_attempt(attempt, "anchor")
                 return 0.0, 0.0
             anchor = attempt.anchor = available
@@ -1212,8 +1292,9 @@ class StackingReward:
         if ((not settled_self and available != anchor)
                 or not self._destination_valid(frame, label, attempt)
                 or (lower is None and self._occupied(frame, None, label))):
-            if held and attempt.previous is not None:
+            if carrying:
                 # Keep the identity across transient instability; skip this motion.
+                attempt.drop_pending = 0
                 attempt.previous = frame.pos[label].copy()
                 return 0.0, 0.0
             self._end_attempt(attempt, "destination")
@@ -1221,6 +1302,7 @@ class StackingReward:
 
         near_goal = self._near_release_goal(frame, label, lower)
         if held:
+            attempt.drop_pending = 0
             if near_goal and attempt.row["aligned_step"] is None:
                 attempt.row["aligned_step"] = self._step_index
             if attempt.previous is None:
@@ -1247,8 +1329,12 @@ class StackingReward:
             return 0.0, 0.0
         if not near_goal or (attempt.row["aligned_step"] is None
                              and arm not in frame.associated_arms[label]):
-            self._end_attempt(attempt, "dropped")
+            attempt.drop_pending += 1
+            if (float(frame.measured[arm]) >= _RELEASE_MIN
+                    or attempt.drop_pending >= _DROP_CONFIRM_STEPS):
+                self._end_attempt(attempt, "dropped")
             return 0.0, 0.0
+        attempt.drop_pending = 0
         if attempt.row["aligned_step"] is None:
             attempt.row["aligned_step"] = self._step_index
         if float(frame.measured[arm]) < _RELEASE_MIN or not frame.released[label]:
@@ -1275,16 +1361,37 @@ class StackingReward:
                 return anchor[:index]
         return anchor
 
+    @staticmethod
+    def _intact_prefix(frame: _Frame, anchor: tuple[str, ...]) -> tuple[str, ...]:
+        if anchor and not frame.base_intact[anchor[0]]:
+            return ()
+        for index, edge in enumerate(zip(anchor, anchor[1:]), 1):
+            if not frame.edge_intact.get(edge, False):
+                return anchor[:index]
+        return anchor
+
     def _available_anchor(self, frame: _Frame) -> tuple[str, ...]:
         return self._stable_prefix(frame, self._settled_anchor)
 
-    def _dense_events(self, frame: _Frame, confirmed: dict[str, int]) -> tuple[float, float]:
-        carry_bonus = placement_bonus = 0.0
+    def _dense_events(
+        self, frame: _Frame, confirmed: dict[str, int]
+    ) -> tuple[float, float, float, set[int], set[int]]:
+        carry_bonus = placement_bonus = drop_penalty = 0.0
+        active_arms = {attempt.arm for attempt in self._carry_destinations.values()}
+        ending_arms: set[int] = set()
         for label, attempt in list(self._carry_destinations.items()):
             carry, placement = self._advance_dense_carry(frame, label, attempt)
             carry_bonus += carry
             placement_bonus += placement
             if attempt.invalid:
+                reason = attempt.row["end_reason"]
+                if reason == "released":
+                    ending_arms.add(attempt.arm)
+                elif reason == "dropped":
+                    ending_arms.add(attempt.arm)
+                    if self.penalty_counts["drop"] < _MAX_DROP_PENALTIES:
+                        self.penalty_counts["drop"] += 1
+                        drop_penalty += float(self.cfg["drop_penalty"])
                 del self._carry_destinations[label]
 
         anchor = self._available_anchor(frame)
@@ -1299,7 +1406,158 @@ class StackingReward:
             self.transport_attempts.append(row)
             self._carry_destinations[label] = _DenseCarry(
                 arm, anchor, hard_tower=bool(anchor), row=row, previous=frame.pos[label].copy())
-        return carry_bonus, placement_bonus
+            active_arms.add(arm)
+        return carry_bonus, placement_bonus, drop_penalty, active_arms, ending_arms
+
+    def _arm_has_block(self, frame: _Frame, arm: int, protected: set[str],
+                       active_arms: set[int], ending_arms: set[int]) -> bool:
+        if arm in active_arms or arm in ending_arms:
+            return True
+        if any(frame.hold[arm, label] >= _GRASP_HOLD_MIN for label in BLOCK_LABELS):
+            return True
+        return any(
+            label not in protected
+            and (frame.bottom[label] - frame.support_top[label] + 1e-12
+                 >= _EMPTY_CARRY_LIFT_FRACTION * self._sides[label])
+            and (math.dist(frame.grasp[arm], frame.pos[label])
+                 <= _EMPTY_CARRY_RADIUS_FRACTION * self._sides[label])
+            for label in BLOCK_LABELS
+        )
+
+    def _arm_engaging_unplaced(self, frame: _Frame, arm: int, protected: set[str]) -> bool:
+        return any(
+            label not in protected
+            and (arm in frame.associated_arms[label]
+                 or math.dist(frame.grasp[arm], frame.pos[label])
+                 <= _EMPTY_CARRY_RADIUS_FRACTION * self._sides[label])
+            for label in BLOCK_LABELS
+        )
+
+    def _in_tower_volume(self, frame: _Frame, arm: int, anchor: tuple[str, ...],
+                         margin: float = 0.0) -> bool:
+        z = float(frame.grasp[arm][2])
+        for label in anchor:
+            xy_radius = self._sides[label] + margin
+            z_low = frame.bottom[label] - 0.01 - margin
+            z_high = frame.pos[label][2] + frame.half_height[label] + 0.5 * self._sides[label] + margin
+            if math.dist(frame.grasp[arm][:2], frame.pos[label][:2]) <= xy_radius and z_low <= z <= z_high:
+                return True
+        return False
+
+    def _dense_penalties(self, frame: _Frame, active_arms: set[int],
+                         ending_arms: set[int]) -> float:
+        penalty = 0.0
+        available = self._available_anchor(frame)
+        anchor = available or self._intact_anchor
+        protected = set(self._intact_anchor) | set(frame.support) | set(available)
+        lower = anchor[-1] if anchor else None
+        goal_xy, surface_z = self._surface(frame, lower)
+        max_side = max(self._sides.values())
+        zone_radius = float(self.cfg["placement_radius"]) + 0.5 * max_side
+        zone_top = surface_z + 2.0 * max_side
+        zone_low = surface_z - 0.01
+
+        for arm in (0, 1):
+            measured = float(frame.measured[arm])
+            if self._arm_has_block(frame, arm, protected, active_arms, ending_arms):
+                self._arm_last_carry_step[arm] = self._step_index
+                self._arm_zone_state[arm] = "outside"
+                self._arm_tower_intruding[arm] = False
+                self._arm_empty_grasp_armed[arm] = False
+                continue
+
+            if measured >= _EMPTY_GRASP_REARM:
+                self._arm_empty_grasp_armed[arm] = True
+
+            xy_dist = math.dist(frame.grasp[arm][:2], goal_xy)
+            z = float(frame.grasp[arm][2])
+            in_zone = xy_dist <= zone_radius and zone_low <= z <= zone_top
+            outside_zone = (
+                xy_dist > zone_radius + _EMPTY_ZONE_EXIT_MARGIN
+                or z > zone_top + _EMPTY_ZONE_EXIT_MARGIN
+                or z < zone_low - _EMPTY_ZONE_EXIT_MARGIN
+            )
+            if self._arm_zone_state[arm] == "penalized" and outside_zone:
+                self._arm_zone_state[arm] = "outside"
+            if self._arm_tower_intruding[arm] and (
+                not self._intact_anchor
+                or not self._in_tower_volume(frame, arm, self._intact_anchor, _EMPTY_ZONE_EXIT_MARGIN)
+            ):
+                self._arm_tower_intruding[arm] = False
+
+            in_grace = (self._arm_last_carry_step[arm] is not None
+                        and self._step_index - self._arm_last_carry_step[arm] <= _EMPTY_CARRY_GRACE_STEPS)
+            engaging = self._arm_engaging_unplaced(frame, arm, protected)
+            in_tower = bool(self._intact_anchor
+                            and self._in_tower_volume(frame, arm, self._intact_anchor))
+
+            # Placement-zone and tower-volume events own the arm while it is
+            # there; the midair empty-grasp check applies only outside both.
+            if not in_grace and not engaging:
+                opening_empty = (self._arm_prev_measured[arm] < _RELEASE_MIN
+                                 and measured >= _RELEASE_MIN)
+                empty_place_action = measured <= _EMPTY_CLOSED_MAX or opening_empty
+                if in_tower:
+                    self._arm_last_empty_tower_step[arm] = self._step_index
+                    if not self._arm_tower_intruding[arm]:
+                        self._arm_tower_intruding[arm] = True
+                        if self.penalty_counts["empty_tower_intrusion"] < _MAX_EMPTY_TOWER_INTRUSIONS:
+                            self.penalty_counts["empty_tower_intrusion"] += 1
+                            penalty += float(self.cfg["empty_tower_intrusion_penalty"])
+                elif (self._arm_zone_state[arm] != "penalized"
+                      and in_zone and empty_place_action):
+                    self._arm_zone_state[arm] = "penalized"
+                    if self.penalty_counts["empty_place"] < _MAX_EMPTY_PLACE_PENALTIES:
+                        self.penalty_counts["empty_place"] += 1
+                        penalty += float(self.cfg["empty_place_penalty"])
+
+            if (self._arm_empty_grasp_armed[arm] and not in_grace
+                    and not engaging and not in_zone and not in_tower):
+                if measured <= _EMPTY_PINCH_MAX:
+                    self._arm_empty_grasp_armed[arm] = False
+                    if self.penalty_counts["empty_grasp"] < _MAX_EMPTY_GRASP_PENALTIES:
+                        self.penalty_counts["empty_grasp"] += 1
+                        penalty += float(self.cfg["empty_grasp_penalty"])
+
+        self._arm_prev_measured = [float(frame.measured[0]), float(frame.measured[1])]
+
+        ee_dist = math.dist(frame.grasp[0], frame.grasp[1])
+        same_block_hold = any(
+            frame.hold[0, label] >= _GRASP_HOLD_MIN
+            and frame.hold[1, label] >= _GRASP_HOLD_MIN
+            for label in BLOCK_LABELS
+        )
+        conflict_now = ee_dist <= _ARM_CONFLICT_DISTANCE or same_block_hold
+        if (self._arms_conflicting
+                and ee_dist > _ARM_CONFLICT_DISTANCE + _EMPTY_ZONE_EXIT_MARGIN
+                and not same_block_hold):
+            self._arms_conflicting = False
+        if conflict_now and not self._arms_conflicting:
+            self._arms_conflicting = True
+            if self.penalty_counts["arm_conflict"] < _MAX_ARM_CONFLICT_PENALTIES:
+                self.penalty_counts["arm_conflict"] += 1
+                penalty += float(self.cfg["arm_conflict_penalty"])
+
+        if len(available) > len(self._intact_anchor) and self._intact_prefix(frame, available) == available:
+            self._intact_anchor = available
+            self._tower_break_dwell = 0
+        elif self._intact_anchor:
+            intact = self._intact_prefix(frame, self._intact_anchor)
+            if len(intact) == len(self._intact_anchor):
+                self._tower_break_dwell = 0
+            else:
+                self._tower_break_dwell += 1
+                if self._tower_break_dwell >= _TOWER_BREAK_DWELL_STEPS:
+                    self._intact_anchor = intact
+                    self._tower_break_dwell = 0
+                    if self.penalty_counts["tower_break"] < _MAX_TOWER_BREAK_PENALTIES:
+                        self.penalty_counts["tower_break"] += 1
+                        penalty += float(self.cfg["tower_break_penalty"])
+                        if any(step is not None
+                               and self._step_index - step <= _EMPTY_TOWER_BREAK_WINDOW
+                               for step in self._arm_last_empty_tower_step):
+                            self.penalty_counts["empty_tower_break"] += 1
+        return penalty
 
     def _soft_anchors(self, frame: _Frame, carried: str) -> list[tuple[str, ...]]:
         """Released tabletop blocks and their released, edge-stable top blocks."""
@@ -1486,13 +1744,17 @@ class StackingReward:
         terms, identities, frame = self._evaluate(proprio, physical)
         self._step_index += 1
         milestone_bonus, confirmed = self._grasp_events(frame)
-        approach_bonus = carry_bonus = 0.0
+        approach_bonus = carry_bonus = penalty_step = 0.0
+        active_arms: set[int] = set()
+        released_arms: set[int] = set()
         if self._dense_transport_reward:
-            carry_bonus, placement_bonus = self._dense_events(frame, confirmed)
+            carry_bonus, placement_bonus, drop_penalty, active_arms, released_arms = (
+                self._dense_events(frame, confirmed))
             approach_bonus = self._dense_approach(frame)
             self._dense_approach_return += approach_bonus
             self._dense_transport_return += carry_bonus
             milestone_bonus += placement_bonus
+            penalty_step += drop_penalty
             terms.update(dense_approach_return=self._dense_approach_return,
                          dense_transport_return=self._dense_transport_return)
         elif self._transport_to_support:
@@ -1530,12 +1792,17 @@ class StackingReward:
             self.milestone_steps[name] = self._step_index
             scale = (1.0 - _RELEASE_REWARD_FRACTION) if self._dense_transport_reward else 1.0
             milestone_bonus += scale * float(self.cfg[f"milestone_{name}"])
+        if self._dense_transport_reward:
+            penalty_step += self._dense_penalties(frame, active_arms, released_arms)
         self.milestone_return += milestone_bonus
+        self.penalty_return -= penalty_step
         self.waypoint_return += waypoint_bonus
         terms["milestone_return"] = self.milestone_return
+        terms["penalty_return"] = self.penalty_return
+        terms["penalty_counts"] = dict(self.penalty_counts)
         terms["waypoint_return"] = self.waypoint_return
         terms["waypoint_counts"] = dict(self.waypoint_counts)
-        event_bonus = milestone_bonus + waypoint_bonus
+        event_bonus = milestone_bonus + waypoint_bonus - penalty_step
         if self._dense_transport_reward:
             terms["event_bonus"] = event_bonus
         return terms, event_bonus + approach_bonus + carry_bonus

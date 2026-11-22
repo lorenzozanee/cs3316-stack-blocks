@@ -131,6 +131,7 @@ class OnlineCurvePlotTest(unittest.TestCase):
     def test_single_cpu_update_renders_all_sixteen_panels(self):
         axes, svg = _render([_record(1, explained_variance=None)])
         self.assertEqual(len(axes.flat), 16)
+        self.assertTrue(all(list(axis.get_xticks()) == [1] for axis in axes.flat))
         self.assertIn("Training rollout metrics, not held-out evaluation", svg)
         self.assertIn("excluding Isaac Sim", svg)
         self.assertIn("Raw per-update values, no smoothing", svg)

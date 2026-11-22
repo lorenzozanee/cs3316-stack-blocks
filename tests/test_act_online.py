@@ -60,7 +60,10 @@ def _zero_reward_cfg() -> dict:
     return _reward_cfg(reach_weight=0.0, manipulation_weight=0.0, base_weight=0.0,
                        pair_weight=0.0, release_weight=0.0, waypoint_bonus=0.0,
                        milestone_grasp=0.0, milestone_base=0.0,
-                       milestone_pair2=0.0, milestone_pair3=0.0)
+                       milestone_pair2=0.0, milestone_pair3=0.0,
+                       empty_grasp_penalty=0.0, drop_penalty=0.0,
+                       empty_place_penalty=0.0, empty_tower_intrusion_penalty=0.0,
+                       tower_break_penalty=0.0, arm_conflict_penalty=0.0)
 
 
 def _test_proprio() -> np.ndarray:
@@ -403,6 +406,10 @@ class CollectWaveTest(unittest.TestCase):
         self.assertEqual(diagnostics["success_count"], 1)
         self.assertEqual(diagnostics["partial_rate"], 1.0)
         self.assertEqual(diagnostics["rollout_steps"], 4)
+        self.assertIn("mean_penalty_return", diagnostics)
+        self.assertEqual(diagnostics["mean_penalty_return"], 0.0)
+        for key in ("drop", "empty_place", "empty_tower_intrusion", "tower_break", "empty_tower_break"):
+            self.assertEqual(diagnostics[f"penalty_{key}_count"], 0)
         self.assertEqual(diagnostics["residual_clip_fraction"], 1 / (4 * ACTION_DIM))
         self.assertAlmostEqual(diagnostics["normalized_residual_abs_mean"],
                                0.05 / (4 * ACTION_DIM))
@@ -776,7 +783,10 @@ class TrainOnlineTest(unittest.TestCase):
     def test_reward_weights_must_be_nonnegative_and_finite(self):
         for key in ("reach_weight", "manipulation_weight", "base_weight", "pair_weight",
                     "release_weight", "milestone_grasp", "milestone_base",
-                    "milestone_pair2", "milestone_pair3"):
+                    "milestone_pair2", "milestone_pair3",
+                    "empty_grasp_penalty", "drop_penalty", "empty_place_penalty",
+                    "empty_tower_intrusion_penalty", "tower_break_penalty",
+                    "arm_conflict_penalty"):
             for value in (-1, float("inf"), float("nan")):
                 with self.subTest(key=key, value=value):
                     config = _online_config(Path("/unused/offline.ckpt"))
@@ -920,7 +930,9 @@ class TrainOnlineTest(unittest.TestCase):
                               "peak_reserved_gib", "total_gib"):
                     self.assertEqual(row[f"vram_{field}"], "")
                 self.assertGreater(record["update_seconds"], 0)
-                self.assertGreater(record["rollout_seconds"], 0)
+                phases = [record[key] for key in ("reset_seconds", "act_seconds", "step_rpc_seconds")]
+                self.assertTrue(all(seconds > 0 for seconds in phases))
+                self.assertGreater(record["rollout_seconds"], sum(phases))
                 self.assertGreater(record["optimization_seconds"], 0)
                 self.assertGreaterEqual(record["update_seconds"],
                                         record["rollout_seconds"] + record["optimization_seconds"])
@@ -1087,6 +1099,34 @@ class TrainOnlineTest(unittest.TestCase):
             self.assertFalse((output / "policy_latest.ckpt").exists())
             self.assertFalse((output / "policy_last.ckpt.tmp").exists())
             load_act_runner(output / "policy_last.ckpt", "cpu")
+
+    def test_budget_exit_after_full_updates_renders_final_history(self):
+        from starter.policies import act_online_metrics
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint, _, _ = self._write_base(root)
+            output = root / "online"
+            env = _OnlineFakeEnv()
+            config = _online_config(checkpoint)
+            config.update(finetune_episodes=2, finetune_updates=100, save_freq=100)
+            plotted_updates = []
+
+            def record_plot(path):
+                self.assertTrue(env.closed)
+                self.assertEqual(path, output)
+                records = act_online_metrics._load_records(path)
+                plotted_updates.append([record["absolute_update"] for record in records])
+
+            with mock.patch.object(act_online, "_budget_exhausted", side_effect=[False, False, True]), \
+                    mock.patch.object(act_online, "RemoteEnv", return_value=env), \
+                    mock.patch.object(act_online, "online_output_dir", return_value=output), \
+                    mock.patch.object(act_online_metrics, "plot_online_training", side_effect=record_plot), \
+                    mock.patch("sys.stdout", io.StringIO()):
+                act_online.train_online(config)
+
+            self.assertEqual(plotted_updates, [[1, 2]])
+            self.assertEqual(json.loads((output / "metadata.json").read_text())["stop_reason"], "budget")
 
     def test_expired_budget_saves_current_state_without_an_empty_update(self):
         with tempfile.TemporaryDirectory() as temporary:
