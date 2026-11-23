@@ -44,8 +44,11 @@ from starter.policies.act_awr import (
 from starter.policies.act_inference import (
     FEATURE_DIM,
     ONLINE_FORMAT,
+    POSITION_ACTION_INDICES,
     FrozenACTRunner,
     compose_residual_action,
+    residual_channel_scales,
+    validate_position_residual_multiplier,
 )
 from starter.policies.act_model import ACTPolicy
 from starter.policies.post_grasp_prefix import (
@@ -125,7 +128,8 @@ def _block_positions(privileged) -> dict:
 @torch.no_grad()
 def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale,
                  reward_cfg, prefixes=None, capture_prefix=None, timings=None,
-                 act_sample_stride: int | None = None, act_waves_out: list | None = None):
+                 act_sample_stride: int | None = None, act_waves_out: list | None = None,
+                 position_residual_multiplier: float = 1.0):
     """Finish every scene before resetting; never fabricate inactive transitions.
 
     Features and the raw sampled residual are cached before the environment
@@ -225,14 +229,17 @@ def collect_wave(env, runner, actor, seeds, *, gamma, gae_lambda, residual_scale
             raw_actions, log_probs, values = actor.act(inputs)
             inputs, raw_actions, log_probs, values = (item.cpu() for item in (inputs, raw_actions, log_probs, values))
             base = np.stack([current[i][0] for i in learning])
-            actions = compose_residual_action(base, raw_actions, runner.stats["action_std"], residual_scale)
+            actions = compose_residual_action(
+                base, raw_actions, runner.stats["action_std"], residual_scale,
+                position_residual_multiplier=position_residual_multiplier,
+            )
             for i, action, base_action in zip(learning, actions, base):
                 requests = rewards[i].guard_gripper_action(action, base_action=base_action)
                 if requests:
                     early_open[i] = requests
             # Mean Euclidean target-position correction across both arms, in metres.
             position_residuals = np.linalg.norm(
-                (actions - base)[:, [0, 1, 2, 8, 9, 10]].reshape(-1, 2, 3), axis=-1,
+                (actions - base)[:, POSITION_ACTION_INDICES].reshape(-1, 2, 3), axis=-1,
             ).mean(axis=-1)
             physical.update(zip(learning, actions.tolist()))
             if capture_act:
@@ -514,7 +521,8 @@ def _suffix_grasp_attempts(episode: dict) -> list[dict]:
             for key, counts in episode["grasp_attempts"].items()]
 
 
-def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: float) -> dict:
+def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: float,
+                     position_residual_multiplier: float = 1.0) -> dict:
     """Summarize genuine rollout samples before PPO normalizes advantages."""
     actions = batch.actions
     attempts = [counts for episode in episodes for counts in _suffix_grasp_attempts(episode)]
@@ -584,7 +592,8 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
         "raw_residual_abs_mean": float(actions.abs().mean()),
         "raw_residual_rms": float(actions.square().mean().sqrt()),
         "residual_clip_fraction": float((actions.abs() > 1).float().mean()),
-        "normalized_residual_abs_mean": float(actions.clamp(-1, 1).abs().mean()) * residual_scale,
+        "normalized_residual_abs_mean": float((actions.clamp(-1, 1).abs() * actions.new_tensor(
+            residual_channel_scales(residual_scale, position_residual_multiplier))).mean()),
         "rollout_value_mean": float(batch.values.mean()),
         "rollout_value_std": float(batch.values.std(unbiased=False)),
         "return_mean": float(batch.returns.mean()),
@@ -595,15 +604,17 @@ def _rollout_metrics(batch: PPOBatch, episodes: list[dict], residual_scale: floa
 
 
 @torch.no_grad()
-def _mean_policy_metrics(actor, features, action_std, residual_scale):
+def _mean_policy_metrics(actor, features, action_std, residual_scale,
+                         position_residual_multiplier: float = 1.0):
     """Measure the learned mean separately from exploration on rollout states."""
     position_norm_sum = raw_abs_sum = 0.0
     device = next(actor.parameters()).device
     std = torch.as_tensor(action_std, dtype=torch.float32, device=device)
+    scales = std.new_tensor(residual_channel_scales(residual_scale, position_residual_multiplier))
     for inputs in features.split(1024):
         mean, _, _ = actor.act(inputs.to(device), deterministic=True)
-        correction = mean.clamp(-1, 1) * residual_scale * std
-        position = correction[:, [0, 1, 2, 8, 9, 10]].reshape(-1, 2, 3)
+        correction = mean.clamp(-1, 1) * scales * std
+        position = correction[:, POSITION_ACTION_INDICES].reshape(-1, 2, 3)
         position_norm_sum += float(position.norm(dim=-1).sum())
         raw_abs_sum += float(mean.abs().sum())
     return {
@@ -647,6 +658,7 @@ def _validate_config(config):
         raise ValueError("entropy_coef must be nonnegative and finite.")
     if float(config["residual_scale"]) > 0.5:
         raise ValueError("residual_scale must not exceed 0.5 of the demonstration action std.")
+    residual_channel_scales(float(config["residual_scale"]), config.get("position_residual_multiplier", 1.0))
     if not 0.02 <= float(config["initial_std"]) <= 0.5:
         raise ValueError("initial_std must lie in [0.02, 0.5].")
     for key in ("ppo_epochs", "minibatch_size", "hidden_dim", "save_freq"):
@@ -721,9 +733,13 @@ def train_online(config: dict) -> Path:
         base.load_state_dict(payload["base_state_dict"], strict=True)
         frozen_state = (None if unfreeze_act else
                         {key: value.detach().cpu().clone() for key, value in base.state_dict().items()})
+        residual_scale = float(payload["residual_scale"])
+        position_residual_multiplier = validate_position_residual_multiplier(config.get(
+            "position_residual_multiplier", payload.get("position_residual_multiplier", 1.0)))
         runner = FrozenACTRunner(base, payload["stats"], device, capture_features=True,
                                  inference_batch_size=inference_batch_size,
-                                 freeze_policy=not unfreeze_act)
+                                 freeze_policy=not unfreeze_act,
+                                 position_residual_multiplier=position_residual_multiplier)
         residual_config = dict(payload["residual_config"])
         if int(residual_config.get("feature_dim", -1)) != FEATURE_DIM:
             raise ValueError(f"Residual feature_dim must be {FEATURE_DIM}.")
@@ -744,7 +760,6 @@ def train_online(config: dict) -> Path:
         # moments continue, only the param-group lr is adapted.
         for group, rate in zip(optimizer.param_groups, (learning_rate, critic_learning_rate)):
             group["lr"] = rate
-        residual_scale = float(payload["residual_scale"])
         start_update = int(payload["update"])
         global_step = int(payload["global_step"])
         layout_cursor = int(payload["layout_cursor"])
@@ -760,17 +775,21 @@ def train_online(config: dict) -> Path:
                         {key: value.detach().cpu().clone() for key, value in base.state_dict().items()})
         with (checkpoint.parent / "dataset_stats.pkl").open("rb") as stream:
             stats = pickle.load(stream)
+        residual_scale = float(config["residual_scale"])
+        position_residual_multiplier = validate_position_residual_multiplier(
+            config.get("position_residual_multiplier", 1.0))
         runner = FrozenACTRunner(base, stats, device, capture_features=True,
                                  inference_batch_size=inference_batch_size,
-                                 freeze_policy=not unfreeze_act)
+                                 freeze_policy=not unfreeze_act,
+                                 position_residual_multiplier=position_residual_multiplier)
         residual_config = {"feature_dim": FEATURE_DIM, "hidden_dim": int(config["hidden_dim"]),
                            "initial_std": float(config["initial_std"]),
                            "learn_std": bool(config["learn_std"])}
         residual = ResidualActorCritic(**residual_config).to(device)
         optimizer = make_optimizer(residual)
-        residual_scale = float(config["residual_scale"])
         start_update = global_step = layout_cursor = 0
 
+    residual_channel_scales(residual_scale, position_residual_multiplier)
     trainable_act_named = []
     frozen_cvae = {}
     aux_pose_head = None
@@ -808,7 +827,8 @@ def train_online(config: dict) -> Path:
     output = online_output_dir(config)
     output.mkdir(parents=True, exist_ok=False)
     snapshot = dict(config, base_checkpoint=str(checkpoint), policy_type="act_residual_ppo",
-                    residual_scale=residual_scale, resumed_from_update=start_update,
+                    residual_scale=residual_scale, position_residual_multiplier=position_residual_multiplier,
+                    resumed_from_update=start_update,
                     reward_type="score_delta_plus_physical_pbrs_waypoints_and_milestones",
                     residual_features=("normalized_qpos+base_action+visual+block_poses"
                                        if unfreeze_act else
@@ -870,7 +890,8 @@ def train_online(config: dict) -> Path:
             "base_state_dict": base_state, "residual_config": residual_config,
             "residual_state_dict": residual.state_dict(),
             "stats": {key: torch.as_tensor(runner.stats[key]) for key in runner.stats},
-            "residual_scale": residual_scale, "temporal_agg": True,
+            "residual_scale": residual_scale, "position_residual_multiplier": position_residual_multiplier,
+            "temporal_agg": True,
             "optimizer": optimizer.state_dict(), "update": absolute_update,
             "global_step": steps, "layout_cursor": layout_cursor,
             "torch_rng_state": torch.get_rng_state(),
@@ -917,6 +938,7 @@ def train_online(config: dict) -> Path:
     expected_waves = episodes_per_update // width
     mode = "unfrozen ACT (AWR) + residual PPO" if unfreeze_act else "frozen base"
     print(f"ACT residual PPO ({mode}): base={checkpoint}; resumed_update={start_update}; "
+          f"position_residual_multiplier={position_residual_multiplier:g}; "
           f"rollout_layout_ids={layout_ids}; budget={max_train_seconds:.0f}s; "
           f"output={output}", flush=True)
     try:
@@ -960,6 +982,7 @@ def train_online(config: dict) -> Path:
                         reward_cfg=reward_cfg, prefixes=prefixes, timings=timings,
                         act_sample_stride=(int(config["act_sample_stride"]) if unfreeze_act else None),
                         act_waves_out=act_waves,
+                        position_residual_multiplier=position_residual_multiplier,
                     )
                     layout_cursor += width
                     waves.append(batch)
@@ -995,7 +1018,7 @@ def train_online(config: dict) -> Path:
                 batch = concatenate_batches(waves)
                 batch_steps = len(batch.features)
                 global_step += batch_steps
-                rollout_stats = _rollout_metrics(batch, episodes, residual_scale)
+                rollout_stats = _rollout_metrics(batch, episodes, residual_scale, position_residual_multiplier)
                 rollout_seconds = time.monotonic() - update_started
                 optimization_started = time.monotonic()
                 batch = PPOBatch(*(getattr(batch, field).to(device) for field in PPOBatch.__dataclass_fields__))
@@ -1006,8 +1029,10 @@ def train_online(config: dict) -> Path:
                     value_coef=float(config["value_coef"]), entropy_coef=float(config["entropy_coef"]),
                     max_grad_norm=float(config["max_grad_norm"]), target_kl=float(config["target_kl"]),
                 )
-                losses.update(_mean_policy_metrics(residual, batch.features,
-                                                   runner.stats["action_std"], residual_scale))
+                losses.update(_mean_policy_metrics(
+                    residual, batch.features, runner.stats["action_std"], residual_scale,
+                    position_residual_multiplier,
+                ))
                 del batch
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)

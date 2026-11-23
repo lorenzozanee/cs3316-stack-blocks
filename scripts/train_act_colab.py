@@ -146,6 +146,8 @@ def write_configs(args, run_stamp: str) -> tuple[Path, Path, Path]:
     )
     if args.act_inference_batch_size is not None:
         online["act_inference_batch_size"] = args.act_inference_batch_size
+    if args.position_residual_multiplier is not None:
+        online["position_residual_multiplier"] = args.position_residual_multiplier
     env_config, online_config = (args.logs / name for name in ("env.yaml", "act_online.yaml"))
     for path, data in ((env_config, env), (online_config, online)):
         # The repo's simple YAML reader requires indentation before list items.
@@ -267,6 +269,7 @@ def main() -> int:
     parser.add_argument("--physx-threads", type=int)
     parser.add_argument("--finetune-episodes", type=int)
     parser.add_argument("--act-inference-batch-size", type=int)
+    parser.add_argument("--position-residual-multiplier", type=float)
     parser.add_argument("--max-train-seconds", type=int)
     parser.add_argument("--drive-credentials-file", type=Path)
     parser.add_argument("--measure-updates", type=int)
@@ -290,6 +293,8 @@ def main() -> int:
         parser.error("Port range for --env-workers must lie in 1..65535.")
     if args.act_inference_batch_size is not None and args.act_inference_batch_size < 1:
         parser.error("--act-inference-batch-size must be positive.")
+    if args.position_residual_multiplier is not None and not 0 < args.position_residual_multiplier < math.inf:
+        parser.error("--position-residual-multiplier must be positive and finite.")
     if not args.measure_updates:
         if args.drive_credentials_file is None or not args.drive_credentials_file.is_file():
             parser.error("Formal training requires a readable private Drive credentials file.")

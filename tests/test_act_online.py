@@ -1210,6 +1210,7 @@ class TrainOnlineTest(unittest.TestCase):
             second_config["finetune_updates"] = 1
             second_config["rollout_layout_ids"] = list(range(55))
             second_config["lr"] = 5e-3
+            second_config["position_residual_multiplier"] = 20.0
             second_env = _OnlineFakeEnv()
             captured = {}
             real_ppo_update = act_online.ppo_update
@@ -1272,6 +1273,8 @@ class TrainOnlineTest(unittest.TestCase):
 
             runner, residual, residual_scale = load_act_runner(second_last, "cpu")
             self.assertAlmostEqual(residual_scale, first_config["residual_scale"])
+            self.assertEqual(second["position_residual_multiplier"], 20.0)
+            self.assertEqual(runner.position_residual_multiplier, 20.0)
             for key, value in residual.state_dict().items():
                 torch.testing.assert_close(value.cpu(), second["residual_state_dict"][key], msg=key)
 

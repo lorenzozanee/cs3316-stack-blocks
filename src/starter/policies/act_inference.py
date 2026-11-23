@@ -26,6 +26,27 @@ FEATURE_DIM = VISUAL_FEATURE_DIM + 7 * len(BLOCK_LABELS)
 STAT_KEYS = ("qpos_mean", "qpos_std", "action_mean", "action_std")
 ONLINE_FORMAT = "act_residual_ppo_v3"
 MIN_QUATERNION_NORM = 1e-8
+POSITION_ACTION_INDICES = [0, 1, 2, 8, 9, 10]
+
+
+def validate_position_residual_multiplier(value) -> float:
+    multiplier = float(value)
+    if not np.isfinite(multiplier) or multiplier <= 0.0:
+        raise ValueError("position_residual_multiplier must be positive and finite.")
+    return multiplier
+
+
+def residual_channel_scales(residual_scale: float, position_residual_multiplier: float) -> np.ndarray:
+    scale = float(residual_scale)
+    if not np.isfinite(scale) or scale < 0.0:
+        raise ValueError("residual_scale must be a non-negative finite number.")
+    multiplier = validate_position_residual_multiplier(position_residual_multiplier)
+    position_scale = scale * multiplier
+    if position_scale > np.finfo(np.float32).max or scale > np.finfo(np.float32).max:
+        raise ValueError("Residual scale cannot be represented in float32.")
+    scales = np.full(ACTION_DIM, scale, dtype=np.float32)
+    scales[POSITION_ACTION_INDICES] = position_scale
+    return scales
 
 
 def _normalization_stats(stats: Mapping) -> dict[str, np.ndarray]:
@@ -101,6 +122,7 @@ class FrozenACTRunner:
         *,
         inference_batch_size: int | None = None,
         freeze_policy: bool = True,
+        position_residual_multiplier: float = 1.0,
     ):
         if inference_batch_size is not None and (
             type(inference_batch_size) is not int or inference_batch_size < 1
@@ -112,6 +134,7 @@ class FrozenACTRunner:
         if freeze_policy:
             self.policy.requires_grad_(False)
         self.stats = _normalization_stats(stats)
+        self.position_residual_multiplier = validate_position_residual_multiplier(position_residual_multiplier)
         self.temporal_agg = bool(temporal_agg)
         self.capture_features = bool(capture_features)
         self.chunk_size = int(policy.model.num_queries)
@@ -260,6 +283,8 @@ def compose_residual_action(
     raw_actions: torch.Tensor | np.ndarray,
     action_std,
     residual_scale: float,
+    *,
+    position_residual_multiplier: float = 1.0,
 ) -> np.ndarray:
     """Add a scaled residual to base actions and restore the action contract."""
 
@@ -277,9 +302,7 @@ def compose_residual_action(
     if not np.isfinite(raw).all():
         raise ValueError("raw_actions contain a non-finite value.")
 
-    scale = float(residual_scale)
-    if not np.isfinite(scale) or scale < 0.0:
-        raise ValueError("residual_scale must be a non-negative finite number.")
+    scales = residual_channel_scales(residual_scale, position_residual_multiplier)
     std = np.asarray(
         action_std.detach().cpu().numpy() if isinstance(action_std, torch.Tensor) else action_std,
         dtype=np.float32,
@@ -289,7 +312,7 @@ def compose_residual_action(
     if std.shape != (ACTION_DIM,) or not np.isfinite(std).all():
         raise ValueError(f"action_std must be {ACTION_DIM} finite values.")
 
-    actions = base + np.clip(raw, -1.0, 1.0) * scale * std
+    actions = base + np.clip(raw, -1.0, 1.0) * scales * std
     actions[:, (7, 15)] = np.clip(actions[:, (7, 15)], 0.0, 1.0)
     # Pose positions stay unclipped; only scalar-first quaternions are renormalized.
     for start in (3, 11):
@@ -330,6 +353,7 @@ def _load_online(checkpoint: Path, device, temporal_agg: bool):
     runner = FrozenACTRunner(
         policy.to(device), payload["stats"], device,
         temporal_agg=True, capture_features=True,
+        position_residual_multiplier=payload.get("position_residual_multiplier", 1.0),
     )
     residual = residual.to(device).eval()
     return runner, residual, float(payload["residual_scale"])

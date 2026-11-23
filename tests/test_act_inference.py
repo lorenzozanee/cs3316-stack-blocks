@@ -258,6 +258,18 @@ class ComposeResidualTest(unittest.TestCase):
             np.testing.assert_allclose(np.linalg.norm(quaternion, axis=1), 1.0)
         self.assertTrue(np.isfinite(composed).all())
 
+    def test_position_multiplier_changes_only_both_arms_xyz(self):
+        base = np.zeros((1, 16), dtype=np.float32)
+        base[:, (3, 11)] = 1.0
+        raw = np.full_like(base, 0.1)
+        std = np.linspace(0.04, 0.13, 16, dtype=np.float32)
+        normal = compose_residual_action(base, raw, std, 0.2)
+        amplified = compose_residual_action(base, raw, std, 0.2, position_residual_multiplier=20.0)
+        xyz = [0, 1, 2, 8, 9, 10]
+        other = sorted(set(range(16)) - set(xyz))
+        np.testing.assert_allclose(amplified[:, xyz], 20.0 * normal[:, xyz])
+        np.testing.assert_array_equal(amplified[:, other], normal[:, other])
+
     def test_pose_positions_are_not_clipped(self):
         base = np.zeros((1, 16), dtype=np.float32)
         base[:, :3] = 100.0

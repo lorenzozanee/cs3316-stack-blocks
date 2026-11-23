@@ -123,5 +123,6 @@ class Model(ModelTemplate):
         raw_actions, _, _ = self.residual.act(features, deterministic=True)
         composed = compose_residual_action(
             base_actions, raw_actions, self.runner.stats["action_std"], self.residual_scale,
+            position_residual_multiplier=self.runner.position_residual_multiplier,
         )
         return [self._unpack_chunk(composed[index : index + 1]) for index in range(len(indices))]
